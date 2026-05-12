@@ -1,4 +1,10 @@
 import asyncio
+# Try loading TgCrypto for fast speed
+try:
+    import tgcrypto
+    print("✅ TgCrypto loaded! Fast speed mode ON.")
+except ImportError:
+    print("⚠️ TgCrypto missing, using fallback (slower). Install: pip install tgcrypto")
 import os
 import re
 import random
