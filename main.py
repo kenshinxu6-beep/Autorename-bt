@@ -1,8 +1,7 @@
 # ═══════════════════════════════════════════════════════════
-# Renamer Bot v3.2 – Monolithic, All Features, Metadata, Progress, Force Sub, Owner, Admin
+# Renamer Bot v3.2 FINAL – All Features, No Omissions
 # ═══════════════════════════════════════════════════════════
 
-# Try TgCrypto for speed
 try:
     import tgcrypto
     print("✅ TgCrypto loaded. Fast mode ON.")
@@ -32,9 +31,6 @@ from database import (
 )
 from utils import parse_info, new_filename
 
-# ═══════════════════════════════════════════
-# Bot Client
-# ═══════════════════════════════════════════
 app = Client(
     "renamer_bot",
     api_id=API_ID,
@@ -43,16 +39,14 @@ app = Client(
     workers=200
 )
 
-# ═══════════════════════════════════════════
-# Global State
-# ═══════════════════════════════════════════
+# Global state
 user_semaphores = {}
 admin_batch_mode = False
 all_tasks = []
 DEFAULT_TEMPLATE = "{name} S{season}E{episode} [{audio}] [{quality}]"
 
 # ═══════════════════════════════════════════
-# StreamProcessor (built-in)
+# StreamProcessor (fixed concurrency)
 # ═══════════════════════════════════════════
 class StreamProcessor:
     def __init__(self, client, bot_token, dump_channel, extra_metadata=None):
@@ -68,7 +62,7 @@ class StreamProcessor:
         caption = metadata.get('caption', '')
         total_size = metadata.get('file_size', 0)
 
-        # Build ffmpeg command with extra metadata
+        # FFmpeg command with metadata
         cmd = [
             "ffmpeg", "-y",
             "-i", "pipe:0",
@@ -101,18 +95,18 @@ class StreamProcessor:
                 raise
 
         upload_url = f"https://api.telegram.org/bot{self.bot_token}/sendVideo"
-        async with aiohttp.ClientSession() as session:
+
+        async def upload_stdout():
             buffer = bytearray()
             final_file_id = None
             uploaded = 0
-
             while True:
                 chunk = await proc.stdout.read(self.chunk_size)
                 if not chunk:
                     break
                 buffer.extend(chunk)
                 uploaded += len(chunk)
-
+                # Upload every 5MB or when stream ends
                 if len(buffer) >= 5*1024*1024 or not chunk:
                     form = aiohttp.FormData()
                     form.add_field('chat_id', str(self.dump_channel))
@@ -121,26 +115,29 @@ class StreamProcessor:
                                    content_type='video/x-matroska')
                     form.add_field('caption', caption)
                     form.add_field('supports_streaming', 'true')
-
-                    async with session.post(upload_url, data=form) as resp:
-                        res = await resp.json()
-                        if not res.get('ok'):
-                            raise Exception(res.get('description', 'Upload failed'))
-                        if not chunk and 'result' in res and 'video' in res['result']:
-                            final_file_id = res['result']['video']['file_id']
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(upload_url, data=form) as resp:
+                            res = await resp.json()
+                            if not res.get('ok'):
+                                raise Exception(res.get('description', 'Upload failed'))
+                            # Last chunk gives us the file_id
+                            if not chunk and 'result' in res and 'video' in res['result']:
+                                final_file_id = res['result']['video']['file_id']
                     buffer.clear()
-
                     if progress_callback and total_size:
                         await progress_callback(uploaded, total_size)
-
-            stdin_task = asyncio.create_task(feed_stdin())
-            # Wait for stdin to finish
-            await stdin_task
-            await proc.wait()
-            if proc.returncode != 0:
-                stderr = (await proc.stderr.read()).decode()[:300]
-                raise Exception(f"FFmpeg error: {stderr}")
             return final_file_id
+
+        stdin_task = asyncio.create_task(feed_stdin())
+        upload_task = asyncio.create_task(upload_stdout())
+        await asyncio.gather(stdin_task, upload_task)
+
+        await proc.wait()
+        if proc.returncode != 0:
+            stderr = (await proc.stderr.read()).decode()[:300]
+            raise Exception(f"FFmpeg error: {stderr}")
+        return upload_task.result()
+
 
 # ═══════════════════════════════════════════
 # Force Sub Helpers
@@ -171,11 +168,13 @@ async def send_fsub_warning(m):
     text = "⚠️ **Please join our channels:**\n" + "\n".join(f"➤ @{ch}" for ch in fsub_channels)
     await m.reply(text, reply_markup=await build_fsub_keyboard(), disable_web_page_preview=True)
 
+
 # ═══════════════════════════════════════════
 # Progress Bar
 # ═══════════════════════════════════════════
 def progress_bar(current, total, length=10):
-    if total == 0: return "`██████████` 100%"
+    if total == 0:
+        return "`██████████` 100%"
     filled = int(length * current / total)
     bar = '█' * filled + '░' * (length - filled)
     percent = round(100 * current / total, 1)
@@ -183,9 +182,11 @@ def progress_bar(current, total, length=10):
 
 def format_size(sz):
     for unit in ['B','KB','MB','GB']:
-        if sz < 1024: return f"{sz:.1f} {unit}"
+        if sz < 1024:
+            return f"{sz:.1f} {unit}"
         sz /= 1024
     return f"{sz:.1f} TB"
+
 
 # ═══════════════════════════════════════════
 # Semaphore
@@ -207,6 +208,7 @@ async def get_semaphore(uid):
         user_semaphores[uid] = asyncio.Semaphore(lim)
     return user_semaphores[uid]
 
+
 # ═══════════════════════════════════════════
 # START
 # ═══════════════════════════════════════════
@@ -216,8 +218,10 @@ async def start_cmd(c, m):
     start_text = await get_global_setting(
         "start_message",
         "👋 **Welcome {username}!**\n\nSend me a video/document with caption to rename & upload."
-    ).replace("{username}", user_mention)
+    )
+    start_text = start_text.replace("{username}", user_mention)
     start_img = await get_global_setting("start_image", None)
+
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📖 Commands", callback_data="help"),
          InlineKeyboardButton("ℹ️ About", callback_data="about")],
@@ -226,10 +230,15 @@ async def start_cmd(c, m):
         [InlineKeyboardButton("🛠 Settings", callback_data="user_settings"),
          InlineKeyboardButton("📊 Status", callback_data="bot_status")]
     ])
+
     try:
-        if start_img: await m.reply_photo(start_img, caption=start_text, reply_markup=kb)
-        else: await m.reply_text(start_text, reply_markup=kb)
-    except: await m.reply_text(start_text, reply_markup=kb)
+        if start_img:
+            await m.reply_photo(start_img, caption=start_text, reply_markup=kb)
+        else:
+            await m.reply_text(start_text, reply_markup=kb)
+    except:
+        await m.reply_text(start_text, reply_markup=kb)
+
 
 # ═══════════════════════════════════════════
 # HELP
@@ -239,22 +248,32 @@ async def help_cmd(c, m):
     uid = m.from_user.id
     text = (
         "**👤 Everyone:**\n"
-        "/start, /help, /status\n"
+        "/start – Main menu\n"
+        "/help – This message\n"
+        "/status – Check bot status\n"
         "/setformat <template> – Your rename format\n"
-        "/getformat – Show format\n"
+        "/getformat – View format\n"
         "/setthumb – Set thumbnail (reply photo)\n"
         "/getthumb – View thumbnail\n"
         "/clearthumb – Remove\n"
-        "/setmetadata key=value – Add metadata\n"
-        "/removemetadata key – Remove\n"
+        "/setmetadata key=value – Add custom metadata\n"
+        "/removemetadata key – Remove metadata\n"
         "/listmetadata – List your metadata\n"
-        "/buy – Premium contact\n"
+        "/buy – Premium info\n"
         "/myplan – Your plan\n\n"
-        "**Placeholders:** {name}, {season}, {episode}, {quality}, {audio}, {video_length}"
+        "**Placeholders:** `{name}`, `{season}`, `{episode}`, `{quality}`, `{audio}`, `{video_length}`"
     )
     if uid == OWNER_ID:
-        text += "\n\n**👑 Owner:** /stats, /addadmin, /setfsub, /broadcast, ... (full list in /help)"
+        text += (
+            "\n\n**👑 Owner Commands:**"
+            "/stats\n/setstartimage\n/setstartmsg\n/setglobalformat\n/setglobalthumb\n"
+            "/addadmin /removeadmin\n/addpremium /removepremium\n"
+            "/addtoken /removetoken /listtokens\n/adddump /removedump\n"
+            "/setfsub /removefsub /fsubchannels\n"
+            "/setlimit /stopall /startadminbatch /endadminbatch\n/broadcast"
+        )
     await m.reply(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="start")]]))
+
 
 # ═══════════════════════════════════════════
 # Callbacks
@@ -300,12 +319,12 @@ async def cb_verify(c, q):
     else:
         await q.answer("❌ Not joined all channels!", show_alert=True)
 
+
 # ═══════════════════════════════════════════
 # USER COMMANDS
 # ═══════════════════════════════════════════
 @app.on_message(filters.command("status"))
-async def status_cmd(c, m):
-    await m.reply("✅ Bot running")
+async def status_cmd(c, m): await m.reply("✅ Bot running")
 
 @app.on_message(filters.command("setformat"))
 async def setformat(c, m):
@@ -350,19 +369,19 @@ async def myplan(c, m):
     else: p = "🆓 Free"
     await m.reply(f"Your plan: {p}")
 
+
 # ═══════════════════════════════════════════
 # METADATA COMMANDS
 # ═══════════════════════════════════════════
 @app.on_message(filters.command("setmetadata"))
 async def setmeta(c, m):
     if len(m.command) < 2: return await m.reply("Usage: `/setmetadata key=value`")
-    try:
-        key, value = m.text.split(maxsplit=1)[1].split('=', 1)
+    try: key, value = m.text.split(maxsplit=1)[1].split('=', 1)
     except ValueError: return await m.reply("Invalid format. Use `key=value`.")
     meta = await get_user_setting(m.from_user.id, "metadata_dict", {})
     meta[key.strip()] = value.strip()
     await set_user_setting(m.from_user.id, "metadata_dict", meta)
-    await m.reply(f"✅ Saved `{key}` = `{value}`")
+    await m.reply(f"✅ `{key}` = `{value}`")
 
 @app.on_message(filters.command("removemetadata"))
 async def removemeta(c, m):
@@ -373,19 +392,19 @@ async def removemeta(c, m):
         del meta[key]
         await set_user_setting(m.from_user.id, "metadata_dict", meta)
         await m.reply(f"✅ Removed `{key}`")
-    else:
-        await m.reply(f"Key `{key}` not found.")
+    else: await m.reply("Key not found.")
 
 @app.on_message(filters.command("listmetadata"))
 async def listmeta(c, m):
     meta = await get_user_setting(m.from_user.id, "metadata_dict", {})
-    if not meta: return await m.reply("No custom metadata set.")
-    text = "**Your Metadata:**\n" + "\n".join(f"• `{k}` = `{v}`" for k, v in meta.items())
-    await m.reply(text)
+    if not meta: return await m.reply("No custom metadata.")
+    await m.reply("**Your Metadata:**\n" + "\n".join(f"• `{k}` = `{v}`" for k, v in meta.items()))
+
 
 # ═══════════════════════════════════════════
-# OWNER COMMANDS
+# OWNER COMMANDS (ALL INCLUDED)
 # ═══════════════════════════════════════════
+
 @app.on_message(filters.command("setstartimage") & filters.user(OWNER_ID))
 async def setstartimg_cmd(c, m):
     if not m.reply_to_message or not m.reply_to_message.photo: return await m.reply("Reply to an image.")
@@ -399,13 +418,13 @@ async def setstartmsg_cmd(c, m):
     await m.reply("✅ Start message updated.")
 
 @app.on_message(filters.command("setglobalformat") & filters.user(OWNER_ID))
-async def setglobalfmt_cmd(c, m):
+async def setglobfmt_cmd(c, m):
     if len(m.command) < 2: return await m.reply("Usage: `/setglobalformat <template>`")
     await set_global_setting("rename_template", m.text.split(maxsplit=1)[1])
     await m.reply("✅ Global format set.")
 
 @app.on_message(filters.command("setglobalthumb") & filters.user(OWNER_ID))
-async def setglobalthumb_cmd(c, m):
+async def setglobthumb_cmd(c, m):
     if not m.reply_to_message or not m.reply_to_message.photo: return await m.reply("Reply to an image.")
     await set_global_setting("thumb_file_id", m.reply_to_message.photo.file_id)
     await m.reply("✅ Global thumbnail set.")
@@ -548,8 +567,9 @@ async def stats_cmd(c, m):
     text = f"**System Stats**\nCPU: {psutil.cpu_percent()}%\nRAM: {ram.percent}% (Bot: {bot_ram:.1f} MB)\nDisk Free: {disk.free//1048576} MB\nActive Tasks: {active}"
     await m.reply(text)
 
+
 # ═══════════════════════════════════════════
-# MAIN RENAME HANDLER (Streaming, Metadata, Thumbnails)
+# MAIN RENAME HANDLER
 # ═══════════════════════════════════════════
 @app.on_message(filters.video | filters.document)
 async def rename_handler(c, m):
@@ -596,12 +616,10 @@ async def rename_handler(c, m):
                 up_token = random.choice(DUMP_BOT_TOKENS) if DUMP_BOT_TOKENS else BOT_TOKEN
                 dump_id = DUMP_CHANNEL
 
-            # Progress callback
             async def progress_callback(cur, tot):
                 bar = progress_bar(cur, tot)
                 await stat.edit(f"📛 `{new_name}`\n📤 Uploading: {bar}")
 
-            # Build metadata for processor
             processor = StreamProcessor(c, up_token, dump_id, extra_metadata=meta_dict)
             meta_info = {
                 "title": new_name,
@@ -616,7 +634,6 @@ async def rename_handler(c, m):
             if not file_id:
                 return await stat.edit("❌ Upload failed.")
 
-            # Send to user
             await c.send_video(
                 chat_id=m.chat.id,
                 video=file_id,
@@ -625,7 +642,6 @@ async def rename_handler(c, m):
                 thumb=thumb_path
             )
             await stat.edit(f"✅ Done! `{new_name}`")
-
         except asyncio.CancelledError:
             await stat.edit("❌ Cancelled.")
         except Exception as e:
@@ -633,6 +649,7 @@ async def rename_handler(c, m):
         finally:
             if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
             if task in all_tasks: all_tasks.remove(task)
+
 
 # ═══════════════════════════════════════════
 # RUN
