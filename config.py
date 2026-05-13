@@ -6,7 +6,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", 0))
 
-# Original URI without database name
 MONGO_URI = os.getenv("MONGO_URI", "")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "Kenshinfileshere")
 
