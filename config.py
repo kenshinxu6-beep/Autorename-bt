@@ -4,8 +4,8 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", 0))
-API_ID = int(os.getenv("API_ID", 0))
-API_HASH = os.getenv("API_HASH", "")
+API_ID = 37407868   # your real api_id
+API_HASH = "d7d3bff9f7cf9f3b111129bdbd13a065" # your real api_hash
 MONGO_URI = os.getenv("MONGO_URI", "")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "botdb")
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "KENSHIN_ANIME_OWNER")
