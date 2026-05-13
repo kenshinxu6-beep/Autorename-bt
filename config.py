@@ -1,3 +1,4 @@
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "KENSHIN_ANIME_OWNER")  # without @
 import os
 from dotenv import load_dotenv
 
@@ -6,10 +7,13 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", 0))
 
+# Pyrogram API keys (REQUIRED)
+API_ID = int(os.getenv("API_ID", 0))
+API_HASH = os.getenv("API_HASH", "")
+
 MONGO_URI = os.getenv("MONGO_URI", "")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "Kenshinfileshere")
 
-# Build final URI with database name
 if MONGO_URI and "mongodb+srv://" in MONGO_URI:
     if "?" in MONGO_URI:
         base, query = MONGO_URI.split("?", 1)
