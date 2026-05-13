@@ -1,14 +1,10 @@
 import motor.motor_asyncio
-from config import MONGO_URI
+from config import MONGO_URI, DATABASE_NAME
 
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
 
-# Fix: Use get_default_database() safely with is not None check
-default_db = client.get_default_database()
-if default_db is not None:
-    db = default_db
-else:
-    db = client["botdb"]
+# Directly get database by name – no truthiness check
+db = client[DATABASE_NAME]
 
 users = db["users"]
 tokens = db["tokens"]
@@ -26,7 +22,6 @@ async def init_db():
         upsert=True
     )
 
-# ---------- User Status Checks ----------
 async def is_admin(user_id):
     user = await users.find_one({"user_id": user_id})
     return user and user.get("is_admin", False)
@@ -35,7 +30,6 @@ async def is_premium(user_id):
     user = await users.find_one({"user_id": user_id})
     return user and user.get("is_premium", False)
 
-# ---------- Global Settings ----------
 async def get_settings():
     s = await settings.find_one({"_id": "global"})
     return s if s else {"max_concurrent_normal": 10, "max_concurrent_admin": 100}
@@ -52,7 +46,6 @@ async def set_global_setting(key, value):
 async def delete_global_setting(key):
     await settings.update_one({"_id": "global"}, {"$unset": {key: ""}})
 
-# ---------- Per-User Settings ----------
 async def get_user_setting(user_id, key, default=None):
     user = await users.find_one({"user_id": user_id})
     if user and key in user:
@@ -65,21 +58,18 @@ async def set_user_setting(user_id, key, value):
 async def delete_user_setting(user_id, key):
     await users.update_one({"user_id": user_id}, {"$unset": {key: ""}})
 
-# ---------- Admin Management ----------
 async def add_admin(user_id):
     await users.update_one({"user_id": user_id}, {"$set": {"is_admin": True}}, upsert=True)
 
 async def remove_admin(user_id):
     await users.update_one({"user_id": user_id}, {"$unset": {"is_admin": ""}})
 
-# ---------- Premium Management ----------
 async def add_premium(user_id):
     await users.update_one({"user_id": user_id}, {"$set": {"is_premium": True}}, upsert=True)
 
 async def remove_premium(user_id):
     await users.update_one({"user_id": user_id}, {"$unset": {"is_premium": ""}})
 
-# ---------- Token Management ----------
 async def add_bot_token(token, dump_channel_id):
     await tokens.update_one(
         {"token": token},
@@ -94,7 +84,6 @@ async def get_all_tokens():
     cursor = tokens.find({})
     return await cursor.to_list(length=1000)
 
-# ---------- Dump Channel Management ----------
 async def add_dump_channel(channel_id, token):
     await dumps.update_one(
         {"channel_id": channel_id},
