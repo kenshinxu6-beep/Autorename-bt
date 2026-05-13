@@ -44,9 +44,8 @@ app = Client(
     bot_token=BOT_TOKEN,
     workers=100,
     max_concurrent_transmissions=50,
-    in_memory=True,
     sleep_threshold=1,
-    timeout=300
+    in_memory=True
 )
 
 user_semaphores = {}
