@@ -1,3 +1,8 @@
+# main.py
+
+import uvloop
+uvloop.install()
+
 import os
 import re
 import time
@@ -13,61 +18,82 @@ except:
     print("⚠️ TgCrypto Missing")
 
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
 from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton
 )
 
-# ═══════════════════════════════
-# ENV CONFIG
-# ═══════════════════════════════
+from config import (
+    API_ID,
+    API_HASH,
+    BOT_TOKEN,
+    OWNER_ID,
+    OWNER_USERNAME,
+    DUMP_CHANNEL,
+    DUMP_BOT_TOKENS,
+    MAX_FILE_SIZE,
+    MAX_FILE_SIZE_GB
+)
 
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+from database import (
+    init_db,
+    get_user_setting,
+    set_user_setting,
+    delete_user_setting,
+    get_global_setting,
+    set_global_setting,
+    delete_global_setting,
+    is_admin,
+    is_premium,
+    get_all_tokens,
+    add_bot_token,
+    get_settings
+)
 
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-DUMP_CHANNEL = int(os.getenv("DUMP_CHANNEL", "0"))
-
-MAX_FILE_SIZE_GB = float(os.getenv("MAX_FILE_SIZE_GB", "2"))
-MAX_FILE_SIZE = int(MAX_FILE_SIZE_GB * 1024 * 1024 * 1024)
-
-OWNER_USERNAME = os.getenv("OWNER_USERNAME", "owner")
-
-DUMP_BOT_TOKENS = [
-    x.strip()
-    for x in os.getenv("DUMP_BOT_TOKENS", "").split(",")
-    if x.strip()
-]
+from utils import (
+    parse_info,
+    new_filename,
+    safe_filename
+)
 
 # ═══════════════════════════════
 # APP
 # ═══════════════════════════════
 
 app = Client(
-    "RenamerBot",
+    "UltraRenameBot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=100,
-    sleep_threshold=1,
-    max_concurrent_transmissions=50,
+    workers=500,
+    workdir="/tmp",
+    sleep_threshold=0,
+    max_concurrent_transmissions=200,
     in_memory=True
 )
+
+# ═══════════════════════════════
+# GLOBALS
+# ═══════════════════════════════
+
+user_semaphores = {}
 
 # ═══════════════════════════════
 # HELPERS
 # ═══════════════════════════════
 
-def safe_filename(name):
-    name = re.sub(r'[\\/:*?"<>|]', '', name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name[:240]
-
 def format_size(size):
+
     power = 1024
     n = 0
-    Dic_powerN = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
+    Dic_powerN = {
+        0: 'B',
+        1: 'KB',
+        2: 'MB',
+        3: 'GB',
+        4: 'TB'
+    }
 
     while size > power:
         size /= power
@@ -76,14 +102,17 @@ def format_size(size):
     return f"{round(size,2)} {Dic_powerN[n]}"
 
 def progress_bar(current, total):
+
+    if total == 0:
+        return "░░░░░░░░░░"
+
     percent = current * 100 / total
     filled = int(percent // 10)
 
-    bar = "█" * filled + "░" * (10 - filled)
-
-    return f"`{bar}` {round(percent,1)}%"
+    return "█" * filled + "░" * (10 - filled)
 
 def get_speed(current, start):
+
     diff = time.time() - start
 
     if diff <= 0:
@@ -91,32 +120,26 @@ def get_speed(current, start):
 
     return f"{format_size(current / diff)}/s"
 
-def parse_info(filename):
+async def get_semaphore(user_id):
 
-    season = "01"
-    episode = "01"
-    quality = "Unknown"
-    audio = "Multi"
+    settings = await get_settings()
 
-    s = re.search(r"S(\d+)", filename, re.I)
-    e = re.search(r"E(\d+)", filename, re.I)
-    q = re.search(r"(360p|480p|720p|1080p|2160p)", filename, re.I)
+    if user_id == OWNER_ID:
+        limit = settings.get("max_concurrent_admin", 100)
 
-    if s:
-        season = s.group(1)
+    elif await is_admin(user_id):
+        limit = settings.get("max_concurrent_admin", 100)
 
-    if e:
-        episode = e.group(1)
+    elif await is_premium(user_id):
+        limit = settings.get("max_concurrent_admin", 100)
 
-    if q:
-        quality = q.group(1)
+    else:
+        limit = settings.get("max_concurrent_normal", 10)
 
-    return {
-        "season": season,
-        "episode": episode,
-        "quality": quality,
-        "audio": audio
-    }
+    if user_id not in user_semaphores:
+        user_semaphores[user_id] = asyncio.Semaphore(limit)
+
+    return user_semaphores[user_id]
 
 # ═══════════════════════════════
 # START
@@ -132,9 +155,16 @@ async def start(_, m):
         ]
     ])
 
-    await m.reply_text(
+    txt = (
         f"👋 Hello {m.from_user.mention}\n\n"
-        f"Send me any video/document to rename.",
+        f"⚡ Ultra Fast Auto Renamer Bot\n"
+        f"🚀 Railway Optimized\n"
+        f"🔥 Multi Token Upload\n\n"
+        f"Send any file to rename."
+    )
+
+    await m.reply_text(
+        txt,
         reply_markup=kb
     )
 
@@ -146,14 +176,18 @@ async def start(_, m):
 async def help_cmd(_, m):
 
     txt = """
-**📖 Renamer Bot Commands**
+📖 Commands
 
 /start - Start bot
-/help - Help menu
-/ping - Check bot
+/help - Help
+/ping - Ping bot
 /status - Bot status
 
-Send any video/document to rename automatically.
+/setformat - Set rename format
+/getformat - Get rename format
+
+Example:
+/setformat {name} S{season}E{episode} [{quality}]
 """
 
     await m.reply_text(txt)
@@ -185,194 +219,333 @@ async def status(_, m):
     await m.reply_text(txt)
 
 # ═══════════════════════════════
-# RENAME HANDLER
+# FORMAT
+# ═══════════════════════════════
+
+@app.on_message(filters.command("setformat"))
+async def setformat(_, m):
+
+    if len(m.command) < 2:
+        return await m.reply_text(
+            "Usage:\n/setformat {name} S{season}E{episode}"
+        )
+
+    fmt = m.text.split(None, 1)[1]
+
+    await set_user_setting(
+        m.from_user.id,
+        "rename_format",
+        fmt
+    )
+
+    await m.reply_text("✅ Format Saved")
+
+@app.on_message(filters.command("getformat"))
+async def getformat(_, m):
+
+    fmt = await get_user_setting(
+        m.from_user.id,
+        "rename_format",
+        "{name} S{season}E{episode} [{quality}]"
+    )
+
+    await m.reply_text(
+        f"📝 Current Format:\n\n`{fmt}`"
+    )
+
+# ═══════════════════════════════
+# RENAME
 # ═══════════════════════════════
 
 @app.on_message(filters.video | filters.document)
 async def rename_handler(c, m):
 
-    file = m.video or m.document
+    user_id = m.from_user.id
 
-    if not file:
-        return
+    sem = await get_semaphore(user_id)
 
-    if file.file_size > MAX_FILE_SIZE:
-        return await m.reply_text(
-            f"❌ File too large.\nMax: {MAX_FILE_SIZE_GB} GB"
-        )
+    async with sem:
 
-    os.makedirs("downloads", exist_ok=True)
+        file = m.video or m.document
 
-    status = await m.reply_text("⏳ Starting...")
+        if not file:
+            return
 
-    try:
+        if file.file_size > MAX_FILE_SIZE:
 
-        original_name = file.file_name or "video.mp4"
-
-        info = parse_info(original_name)
-
-        ext = os.path.splitext(original_name)[1]
-
-        base_name = (
-            f"Anime S{info['season']}E{info['episode']} "
-            f"[{info['quality']}] [{info['audio']}]"
-        )
-
-        new_name = safe_filename(base_name) + ext
-
-        download_path = f"downloads/{file.file_id}{ext}"
-
-        # ═════════ DOWNLOAD ═════════
-
-        last = [0]
-
-        download_start = time.time()
-
-        async def download_progress(current, total):
-
-            if time.time() - last[0] < 1:
-                return
-
-            last[0] = time.time()
-
-            speed = get_speed(current, download_start)
-
-            try:
-                await status.edit_text(
-                    f"⬇️ Downloading\n\n"
-                    f"{progress_bar(current, total)}\n\n"
-                    f"⚡ {speed}\n"
-                    f"{format_size(current)} / {format_size(total)}"
-                )
-            except:
-                pass
-
-        await m.download(
-            file_name=download_path,
-            progress=download_progress
-        )
-
-        # ═════════ FFMPEG CHECK ═════════
-
-        if not shutil.which("ffmpeg"):
-            raise Exception("FFmpeg not installed")
-
-        # ═════════ PROCESS ═════════
-
-        await status.edit_text("⚙️ Processing Video...")
-
-        output_path = f"downloads/{new_name}"
-
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            download_path,
-            "-c",
-            "copy",
-            "-map",
-            "0",
-            "-metadata",
-            f"title={new_name}",
-            "-movflags",
-            "+faststart",
-            output_path
-        ]
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        await process.communicate()
-
-        if process.returncode != 0:
-            shutil.copy(download_path, output_path)
-
-        # ═════════ TOKEN SELECT ═════════
-
-        upload_token = BOT_TOKEN
-
-        if DUMP_BOT_TOKENS:
-            upload_token = random.choice(DUMP_BOT_TOKENS)
-
-        # ═════════ UPLOAD ═════════
-
-        upload_start = time.time()
-
-        async def upload_progress(current, total):
-
-            if time.time() - last[0] < 1:
-                return
-
-            last[0] = time.time()
-
-            speed = get_speed(current, upload_start)
-
-            try:
-                await status.edit_text(
-                    f"📤 Uploading\n\n"
-                    f"{progress_bar(current, total)}\n\n"
-                    f"⚡ {speed}\n"
-                    f"{format_size(current)} / {format_size(total)}"
-                )
-            except:
-                pass
-
-        async with Client(
-            name=f"Uploader{random.randint(1000,99999)}",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            bot_token=upload_token,
-            no_updates=True,
-            workers=50,
-            sleep_threshold=1,
-            in_memory=True
-        ) as uploader:
-
-            dump_msg = await uploader.send_video(
-                chat_id=DUMP_CHANNEL,
-                video=output_path,
-                caption=f"`{new_name}`",
-                supports_streaming=True,
-                progress=upload_progress
+            return await m.reply_text(
+                f"❌ Max File Size: {MAX_FILE_SIZE_GB} GB"
             )
 
-        # ═════════ SEND USER ═════════
-
-        await c.send_video(
-            chat_id=m.chat.id,
-            video=dump_msg.video.file_id,
-            caption=f"✅ Renamed Successfully\n\n`{new_name}`",
-            reply_to_message_id=m.id,
-            supports_streaming=True
+        status = await m.reply_text(
+            "⚡ Initializing..."
         )
 
-        await status.edit_text("✅ Completed")
+        try:
 
-        # ═════════ CLEANUP ═════════
+            original_name = file.file_name or "video.mkv"
 
-        for path in [download_path, output_path]:
+            caption = m.caption or ""
 
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except:
-                pass
+            info = parse_info(
+                caption,
+                original_name
+            )
 
-    except Exception as e:
+            ext = os.path.splitext(original_name)[1]
 
-        await status.edit_text(
-            f"❌ Error:\n\n`{str(e)[:400]}`"
-        )
+            user_format = await get_user_setting(
+                user_id,
+                "rename_format"
+            )
+
+            if user_format:
+
+                new_name = user_format
+
+                for k, v in info.items():
+                    new_name = new_name.replace(
+                        "{" + k + "}",
+                        str(v)
+                    )
+
+                new_name = safe_filename(new_name)
+
+                if not new_name.endswith(ext):
+                    new_name += ext
+
+            else:
+                new_name = new_filename(info)
+
+            # PATHS
+
+            download_path = f"/tmp/{file.file_id}{ext}"
+
+            output_path = f"/tmp/{new_name}"
+
+            # DOWNLOAD
+
+            last_edit = [0]
+
+            start_time = time.time()
+
+            async def download_progress(current, total):
+
+                if time.time() - last_edit[0] < 1:
+                    return
+
+                last_edit[0] = time.time()
+
+                speed = get_speed(
+                    current,
+                    start_time
+                )
+
+                try:
+
+                    await status.edit_text(
+                        f"⬇️ Downloading\n\n"
+                        f"{progress_bar(current,total)}\n\n"
+                        f"⚡ {speed}\n"
+                        f"📦 {format_size(current)} / {format_size(total)}"
+                    )
+
+                except:
+                    pass
+
+            await m.download(
+                file_name=download_path,
+                block=False,
+                progress=download_progress
+            )
+
+            # CHECK
+
+            if not os.path.exists(download_path):
+                raise Exception("Download failed")
+
+            if os.path.getsize(download_path) < 100000:
+                raise Exception("Downloaded file corrupted")
+
+            # FFMPEG
+
+            if not shutil.which("ffmpeg"):
+                raise Exception("FFmpeg missing")
+
+            await status.edit_text(
+                "⚙️ Processing..."
+            )
+
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-fflags", "+genpts",
+                "-y",
+                "-i", download_path,
+                "-map", "0",
+                "-c", "copy",
+                "-movflags", "+faststart",
+                "-metadata",
+                f"title={new_name}",
+                output_path
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            _, stderr = await process.communicate()
+
+            if process.returncode != 0:
+
+                print(stderr.decode())
+
+                shutil.copy(
+                    download_path,
+                    output_path
+                )
+
+            # CHECK OUTPUT
+
+            if not os.path.exists(output_path):
+                raise Exception("Output missing")
+
+            if os.path.getsize(output_path) < 100000:
+                raise Exception("Output corrupted")
+
+            # TOKEN SELECT
+
+            upload_token = BOT_TOKEN
+
+            db_tokens = await get_all_tokens()
+
+            if db_tokens:
+
+                selected = random.choice(db_tokens)
+
+                upload_token = selected.get(
+                    "token",
+                    BOT_TOKEN
+                )
+
+            elif DUMP_BOT_TOKENS:
+
+                upload_token = random.choice(
+                    DUMP_BOT_TOKENS
+                )
+
+            # UPLOAD
+
+            upload_start = time.time()
+
+            async def upload_progress(current, total):
+
+                if time.time() - last_edit[0] < 1:
+                    return
+
+                last_edit[0] = time.time()
+
+                speed = get_speed(
+                    current,
+                    upload_start
+                )
+
+                try:
+
+                    await status.edit_text(
+                        f"📤 Uploading\n\n"
+                        f"{progress_bar(current,total)}\n\n"
+                        f"⚡ {speed}\n"
+                        f"📦 {format_size(current)} / {format_size(total)}"
+                    )
+
+                except:
+                    pass
+
+            async with Client(
+                name=f"Uploader{random.randint(1000,999999)}",
+                api_id=API_ID,
+                api_hash=API_HASH,
+                bot_token=upload_token,
+                workers=300,
+                workdir="/tmp",
+                no_updates=True,
+                sleep_threshold=0,
+                max_concurrent_transmissions=100,
+                in_memory=True
+            ) as uploader:
+
+                dump_msg = await uploader.send_document(
+                    chat_id=DUMP_CHANNEL,
+                    document=output_path,
+                    caption=f"`{new_name}`",
+                    force_document=False,
+                    progress=upload_progress
+                )
+
+            # SEND USER
+
+            await c.send_document(
+                chat_id=m.chat.id,
+                document=dump_msg.document.file_id,
+                caption=(
+                    f"✅ Renamed Successfully\n\n"
+                    f"`{new_name}`"
+                ),
+                reply_to_message_id=m.id
+            )
+
+            await status.edit_text(
+                "✅ Completed"
+            )
+
+        except FloodWait as e:
+
+            await asyncio.sleep(e.value)
+
+            await status.edit_text(
+                f"⏳ FloodWait: {e.value}s"
+            )
+
+        except Exception as e:
+
+            await status.edit_text(
+                f"❌ Error:\n\n`{str(e)[:400]}`"
+            )
+
+        finally:
+
+            for p in [
+                locals().get("download_path"),
+                locals().get("output_path")
+            ]:
+
+                try:
+                    if p and os.path.exists(p):
+                        os.remove(p)
+                except:
+                    pass
 
 # ═══════════════════════════════
 # MAIN
 # ═══════════════════════════════
 
-if __name__ == "__main__":
+async def main():
+
+    await init_db()
 
     print("🚀 Bot Started")
 
-    app.run()
+    await app.start()
+
+    me = await app.get_me()
+
+    print(f"✅ Logged in as @{me.username}")
+
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
