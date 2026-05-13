@@ -10,7 +10,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", 0))
 MONGO_URI = os.getenv("MONGO_URI", "")
 
 # DATABASE_NAME sirf tab use hoga jab MONGO_URI me database na ho
-DATABASE_NAME = os.getenv("DATABASE_NAME", "botdb")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "Kenshinfileshere")
 
 DUMP_CHANNEL = int(os.getenv("DUMP_CHANNEL", 0))
 DUMP_BOT_TOKENS = [t.strip() for t in os.getenv("DUMP_BOT_TOKENS", "").split(",") if t.strip()]
