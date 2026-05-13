@@ -2,9 +2,9 @@ import os
 from pyrogram import Client
 
 # Apni API details yahan daalo (test ke liye)
-API_ID = 12345678           # <-- apni real api_id yahan likho
-API_HASH = "abc123def..."   # <-- apni real api_hash yahan likho
-BOT_TOKEN = "12345:ABC..."  # <-- apna real bot_token yahan likho
+API_ID = 37407868           # <-- apni real api_id yahan likho
+API_HASH = "d7d3bff9f7cf9f3b111129bdbd13a065"   # <-- apni real api_hash yahan likho
+BOT_TOKEN = "8780999113:AAGf1b327eBMRSR6tSv0J0IpEtfzAP2skzk"  # <-- apna real bot_token yahan likho
 
 print(f"Testing with:")
 print(f"  API_ID: {API_ID}")
