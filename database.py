@@ -2,7 +2,13 @@ import motor.motor_asyncio
 from config import MONGO_URI
 
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-db = client.get_default_database() if client.get_default_database() else client["botdb"]
+
+# Fix: Use get_default_database() safely with is not None check
+default_db = client.get_default_database()
+if default_db is not None:
+    db = default_db
+else:
+    db = client["botdb"]
 
 users = db["users"]
 tokens = db["tokens"]
