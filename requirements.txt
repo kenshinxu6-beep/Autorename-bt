@@ -1,9 +1,4 @@
 pyrofork
 tgcrypto
-uvloop
-motor==3.4.0
-pymongo==4.7.2
-python-dotenv==1.0.0
-aiohttp==3.9.5
-aiofiles==23.2.1
-psutil==5.9.8
+aiohttp
+asyncio
