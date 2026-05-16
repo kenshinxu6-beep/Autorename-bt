@@ -1,6 +1,7 @@
-FROM python:3.11-slim-buster
+# Buster ki jagah humne Bookworm (Latest Stable) use kiya hai
+FROM python:3.11-slim-bookworm
 
-# System dependencies
+# System dependencies (Ab bina kisi error ke chalega)
 RUN apt-get update && apt-get install -y git
 
 # Work directory
