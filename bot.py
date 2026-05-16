@@ -2,7 +2,8 @@
 """
 ╔══════════════════════════════════════════════════════╗
 ║ KENSHIN ANIME BOT — by @kenshin_anime                ║
-║ Style     : TMKOC Premium + Season Number Fix        ║
+║ Style     : TMKOC Premium Style                      ║
+║ Access    : PUBLIC (Admin check completely removed)  ║
 ╚══════════════════════════════════════════════════════╝
 """
 import os, io, asyncio, logging, re
@@ -18,13 +19,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("KenshinBot")
 
-# ── Config ─────────────────────────────────────────────
+# ── Config (ADMIN_IDS removed) ─────────────────────────
 API_ID    = int(os.environ.get("API_ID", "0"))
 API_HASH  = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ADMIN_IDS = set(
-    int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
-)
 
 # ── Pyrogram client ────────────────────────────────────
 app = Client(
@@ -39,9 +37,6 @@ _BOLD_DIGITS = "𝟶𝟷𝟸𝟹𝟺𝟻𝟼𝟽𝟾𝟿"
 def bold_num(s: str) -> str:
     return "".join(_BOLD_DIGITS[int(c)] if c.isdigit() else c for c in str(s))
 
-def is_admin(uid: int) -> bool:
-    return not ADMIN_IDS or uid in ADMIN_IDS
-
 def extract_season(title: str) -> str:
     """Title se season number nikalne ka jugaad"""
     match = re.search(r'(?:Season|S)\s*(\d+)', title, re.IGNORECASE)
@@ -51,7 +46,7 @@ def extract_season(title: str) -> str:
     if "3rd" in title.lower(): return "03"
     if "4th" in title.lower(): return "04"
     if "5th" in title.lower(): return "05"
-    return "01" # Default agar kuch na mile
+    return "01" # Default season 1
 
 # ════════════════════════════════════════════════════════
 # JIKAN API FETCHING
@@ -83,7 +78,7 @@ def _parse_anime(a: dict) -> dict:
         "genres":    genres,
         "score":     str(a.get("score") or "?"),
         "episodes":  str(a.get("episodes") or "?"),
-        "season_num": extract_season(title), # Ab yahan real season number aayega
+        "season_num": extract_season(title),
         "runtime":   str(a.get("duration", "Unknown")),
         "status":    str(a.get("status", "Unknown")),
         "studios":   studios,
@@ -97,7 +92,7 @@ def _parse_anime(a: dict) -> dict:
 def build_info_caption(anime: dict) -> str:
     title    = anime["title"].upper()
     category = anime["kind"]
-    season   = anime["season_num"] # "01", "02" etc.
+    season   = anime["season_num"]
     
     episodes = anime["episodes"]
     runtime  = anime["runtime"].lower()
@@ -110,6 +105,7 @@ def build_info_caption(anime: dict) -> str:
     if len(synopsis) > 300:
         synopsis = synopsis[:297] + "..."
 
+    # TMKOC Style Code Integrated
     return (
         f"<b>​<blockquote>「 {title} 」</blockquote>\n"
         f"═══════════════════\n"
@@ -129,10 +125,18 @@ def build_info_caption(anime: dict) -> str:
 # ════════════════════════════════════════════════════════
 # COMMAND HANDLERS
 # ════════════════════════════════════════════════════════
+@app.on_message(filters.command("start") & filters.private)
+async def cmd_start(_, msg: Message):
+    # Koi bhi use kar sakta hai ab!
+    await msg.reply_text(
+        "🎌 <b>Kenshin Info Bot Online!</b>\n\n"
+        "Ab ye bot sabhi ke liye open hai.\n"
+        "👉 Use: <code>/info anime name</code>",
+        parse_mode=ParseMode.HTML
+    )
+
 @app.on_message(filters.command("info") & filters.private)
 async def cmd_info(_, msg: Message):
-    if not is_admin(msg.from_user.id): return
-    
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
         return await msg.reply_text("⚠️ Usage: <code>/info Dr Stone</code>")
@@ -159,7 +163,9 @@ async def cmd_info(_, msg: Message):
             await wait_msg.edit_text(caption)
             
     except Exception as e:
+        log.error(f"Error in info cmd: {e}")
         await wait_msg.edit_text(f"❌ Error: {e}")
 
 if __name__ == "__main__":
+    log.info("🎌 Kenshin Public Info Bot Started!")
     app.run()
