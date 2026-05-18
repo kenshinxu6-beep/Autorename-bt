@@ -1,18 +1,25 @@
-# Buster ki jagah humne Bookworm (Latest Stable) use kiya hai
-FROM python:3.11-slim-bookworm
+FROM python:3.12-slim
 
-# System dependencies (Ab bina kisi error ke chalega)
-RUN apt-get update && apt-get install -y git
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-# Work directory
+RUN apt update && apt install -y \
+    ffmpeg \
+    gcc \
+    git \
+    wget \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Requirements install
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Copy bot code
+RUN pip install --no-cache-dir -U pip
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY . .
 
-# Command to run bot
-CMD ["python3", "bot.py"]
+RUN mkdir -p downloads temp thumbnails
+
+CMD ["python", "main.py"]
