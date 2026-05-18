@@ -616,11 +616,12 @@ Use commands:
 # MAIN
 # =========================================================
 
-async def main():
+async def start_bot():
 
-    for i in range(8):
+    for _ in range(MAX_WORKERS):
+
         asyncio.create_task(
-            worker(i)
+            worker()
         )
 
     await bot.start()
@@ -629,13 +630,11 @@ async def main():
 
     await idle()
 
-# =========================================================
-# RUN
-# =========================================================
+    await bot.stop()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
 
-# =========================================================
-# END
-# =========================================================
+    asyncio.get_event_loop().run_until_complete(
+        start_bot()
+)
