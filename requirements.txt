@@ -1,4 +1,7 @@
 pyrofork
 tgcrypto
-aiohttp
-asyncio
+motor
+uvloop
+python-dotenv
+psutil
+aiofiles
