@@ -1,459 +1,305 @@
-# =========================================================
-# TELEGRAM AUTO RENAME BOT - ULTIMATE MAIN.PY
-# PYROFORK VERSION
-# =========================================================
+"""
+bot.py — Entry point. Wires clients, DB, handlers, and registers all filters.
+"""
 
-import os
-import re
-import sys
-import html
-import time
-import asyncio
-import shutil
-import random
-import string
-import psutil
-import uvloop
-
-from pathlib import Path
-from dotenv import load_dotenv
-from datetime import datetime
-
-from motor.motor_asyncio import AsyncIOMotorClient
-
+import asyncio, logging
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode
-from pyrogram.errors import FloodWait
-from pyrogram.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    Message
+from pyrogram.types import Message, CallbackQuery
+from config import Config
+from db import DB
+import handlers as H
+import file_processor as FP
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
+log = logging.getLogger("AutoRenameBot")
 
-# =========================================================
-# LOAD ENV
-# =========================================================
-
-load_dotenv()
-
-# Windows par test kar rahe ho toh uvloop error de sakta hai, VPS/Linux par sahi chalega
-try:
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-except Exception:
-    pass
-
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID"))
-MONGO_URI = os.getenv("MONGO_URI")
-DATABASE_NAME = os.getenv("DATABASE_NAME", "renamebot")
-
-# =========================================================
-# DIRECTORIES
-# =========================================================
-
-DOWNLOAD_DIR = Path("downloads")
-TEMP_DIR = Path("temp")
-THUMB_DIR = Path("thumbnails")
-
-for x in [DOWNLOAD_DIR, TEMP_DIR, THUMB_DIR]:
-    x.mkdir(exist_ok=True)
-
-# =========================================================
-# DATABASE
-# =========================================================
-
-mongo = AsyncIOMotorClient(MONGO_URI)
-db = mongo[DATABASE_NAME]
-
-users_col = db.users
-settings_col = db.settings
-stats_col = db.stats
-ban_col = db.bans
-queue_col = db.queue
-
-# =========================================================
-# BOT
-# =========================================================
-
+# ── Clients ──────────────────────────────────────────────────────────────
 bot = Client(
-    "RenameBot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    workers=50,
-    sleep_threshold=30,
-    parse_mode=ParseMode.HTML
+    "AutoRenameBot",
+    api_id=Config.API_ID,
+    api_hash=Config.API_HASH,
+    bot_token=Config.BOT_TOKEN,
+    workers=Config.WORKERS,
+    sleep_threshold=60,
 )
 
-# =========================================================
-# SETTINGS
-# =========================================================
-
-MAX_WORKERS = 2
-
-# NOTE: Purane string variables ko hata kar unhe upar wale Path variables se link rakha hai.
-
-# =========================================================
-# GLOBALS
-# =========================================================
-
-queue = asyncio.Queue()
-active_tasks = {}
-
-START_TEXT = """
-⚡ <b>ULTIMATE AUTO RENAME BOT</b>
-
-Send any video/document.
-
-Features:
-• Rename
-• Metadata
-• Queue
-• Thumbnail
-• Fast Upload
-• Progress Bar
-• PyroFork
-"""
-
-# =========================================================
-# HELPERS
-# =========================================================
-
-def humanbytes(size):
-    if not size:
-        return ""
-
-    power = 2**10
-    n = 0
-    Dic_powerN = {
-        0: " ",
-        1: "Ki",
-        2: "Mi",
-        3: "Gi",
-        4: "Ti"
-    }
-
-    while size > power:
-        size /= power
-        n += 1
-
-    return str(round(size, 2)) + " " + Dic_powerN[n] + "B"
-
-
-def progress_bar(percent):
-    filled = int(percent / 10)
-    return (
-        "▓" * filled +
-        "░" * (10 - filled)
+userbot = None
+if Config.STRING_SESSION:
+    userbot = Client(
+        "Userbot",
+        api_id=Config.API_ID,
+        api_hash=Config.API_HASH,
+        session_string=Config.STRING_SESSION,
+        workers=Config.WORKERS,
+        no_updates=True,
     )
 
+db = DB(Config.MONGO_URI, Config.DB_NAME)
 
-async def progress(current, total, message, start, action):
-    now = time.time()
-    diff = now - start
+# ── Inject shared objects ────────────────────────────────────────────────
+STATS  = {"dl": 0, "ul": 0}
+STATES = {}
 
-    if round(diff % 5) == 0:
-        percentage = current * 100 / total
-        speed = current / diff if diff > 0 else 0
-        elapsed = round(diff)
-        eta = round((total - current) / speed) if speed > 0 else 0
+H.bot     = bot;      H.db = db; H.userbot = userbot
+H.STATES  = STATES;   H.STATS = STATS
 
-        text = f"""
-⚡ <b>{action}</b>
+FP.bot    = bot;     FP.db = db; FP.userbot = userbot
+FP.STATES = STATES;  FP.STATS = STATS
 
-[{progress_bar(percentage)}]
+# ════════════════════════════════════════════════════════════════════════
+# COMMAND REGISTRATIONS
+# ════════════════════════════════════════════════════════════════════════
 
-<b>{percentage:.2f}%</b>
+# ── Start / Help / Panel ────────────────────────────────────────────────
+@bot.on_message(filters.command("start")    & filters.private)
+async def _start(c, m):          await H.cmd_start(c, m)
 
-📦 {humanbytes(current)} / {humanbytes(total)}
+@bot.on_message(filters.command("help")     & filters.private)
+async def _help(c, m):           await H.cmd_help(c, m)
 
-🚀 Speed: {humanbytes(speed)}/s
+@bot.on_message(filters.command("panel")    & filters.private)
+async def _panel(c, m):          await H.cmd_panel(c, m)
 
-⏳ ETA: {eta}s
+# ── Rename format ────────────────────────────────────────────────────────
+@bot.on_message(filters.command("format")   & filters.private)
+async def _format(c, m):         await H.cmd_format(c, m)
 
-🕒 Elapsed: {elapsed}s
-"""
-        try:
-            await message.edit_text(text)
-        except Exception:
-            pass
+@bot.on_message(filters.command("getfm")    & filters.private)
+async def _getfm(c, m):          await H.cmd_getfm(c, m)
 
-# =========================================================
-# DATABASE HELPERS
-# =========================================================
+@bot.on_message(filters.command("set_media")& filters.private)
+async def _setmedia(c, m):       await H.cmd_set_media(c, m)
 
-async def get_user(user_id):
-    return await settings_col.find_one({"user_id": user_id})
+@bot.on_message(filters.command("mode")     & filters.private)
+async def _mode(c, m):           await H.cmd_mode(c, m)
 
+@bot.on_message(filters.command("check")    & filters.private)
+async def _check(c, m):          await H.cmd_check(c, m)
 
-async def save_format(user_id, fmt):
-    await settings_col.update_one(
-        {"user_id": user_id},
-        {"$set": {"format": fmt}},
-        upsert=True
-    )
+# ── Queue ────────────────────────────────────────────────────────────────
+@bot.on_message(filters.command("queue")    & filters.private)
+async def _queue(c, m):          await H.cmd_queue(c, m)
 
+@bot.on_message(filters.command("clear")    & filters.private)
+async def _clear(c, m):          await H.cmd_clear(c, m)
 
-async def get_format(user_id):
-    data = await get_user(user_id)
-    if not data:
-        return "{filename}"
-    return data.get("format", "{filename}")
+# ── Caption ──────────────────────────────────────────────────────────────
+@bot.on_message(filters.command("setcp")    & filters.private)
+async def _setcp(c, m):          await H.cmd_setcp(c, m)
 
-# =========================================================
-# START
-# =========================================================
+@bot.on_message(filters.command("chkcp")    & filters.private)
+async def _chkcp(c, m):          await H.cmd_chkcp(c, m)
 
-@bot.on_message(filters.command("start"))
-async def start_cmd(_, message):
-    buttons = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("⚙ Panel", callback_data="panel"),
-                InlineKeyboardButton("📊 Status", callback_data="status")
-            ]
-        ]
-    )
-    await message.reply_text(START_TEXT, reply_markup=buttons)
+@bot.on_message(filters.command("delcp")    & filters.private)
+async def _delcp(c, m):          await H.cmd_delcp(c, m)
 
-# =========================================================
-# HELP
-# =========================================================
+# ── Thumbnail ─────────────────────────────────────────────────────────────
+@bot.on_message(filters.command("thumbsetting") & filters.private)
+async def _thumbsetting(c, m):   await H.cmd_thumbsetting(c, m)
 
-@bot.on_message(filters.command("help"))
-async def help_cmd(_, message):
-    txt = """
-⚡ <b>COMMANDS</b>
+@bot.on_message(filters.command("sthumb")   & filters.private)
+async def _sthumb(c, m):         await H.cmd_sthumb(c, m)
 
-/start
-/help
-/panel
-/format
-/queue
-/status
-/restart
-/stats
-/broadcast
-/ban
-/unban
-"""
-    await message.reply_text(txt)
+@bot.on_message(filters.command("viewthumb")& filters.private)
+async def _viewthumb(c, m):      await H.cmd_viewthumb(c, m)
 
-# =========================================================
-# FORMAT
-# =========================================================
+@bot.on_message(filters.command("delthumb") & filters.private)
+async def _delthumb(c, m):       await H.cmd_delthumb(c, m)
 
-@bot.on_message(filters.command("format"))
-async def format_cmd(_, message):
-    if len(message.command) < 2:
-        return await message.reply_text("Usage:\n/format {filename} - Anime TV")
+@bot.on_message(filters.command("qthumb")   & filters.private)
+async def _qthumb(c, m):         await H.cmd_qthumb(c, m)
 
-    fmt = message.text.split(None, 1)[1]
-    await save_format(message.from_user.id, fmt)
-    await message.reply_text("✅ Rename format saved")
+@bot.on_message(filters.command("thmbs")    & filters.private)
+async def _thmbs(c, m):          await H.cmd_thmbs(c, m)
 
-# =========================================================
-# STATUS
-# =========================================================
+@bot.on_message(filters.command("extthumb") & filters.private)
+async def _extthumb(c, m):       await H.cmd_extthumb(c, m)
 
-@bot.on_message(filters.command("status"))
-async def status_cmd(_, message):
-    cpu = psutil.cpu_percent()
-    ram = psutil.virtual_memory().percent
-    txt = f"""
-⚡ <b>BOT STATUS</b>
+# ── Metadata ──────────────────────────────────────────────────────────────
+@bot.on_message(filters.command("metadata") & filters.private)
+async def _metadata(c, m):       await H.cmd_metadata(c, m)
 
-🖥 CPU: {cpu}%
-🧠 RAM: {ram}%
-📦 Queue: {queue.qsize()}
-"""
-    await message.reply_text(txt)
+@bot.on_message(filters.command("settitle") & filters.private)
+async def _settitle(c, m):       await H.cmd_settitle(c, m)
 
-# =========================================================
-# QUEUE
-# =========================================================
+@bot.on_message(filters.command("setauthor")& filters.private)
+async def _setauthor(c, m):      await H.cmd_setauthor(c, m)
 
-@bot.on_message(filters.command("queue"))
-async def queue_cmd(_, message):
-    await message.reply_text(f"📦 Queue Size: {queue.qsize()}")
+@bot.on_message(filters.command("setartist")& filters.private)
+async def _setartist(c, m):      await H.cmd_setartist(c, m)
 
-# =========================================================
-# RENAME HANDLER
-# =========================================================
+@bot.on_message(filters.command("setaudio") & filters.private)
+async def _setaudio(c, m):       await H.cmd_setaudio(c, m)
 
-@bot.on_message(filters.private & (filters.document | filters.video))
-async def rename_handler(_, message):
-    wait = await message.reply_text("📥 Added To Queue...")
-    await queue.put((message, wait))
+@bot.on_message(filters.command("setsubtitle") & filters.private)
+async def _setsubtitle(c, m):    await H.cmd_setsubtitle(c, m)
 
-# =========================================================
-# WORKER
-# =========================================================
+@bot.on_message(filters.command("setvideo") & filters.private)
+async def _setvideo(c, m):       await H.cmd_setvideo(c, m)
 
-async def worker(worker_id):
-    while True:
-        message, wait = await queue.get()
-        try:
-            media = message.document or message.video
-            old_name = media.file_name
-            user_id = message.from_user.id
+# ── Dump channel ──────────────────────────────────────────────────────────
+@bot.on_message(filters.command("setdump")  & filters.private)
+async def _setdump(c, m):        await H.cmd_setdump(c, m)
 
-            fmt = await get_format(user_id)
-            filename, ext = os.path.splitext(old_name)
+@bot.on_message(filters.command("chkdump")  & filters.private)
+async def _chkdump(c, m):        await H.cmd_chkdump(c, m)
 
-            new_name = fmt.replace("{filename}", filename) + ext
-            download_path = DOWNLOAD_DIR / new_name  # Ab ye crash nahi karega
+@bot.on_message(filters.command("deldump")  & filters.private)
+async def _deldump(c, m):        await H.cmd_deldump(c, m)
 
-            start_time = time.time()
-            downloaded = await message.download(
-                file_name=str(download_path),
-                progress=progress,
-                progress_args=(wait, start_time, "Downloading")
-            )
+# ── PDF Banner ────────────────────────────────────────────────────────────
+@bot.on_message(filters.command("banner")   & filters.private)
+async def _banner(c, m):         await H.cmd_banner(c, m)
 
-            await wait.edit_text("⚡ Uploading...")
-            upload_time = time.time()
+@bot.on_message(filters.command("sbanner")  & filters.private)
+async def _sbanner(c, m):        await H.cmd_sbanner(c, m)
 
-            await bot.send_document(
-                chat_id=message.chat.id,
-                document=downloaded,
-                file_name=new_name,
-                progress=progress,
-                progress_args=(wait, upload_time, "Uploading")
-            )
+# ── Media tools ───────────────────────────────────────────────────────────
+@bot.on_message(filters.command("mediainfo")& filters.private)
+async def _mediainfo(c, m):      await H.cmd_mediainfo(c, m)
 
-            if os.path.exists(downloaded):
-                os.remove(downloaded)
-            await wait.delete()
+@bot.on_message(filters.command("upscale")  & filters.private)
+async def _upscale(c, m):        await H.cmd_upscale(c, m)
 
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-        except Exception as e:
-            try:
-                await wait.edit_text(f"❌ Error:\n{e}")
-            except Exception:
-                pass
-        finally:
-            queue.task_done()
+# ── Stats / Info ──────────────────────────────────────────────────────────
+@bot.on_message(filters.command("leaderboard") & filters.private)
+async def _lb(c, m):             await H.cmd_leaderboard(c, m)
 
-# =========================================================
-# STATS
-# =========================================================
+@bot.on_message(filters.command("stats")    & filters.private)
+async def _stats(c, m):          await H.cmd_stats(c, m)
 
-@bot.on_message(filters.command("stats"))
-async def stats_cmd(_, message):
-    users = await settings_col.count_documents({})
-    txt = f"""
-⚡ <b>BOT STATS</b>
+@bot.on_message(filters.command("status")   & filters.private)
+async def _status(c, m):         await H.cmd_status(c, m)
 
-👤 Users: {users}
-📦 Queue: {queue.qsize()}
-"""
-    await message.reply_text(txt)
+@bot.on_message(filters.command("transfers")& filters.private)
+async def _transfers(c, m):      await H.cmd_transfers(c, m)
 
-# =========================================================
-# BROADCAST
-# =========================================================
+# ── Admin ────────────────────────────────────────────────────────────────
+@bot.on_message(filters.command("ban")      & filters.private)
+async def _ban(c, m):            await H.cmd_ban(c, m)
 
-@bot.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
-async def broadcast(_, message):
-    if not message.reply_to_message:
-        return await message.reply_text("Reply to message")
+@bot.on_message(filters.command("unban")    & filters.private)
+async def _unban(c, m):          await H.cmd_unban(c, m)
 
-    sent = 0
-    async for user in settings_col.find():
-        try:
-            await message.reply_to_message.copy(user["user_id"])
-            sent += 1
-        except Exception:
-            pass
+@bot.on_message(filters.command("banlist")  & filters.private)
+async def _banlist(c, m):        await H.cmd_banlist(c, m)
 
-    await message.reply_text(f"✅ Broadcast Done\n\nSent: {sent}")
+@bot.on_message(filters.command("userinfo") & filters.private)
+async def _userinfo(c, m):       await H.cmd_userinfo(c, m)
 
-# =========================================================
-# BAN
-# =========================================================
+@bot.on_message(filters.command("broadcast")& filters.private)
+async def _broadcast(c, m):      await H.cmd_broadcast(c, m)
 
-@bot.on_message(filters.command("ban") & filters.user(OWNER_ID))
-async def ban(_, message):
-    if len(message.command) < 2:
-        return
+@bot.on_message(filters.command("alive")    & filters.private)
+async def _alive(c, m):          await H.cmd_alive(c, m)
 
-    uid = int(message.command[1])
-    await ban_col.insert_one({"user_id": uid})
-    await message.reply_text(f"✅ Banned {uid}")
+@bot.on_message(filters.command("restart")  & filters.private)
+async def _restart(c, m):        await H.cmd_restart(c, m)
 
-# =========================================================
-# UNBAN
-# =========================================================
+@bot.on_message(filters.command("upd")      & filters.private)
+async def _upd(c, m):            await H.cmd_upd(c, m)
 
-@bot.on_message(filters.command("unban") & filters.user(OWNER_ID))
-async def unban(_, message):
-    if len(message.command) < 2:
-        return
+@bot.on_message(filters.command("clean")    & filters.private)
+async def _clean(c, m):          await H.cmd_clean(c, m)
 
-    uid = int(message.command[1])
-    await ban_col.delete_one({"user_id": uid})
-    await message.reply_text(f"✅ Unbanned {uid}")
+# ── Bot UI (Owner) ────────────────────────────────────────────────────────
+@bot.on_message(filters.command("botui")       & filters.private)
+async def _botui(c, m):          await H.cmd_botui(c, m)
 
-# =========================================================
-# RESTART
-# =========================================================
+@bot.on_message(filters.command("setstartmsg") & filters.private)
+async def _setstartmsg(c, m):    await H.cmd_setstartmsg(c, m)
 
-@bot.on_message(filters.command("restart") & filters.user(OWNER_ID))
-async def restart(_, message):
-    await message.reply_text("♻ Restarting...")
-    os.execl(sys.executable, sys.executable, *sys.argv)
+@bot.on_message(filters.command("setstartpic") & filters.private)
+async def _setstartpic(c, m):    await H.cmd_setstartpic(c, m)
 
-# =========================================================
-# CALLBACKS
-# =========================================================
+@bot.on_message(filters.command("delstartpic") & filters.private)
+async def _delstartpic(c, m):    await H.cmd_delstartpic(c, m)
+
+@bot.on_message(filters.command("setbtn")      & filters.private)
+async def _setbtn(c, m):         await H.cmd_setbtn(c, m)
+
+@bot.on_message(filters.command("viewbtn")     & filters.private)
+async def _viewbtn(c, m):        await H.cmd_viewbtn(c, m)
+
+@bot.on_message(filters.command("delbtn")      & filters.private)
+async def _delbtn(c, m):         await H.cmd_delbtn(c, m)
+
+@bot.on_message(filters.command("viewstart")   & filters.private)
+async def _viewstart(c, m):      await H.cmd_viewstart(c, m)
+
+@bot.on_message(filters.command("resetstart")  & filters.private)
+async def _resetstart(c, m):     await H.cmd_resetstart(c, m)
+
+# ════════════════════════════════════════════════════════════════════════
+# CALLBACK QUERY HANDLER
+# ════════════════════════════════════════════════════════════════════════
 
 @bot.on_callback_query()
-async def callback(_, query: CallbackQuery):
-    if query.data == "status":
-        cpu = psutil.cpu_percent()
-        ram = psutil.virtual_memory().percent
-        txt = f"""
-⚡ <b>STATUS</b>
+async def _cb(client, cq: CallbackQuery):
+    d = cq.data or ""
+    if d.startswith("rn_"):
+        await FP.cb_rename(client, cq)
+    else:
+        await H.cb_generic(client, cq)
 
-🖥 CPU: {cpu}%
-🧠 RAM: {ram}%
-📦 Queue: {queue.qsize()}
-"""
-        await query.message.edit_text(txt)
+# ════════════════════════════════════════════════════════════════════════
+# MESSAGE HANDLER — files + state replies
+# ════════════════════════════════════════════════════════════════════════
 
-    elif query.data == "panel":
-        txt = """
-⚙ <b>PANEL</b>
+@bot.on_message(filters.private & ~filters.command(
+    ["start","help","panel","format","getfm","set_media","mode","check",
+     "queue","clear","setcp","chkcp","delcp","thumbsetting","sthumb",
+     "viewthumb","delthumb","qthumb","thmbs","extthumb","metadata",
+     "settitle","setauthor","setartist","setaudio","setsubtitle","setvideo",
+     "setdump","chkdump","deldump","banner","sbanner","mediainfo","upscale",
+     "leaderboard","stats","status","transfers","ban","unban","banlist",
+     "userinfo","broadcast","alive","restart","upd","clean",
+     "botui","setstartmsg","setstartpic","delstartpic",
+     "setbtn","viewbtn","delbtn","viewstart","resetstart"]
+))
+async def _msg_handler(client, msg: Message):
+    uid = msg.from_user.id
 
-Use commands:
+    # 1. Check active state first
+    if STATES.get(uid):
+        handled = await H.handle_state(client, msg)
+        if handled: return
 
-/format
-/status
-/queue
-/help
-"""
-        await query.message.edit_text(txt)
+    # 2. File received
+    if msg.document or msg.video or msg.audio:
+        await FP.handle_file(client, msg)
+        return
 
-# =========================================================
-# MAIN
-# =========================================================
+    # 3. Unknown text
+    await msg.reply("Send me a file to rename, or use /help to see all commands.")
 
-async def start_bot():
-    # Workers ko background mein start karna
-    for i in range(MAX_WORKERS):
-        asyncio.create_task(worker(i))
+# ════════════════════════════════════════════════════════════════════════
+# STARTUP
+# ════════════════════════════════════════════════════════════════════════
+
+async def main():
+    await db.init()
+    log.info("✅ Database ready")
 
     await bot.start()
-    print("⚡ BOT STARTED")
+    me = await bot.get_me()
+    log.info(f"✅ Bot started: @{me.username}")
 
-    # Isse event loop open rahega bina freeze huye
+    if userbot:
+        await userbot.start()
+        log.info("✅ Userbot started (500 Mbps+ download enabled)")
+
+    if Config.LOG_CHANNEL:
+        try:
+            await bot.send_message(Config.LOG_CHANNEL,
+                f"🟢 **Bot started!**\n@{me.username} is online.")
+        except: pass
+
+    log.info("🚀 AutoRenameBot running...")
     await asyncio.Event().wait()
 
-
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(start_bot())
+    asyncio.run(main())
