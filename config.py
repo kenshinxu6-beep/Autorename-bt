@@ -1,22 +1,13 @@
-import os
-from dotenv import load_dotenv
+from os import environ
 
-load_dotenv()
-
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID"))
-MAX_WORKERS = 2
-
-MONGO_URI = os.getenv("MONGO_URI")
-DATABASE_NAME = os.getenv(
-    "DATABASE_NAME",
-    "renamebot"
-)
-
-MAX_WORKERS = 8
-
-DOWNLOAD_DIR = "downloads"
-THUMB_DIR = "thumbnails"
-TEMP_DIR = "temp"
+class Config:
+    BOT_TOKEN      = environ.get("BOT_TOKEN", "")
+    API_ID         = int(environ.get("API_ID", 0))
+    API_HASH       = environ.get("API_HASH", "")
+    MONGO_URI      = environ.get("MONGO_URI", "")
+    OWNER_ID       = int(environ.get("OWNER_ID", 0))
+    LOG_CHANNEL    = int(environ.get("LOG_CHANNEL", 0))
+    STRING_SESSION = environ.get("STRING_SESSION", "")   # userbot for 500mbps+ speed
+    WORKERS        = int(environ.get("WORKERS", 8))
+    FSUB_CHANNEL   = environ.get("FSUB_CHANNEL", "")
+    DB_NAME        = "AutoRenameBot"
