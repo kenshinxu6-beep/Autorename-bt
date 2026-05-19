@@ -626,10 +626,14 @@ Use commands:
 
 async def start_bot():
 
-    for _ in range(MAX_WORKERS):
+    tasks = []
 
-        asyncio.create_task(
-            worker()
+    for i in range(MAX_WORKERS):
+
+        tasks.append(
+            asyncio.create_task(
+                worker(i)
+            )
         )
 
     await bot.start()
@@ -645,4 +649,4 @@ if __name__ == "__main__":
 
     asyncio.get_event_loop().run_until_complete(
         start_bot()
-)
+    )
