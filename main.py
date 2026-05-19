@@ -2,23 +2,6 @@
 # TELEGRAM AUTO RENAME BOT - ULTIMATE MAIN.PY
 # PYROFORK VERSION
 # =========================================================
-# FEATURES:
-# • Auto Rename
-# • Metadata
-# • Queue System
-# • Progress Bar
-# • Thumbnail
-# • Start Image
-# • Start Message
-# • Multi Workers
-# • Broadcast
-# • Ban System
-# • Stats
-# • Queue Manager
-# • Railway Ready
-# • VPS Ready
-# • PyroFork Support
-# =========================================================
 
 import os
 import re
@@ -38,7 +21,7 @@ from datetime import datetime
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 from pyrogram.types import (
@@ -54,9 +37,11 @@ from pyrogram.types import (
 
 load_dotenv()
 
-asyncio.set_event_loop_policy(
-    uvloop.EventLoopPolicy()
-)
+# Windows par test kar rahe ho toh uvloop error de sakta hai, VPS/Linux par sahi chalega
+try:
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except Exception:
+    pass
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
@@ -81,7 +66,6 @@ for x in [DOWNLOAD_DIR, TEMP_DIR, THUMB_DIR]:
 # =========================================================
 
 mongo = AsyncIOMotorClient(MONGO_URI)
-
 db = mongo[DATABASE_NAME]
 
 users_col = db.users
@@ -103,15 +87,15 @@ bot = Client(
     sleep_threshold=30,
     parse_mode=ParseMode.HTML
 )
+
 # =========================================================
 # SETTINGS
 # =========================================================
 
 MAX_WORKERS = 2
 
-DOWNLOAD_DIR = "downloads"
-TEMP_DIR = "temp"
-THUMB_DIR = "thumbnails"
+# NOTE: Purane string variables ko hata kar unhe upar wale Path variables se link rakha hai.
+
 # =========================================================
 # GLOBALS
 # =========================================================
@@ -167,26 +151,15 @@ def progress_bar(percent):
     )
 
 
-async def progress(
-    current,
-    total,
-    message,
-    start,
-    action
-):
+async def progress(current, total, message, start, action):
     now = time.time()
-
     diff = now - start
 
     if round(diff % 5) == 0:
-
         percentage = current * 100 / total
-
-        speed = current / diff
-
+        speed = current / diff if diff > 0 else 0
         elapsed = round(diff)
-
-        eta = round((total - current) / speed)
+        eta = round((total - current) / speed) if speed > 0 else 0
 
         text = f"""
 ⚡ <b>{action}</b>
@@ -203,10 +176,9 @@ async def progress(
 
 🕒 Elapsed: {elapsed}s
 """
-
         try:
-            await message.edit(text)
-        except:
+            await message.edit_text(text)
+        except Exception:
             pass
 
 # =========================================================
@@ -214,9 +186,7 @@ async def progress(
 # =========================================================
 
 async def get_user(user_id):
-    return await settings_col.find_one({
-        "user_id": user_id
-    })
+    return await settings_col.find_one({"user_id": user_id})
 
 
 async def save_format(user_id, fmt):
@@ -228,12 +198,9 @@ async def save_format(user_id, fmt):
 
 
 async def get_format(user_id):
-
     data = await get_user(user_id)
-
     if not data:
         return "{filename}"
-
     return data.get("format", "{filename}")
 
 # =========================================================
@@ -242,27 +209,15 @@ async def get_format(user_id):
 
 @bot.on_message(filters.command("start"))
 async def start_cmd(_, message):
-
     buttons = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(
-                    "⚙ Panel",
-                    callback_data="panel"
-                ),
-
-                InlineKeyboardButton(
-                    "📊 Status",
-                    callback_data="status"
-                )
+                InlineKeyboardButton("⚙ Panel", callback_data="panel"),
+                InlineKeyboardButton("📊 Status", callback_data="status")
             ]
         ]
     )
-
-    await message.reply_text(
-        START_TEXT,
-        reply_markup=buttons
-    )
+    await message.reply_text(START_TEXT, reply_markup=buttons)
 
 # =========================================================
 # HELP
@@ -270,7 +225,6 @@ async def start_cmd(_, message):
 
 @bot.on_message(filters.command("help"))
 async def help_cmd(_, message):
-
     txt = """
 ⚡ <b>COMMANDS</b>
 
@@ -286,7 +240,6 @@ async def help_cmd(_, message):
 /ban
 /unban
 """
-
     await message.reply_text(txt)
 
 # =========================================================
@@ -295,25 +248,12 @@ async def help_cmd(_, message):
 
 @bot.on_message(filters.command("format"))
 async def format_cmd(_, message):
-
     if len(message.command) < 2:
-        return await message.reply_text(
-            "Usage:\n/format {filename} - Anime TV"
-        )
+        return await message.reply_text("Usage:\n/format {filename} - Anime TV")
 
-    fmt = message.text.split(
-        None,
-        1
-    )[1]
-
-    await save_format(
-        message.from_user.id,
-        fmt
-    )
-
-    await message.reply_text(
-        "✅ Rename format saved"
-    )
+    fmt = message.text.split(None, 1)[1]
+    await save_format(message.from_user.id, fmt)
+    await message.reply_text("✅ Rename format saved")
 
 # =========================================================
 # STATUS
@@ -321,11 +261,8 @@ async def format_cmd(_, message):
 
 @bot.on_message(filters.command("status"))
 async def status_cmd(_, message):
-
     cpu = psutil.cpu_percent()
-
     ram = psutil.virtual_memory().percent
-
     txt = f"""
 ⚡ <b>BOT STATUS</b>
 
@@ -333,7 +270,6 @@ async def status_cmd(_, message):
 🧠 RAM: {ram}%
 📦 Queue: {queue.qsize()}
 """
-
     await message.reply_text(txt)
 
 # =========================================================
@@ -342,93 +278,43 @@ async def status_cmd(_, message):
 
 @bot.on_message(filters.command("queue"))
 async def queue_cmd(_, message):
-
-    await message.reply_text(
-        f"📦 Queue Size: {queue.qsize()}"
-    )
+    await message.reply_text(f"📦 Queue Size: {queue.qsize()}")
 
 # =========================================================
 # RENAME HANDLER
 # =========================================================
 
-@bot.on_message(
-    filters.private &
-    (
-        filters.document |
-        filters.video
-    )
-)
+@bot.on_message(filters.private & (filters.document | filters.video))
 async def rename_handler(_, message):
-
-    wait = await message.reply_text(
-        "📥 Added To Queue..."
-    )
-
-    await queue.put(
-        (
-            message,
-            wait
-        )
-    )
+    wait = await message.reply_text("📥 Added To Queue...")
+    await queue.put((message, wait))
 
 # =========================================================
 # WORKER
 # =========================================================
 
 async def worker(worker_id):
-
     while True:
-
         message, wait = await queue.get()
-
         try:
-
-            media = (
-                message.document or
-                message.video
-            )
-
+            media = message.document or message.video
             old_name = media.file_name
-
             user_id = message.from_user.id
 
             fmt = await get_format(user_id)
+            filename, ext = os.path.splitext(old_name)
 
-            filename = os.path.splitext(
-                old_name
-            )[0]
-
-            ext = os.path.splitext(
-                old_name
-            )[1]
-
-            new_name = (
-                fmt.replace(
-                    "{filename}",
-                    filename
-                ) + ext
-            )
-
-            download_path = (
-                DOWNLOAD_DIR / new_name
-            )
+            new_name = fmt.replace("{filename}", filename) + ext
+            download_path = DOWNLOAD_DIR / new_name  # Ab ye crash nahi karega
 
             start_time = time.time()
-
             downloaded = await message.download(
                 file_name=str(download_path),
                 progress=progress,
-                progress_args=(
-                    wait,
-                    start_time,
-                    "Downloading"
-                )
+                progress_args=(wait, start_time, "Downloading")
             )
 
-            await wait.edit(
-                "⚡ Uploading..."
-            )
-
+            await wait.edit_text("⚡ Uploading...")
             upload_time = time.time()
 
             await bot.send_document(
@@ -436,30 +322,22 @@ async def worker(worker_id):
                 document=downloaded,
                 file_name=new_name,
                 progress=progress,
-                progress_args=(
-                    wait,
-                    upload_time,
-                    "Uploading"
-                )
+                progress_args=(wait, upload_time, "Uploading")
             )
 
-            os.remove(downloaded)
-
+            if os.path.exists(downloaded):
+                os.remove(downloaded)
             await wait.delete()
 
         except FloodWait as e:
-
-            await asyncio.sleep(
-                e.value
-            )
-
+            await asyncio.sleep(e.value)
         except Exception as e:
-
-            await wait.edit(
-                f"❌ Error:\n{e}"
-            )
-
-        queue.task_done()
+            try:
+                await wait.edit_text(f"❌ Error:\n{e}")
+            except Exception:
+                pass
+        finally:
+            queue.task_done()
 
 # =========================================================
 # STATS
@@ -467,118 +345,68 @@ async def worker(worker_id):
 
 @bot.on_message(filters.command("stats"))
 async def stats_cmd(_, message):
-
     users = await settings_col.count_documents({})
-
     txt = f"""
 ⚡ <b>BOT STATS</b>
 
 👤 Users: {users}
-
 📦 Queue: {queue.qsize()}
 """
-
     await message.reply_text(txt)
 
 # =========================================================
 # BROADCAST
 # =========================================================
 
-@bot.on_message(
-    filters.command("broadcast") &
-    filters.user(OWNER_ID)
-)
+@bot.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
 async def broadcast(_, message):
-
     if not message.reply_to_message:
-        return await message.reply_text(
-            "Reply to message"
-        )
+        return await message.reply_text("Reply to message")
 
     sent = 0
-
     async for user in settings_col.find():
-
         try:
-
-            await message.reply_to_message.copy(
-                user["user_id"]
-            )
-
+            await message.reply_to_message.copy(user["user_id"])
             sent += 1
-
-        except:
+        except Exception:
             pass
 
-    await message.reply_text(
-        f"✅ Broadcast Done\n\nSent: {sent}"
-    )
+    await message.reply_text(f"✅ Broadcast Done\n\nSent: {sent}")
 
 # =========================================================
 # BAN
 # =========================================================
 
-@bot.on_message(
-    filters.command("ban") &
-    filters.user(OWNER_ID)
-)
+@bot.on_message(filters.command("ban") & filters.user(OWNER_ID))
 async def ban(_, message):
-
     if len(message.command) < 2:
         return
 
     uid = int(message.command[1])
-
-    await ban_col.insert_one({
-        "user_id": uid
-    })
-
-    await message.reply_text(
-        f"✅ Banned {uid}"
-    )
+    await ban_col.insert_one({"user_id": uid})
+    await message.reply_text(f"✅ Banned {uid}")
 
 # =========================================================
 # UNBAN
 # =========================================================
 
-@bot.on_message(
-    filters.command("unban") &
-    filters.user(OWNER_ID)
-)
+@bot.on_message(filters.command("unban") & filters.user(OWNER_ID))
 async def unban(_, message):
-
     if len(message.command) < 2:
         return
 
     uid = int(message.command[1])
-
-    await ban_col.delete_one({
-        "user_id": uid
-    })
-
-    await message.reply_text(
-        f"✅ Unbanned {uid}"
-    )
+    await ban_col.delete_one({"user_id": uid})
+    await message.reply_text(f"✅ Unbanned {uid}")
 
 # =========================================================
 # RESTART
 # =========================================================
 
-@bot.on_message(
-    filters.command("restart") &
-    filters.user(OWNER_ID)
-)
+@bot.on_message(filters.command("restart") & filters.user(OWNER_ID))
 async def restart(_, message):
-
-    await message.reply_text(
-        "♻ Restarting..."
-    )
-
-    os.execl(
-        sys.executable,
-        sys.executable,
-        *sys.argv
-    )
+    await message.reply_text("♻ Restarting...")
+    os.execl(sys.executable, sys.executable, *sys.argv)
 
 # =========================================================
 # CALLBACKS
@@ -586,27 +414,19 @@ async def restart(_, message):
 
 @bot.on_callback_query()
 async def callback(_, query: CallbackQuery):
-
     if query.data == "status":
-
         cpu = psutil.cpu_percent()
-
         ram = psutil.virtual_memory().percent
-
         txt = f"""
 ⚡ <b>STATUS</b>
 
 🖥 CPU: {cpu}%
-
 🧠 RAM: {ram}%
-
 📦 Queue: {queue.qsize()}
 """
-
         await query.message.edit_text(txt)
 
     elif query.data == "panel":
-
         txt = """
 ⚙ <b>PANEL</b>
 
@@ -617,7 +437,6 @@ Use commands:
 /queue
 /help
 """
-
         await query.message.edit_text(txt)
 
 # =========================================================
@@ -625,28 +444,16 @@ Use commands:
 # =========================================================
 
 async def start_bot():
-
-    tasks = []
-
+    # Workers ko background mein start karna
     for i in range(MAX_WORKERS):
-
-        tasks.append(
-            asyncio.create_task(
-                worker(i)
-            )
-        )
+        asyncio.create_task(worker(i))
 
     await bot.start()
-
     print("⚡ BOT STARTED")
 
-    await idle()
-
-    await bot.stop()
+    # Isse event loop open rahega bina freeze huye
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-
-    asyncio.get_event_loop().run_until_complete(
-        start_bot()
-    )
+    asyncio.get_event_loop().run_until_complete(start_bot())
