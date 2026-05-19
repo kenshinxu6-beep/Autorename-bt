@@ -1,7 +1,7 @@
 pyrofork
 tgcrypto
 motor
-uvloop
-python-dotenv
+aiohttp
+Pillow
+pymediainfo
 psutil
-aiofiles
