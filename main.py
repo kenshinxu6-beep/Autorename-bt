@@ -99,7 +99,7 @@ bot = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=200,
+    workers=50,
     sleep_threshold=30,
     parse_mode=ParseMode.HTML
 )
