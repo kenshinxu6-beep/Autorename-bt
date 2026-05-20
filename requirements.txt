@@ -1,7 +1,0 @@
-pyrofork
-tgcrypto
-motor
-aiohttp
-Pillow
-pymediainfo
-psutil
