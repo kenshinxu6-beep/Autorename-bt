@@ -1,17 +1,17 @@
-FROM python:3.11-slim
-
-WORKDIR /app
+FROM python:3.11-slim-bookworm
 
 RUN apt-get update && apt-get install -y \
+    git \
     ffmpeg \
     libmediainfo0v5 \
     mediainfo \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
+WORKDIR /app
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "bot.py"]
+CMD ["python3", "bot.py"]
