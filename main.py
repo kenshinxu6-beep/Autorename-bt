@@ -25,11 +25,11 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════
 #  ENV
 # ═══════════════════════════════════════════════════════
-API_ID    = int(os.getenv("API_ID", "0"))
-API_HASH  = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-OWNER_ID  = int(os.getenv("OWNER_ID", os.getenv("KENSHIN_ANIME_OWNER", "0")))
+API_ID    = 37407868
+API_HASH  = "d7d3bff9f7cf9f3b111129bdbd13a065"
+BOT_TOKEN = "8285265972:AAGVX-BGABNk1nHBZ2Sr3gUSQ2XHfH7KWSU"
+MONGO_URI = "mongodb+srv://kenshinxu1:iammohitgurjar.1@kenshinfileshere.fyvrwjd.mongodb.net/?appName=Kenshinfileshere"
+OWNER_ID  = 6728678197
 MAX_WORKERS = 6   # concurrent tasks per user (increased for speed)
 
 _lc = os.getenv("LOG_CHANNEL", "").strip()
