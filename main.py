@@ -780,8 +780,8 @@ async def start_cmd(client, msg: Message):
         f"• ✅ Apply HD thumbnail & custom caption\n"
         f"• ✅ Handle **{MAX_TASKS}** concurrent tasks per user\n\n"
         f"Tap ⚙️ **Settings** to configure!\n\n"
-        f"**Support:** @KENSHIN_ANIME_CHAT"
-    )
+        f"**Support:** @KENSHIN_ANIME_CHAT")
+   
     img = bs.get("start_img")
     if img:
         try:
