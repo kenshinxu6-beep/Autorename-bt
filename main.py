@@ -751,7 +751,7 @@ def start_kb():
          InlineKeyboardButton("❓ Help",      callback_data="help")],
         [InlineKeyboardButton("✨ Premium",   callback_data="premium_info"),
          InlineKeyboardButton("📊 Stats",    callback_data="my_stats")],
-        [InlineKeyboardButton("👑 Owner",    url="https://t.me/KENSHIN_ANIME"),
+        [InlineKeyboardButton("👑 Owner",    url="https://t.me/KENSHIN_ANIME_OWNER"),
          InlineKeyboardButton("💬 Support",  url="https://t.me/KENSHIN_ANIME_CHAT")],
     ])
 
@@ -773,17 +773,18 @@ async def start_cmd(client, msg: Message):
     prem = await is_premium(uid)
     
     # Ye raha naya replace karne wala code:
-    text = bs.get("start_msg") or (
-        f"{'✨' if prem else '👋'} **Welcome, {msg.from_user.first_name}!**\n\n"
-        f"{'🌟 You are a **Premium** user!\n\n' if prem else ''}"
-        "Send me any **video / audio / document** and I'll:\n"
-        "• ✅ Rename with your custom format\n"
-        "• ✅ Set **all** metadata fresh (Title, Author, Artist, Audio, Sub, Video)\n"
-        "• ✅ Apply HD thumbnail & custom caption\n"
-        f"• ✅ Handle **{MAX_TASKS}** concurrent tasks per user\n\n"
-        "Tap ⚙️ **Settings** to configure!\n\n"
-        "**Support:** @KENSHIN_ANIME_CHAT"
-  )
+    premium_text = "🌟 You are a **Premium** user!\n\n" if prem else ""
+
+text = bs.get("start_msg") or (
+    f"{'✨' if prem else '👋'} **Welcome, {msg.from_user.first_name}!**\n\n"
+    f"{premium_text}"
+    "Send me any **video / audio / document** and I'll:\n"
+    "• ✅ Rename with your custom format\n"
+    "• ✅ Set all metadata fresh\n"
+    f"• ✅ Handle **{MAX_TASKS}** concurrent tasks per user\n\n"
+    "Tap ⚙️ **Settings** to configure!\n\n"
+    "**Support:** @KENSHIN_ANIME_CHAT"
+)
   
     img = bs.get("start_img")
     if img:
