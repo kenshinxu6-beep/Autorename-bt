@@ -1,6 +1,6 @@
 """
 KenshinRenameBot v6.0  ◈ PREMIUM
-Owner  : @KENSHIN_ANIME
+Owner  : @KENSHIN_ANIME_OWNER
 Support: @KENSHIN_ANIME_CHAT
 Channel: @Kenshin_Anime
 
@@ -80,7 +80,8 @@ DEFAULT_USER = {
     "media_format":  "video",
 }
 
-_BOT_LIMIT_KEY = "file_size_limit"
+_BOT_LIMIT_KEY  = "file_size_limit"
+_PREM_LIMIT_KEY = "premium_size_limit"
 
 async def get_size_limit() -> int:
     s = await settings_col.find_one({"_id": "global"})
@@ -88,6 +89,13 @@ async def get_size_limit() -> int:
 
 async def set_size_limit(bytes_val: int):
     await settings_col.update_one({"_id": "global"}, {"$set": {_BOT_LIMIT_KEY: bytes_val}}, upsert=True)
+
+async def get_premium_limit() -> int:
+    s = await settings_col.find_one({"_id": "global"})
+    return int((s or {}).get(_PREM_LIMIT_KEY, 0))
+
+async def set_premium_limit(bytes_val: int):
+    await settings_col.update_one({"_id": "global"}, {"$set": {_PREM_LIMIT_KEY: bytes_val}}, upsert=True)
 
 async def get_user(uid: int) -> dict:
     u = await users_col.find_one({"_id": uid})
@@ -557,16 +565,28 @@ async def process_rename(client: Client, msg: Message, user: dict, task_id: str)
     info = extract_info(base_name, msg.from_user)
 
     # File size check
-    if uid != OWNER_ID and not await is_premium(uid):
+    if uid == OWNER_ID:
+        pass  # owner: no limit
+    elif await is_premium(uid):
+        prem_limit = await get_premium_limit()
+        if prem_limit and file_size > prem_limit:
+            await remove_pending(task_id)
+            return await msg.reply_text(
+                "❌ **File too large for Premium!**\n\n"
+                "📦 Your file: `" + human(file_size) + "`\n"
+                "📏 Premium Limit: `" + human(prem_limit) + "`\n\n"
+                "Contact @KENSHIN_ANIME to increase limit."
+            )
+    else:
         limit = await get_size_limit()
         if limit and file_size > limit:
             await remove_pending(task_id)
             return await msg.reply_text(
-                f"❌ **File too large!**\n\n"
-                f"📦 Your file: `{human(file_size)}`\n"
-                f"📏 Limit: `{human(limit)}`\n\n"
-                f"✨ Get **Premium** for unlimited size!\n"
-                f"Contact @KENSHIN_ANIME"
+                "❌ **File too large!**\n\n"
+                "📦 Your file: `" + human(file_size) + "`\n"
+                "📏 Limit: `" + human(limit) + "`\n\n"
+                "✨ Get **Premium** for higher limits!\n"
+                "Contact @KENSHIN_ANIME"
             )
 
     # ── BUG FIX: Build final_name cleanly ──────────────────
@@ -813,6 +833,13 @@ async def photo_handler(client, msg: Message):
         await set_bot_setting("start_img", msg.photo.file_id)
         user_states.pop(uid, None)
         await msg.reply_text("✅ **Global start image updated!**")
+    elif state == "set_settings_img":
+        if uid != OWNER_ID:
+            user_states.pop(uid, None)
+            return
+        await set_bot_setting("settings_img", msg.photo.file_id)
+        user_states.pop(uid, None)
+        await msg.reply_text("✅ **Settings image updated! Users will see it when opening /settings.**")
     else:
         await msg.reply_text("📸 Nice pic! Use /setthumb or ⚙️ Settings → 🖼 Set Thumbnail.")
 
@@ -825,7 +852,7 @@ ALL_CMDS = [
     "setmedia","ping","allusers","getthumb","delthumb","resetme","setthumb","setlimit",
     "getlimit","myid","info","setcaption","setformat","setaudio","setsub","settings",
     "clearcaption","clearformat","addpremium","removepremium","premiumlist","mypremium",
-    "exportdb", "c",
+    "exportdb", "c", "setpremiumlimit", "setsettingsimg",
 ]
 
 @app.on_message(filters.private & filters.text & ~filters.command(ALL_CMDS))
@@ -839,14 +866,15 @@ async def text_state_handler(client, msg: Message):
             user_states.pop(uid, None)
             return await msg.reply_text("❌ Cancelled.")
         STATE_MAP = {
-            "rename_format":  "rename_format",
-            "audio_title":    "metadata.audio_title",
-            "subtitle_title": "metadata.subtitle_title",
-            "video_title":    "metadata.video_title",
-            "meta_title":     "metadata.title",
-            "meta_author":    None,   # handled specially
-            "caption":        "caption",
-            "start_msg":      None,   # handled specially
+            "rename_format":    "rename_format",
+            "audio_title":      "metadata.audio_title",
+            "subtitle_title":   "metadata.subtitle_title",
+            "video_title":      "metadata.video_title",
+            "meta_title":       "metadata.title",
+            "meta_author":      None,   # handled specially
+            "caption":          "caption",
+            "start_msg":        None,   # handled specially
+            "set_settings_img": None,   # handled in photo_handler
         }
         if state == "start_msg" and uid == OWNER_ID:
             await set_bot_setting("start_msg", text)
@@ -938,12 +966,28 @@ async def settings_menu(client, update):
         [InlineKeyboardButton("✨ My Premium",      callback_data="premium_info"),
          InlineKeyboardButton("🔙 Back",           callback_data="back_start")],
     ])
+    bs          = await get_bot_settings()
+    settings_img = bs.get("settings_img")
+
     if is_cb:
         try:
-            await update.message.edit_text(text, reply_markup=kb)
+            if settings_img:
+                try:
+                    await update.message.delete()
+                except Exception:
+                    pass
+                await update.message.chat.send_photo(settings_img, caption=text, reply_markup=kb)
+            else:
+                await update.message.edit_text(text, reply_markup=kb)
         except Exception:
             pass
     else:
+        if settings_img:
+            try:
+                await update.reply_photo(settings_img, caption=text, reply_markup=kb)
+                return
+            except Exception:
+                pass
         await update.reply_text(text, reply_markup=kb)
 
 SETTING_PROMPTS: dict[str, tuple[str, str]] = {
@@ -1173,7 +1217,8 @@ async def status_cmd(client, msg: Message):
     text   = f"📊 **Your Status**\n\n**Active:** `{active}/{MAX_TASKS}`\n**Queued:** `{qs}`\n\n"
     for tid, t in tasks:
         elapsed = int(time.time() - t["time"])
-        text   += f"• `{t['file'][:28]}`\n  ⏱ `{elapsed}s` elapsed\n  ID: `{tid}`\n\n"
+        fname   = t["file"][:28]
+        text   += "• `" + fname + "`\n  ⏱ `" + str(elapsed) + "s` elapsed\n  ID: `" + tid + "`\n\n"
     if not tasks:
         text += "✅ No active tasks right now!"
     await msg.reply_text(text)
@@ -1187,7 +1232,8 @@ async def myqueue_cmd(client, msg: Message):
     text = f"📋 **Your Queue ({len(tasks)} tasks)**\n\n"
     for tid, t in tasks:
         elapsed = int(time.time() - t["time"])
-        text   += f"• `{t['file'][:28]}`\n  ⏱ `{elapsed}s` | ID: `{tid}`\n\n"
+        fname   = t["file"][:28]
+        text   += "• `" + fname + "`\n  ⏱ `" + str(elapsed) + "s` | ID: `" + tid + "`\n\n"
     await msg.reply_text(
         text,
         reply_markup=InlineKeyboardMarkup([[
@@ -1296,8 +1342,9 @@ async def setformat_cmd(client, msg: Message):
 
 @app.on_message(filters.command("clearformat") & filters.private)
 async def clearformat_cmd(client, msg: Message):
-    await update_user(msg.from_user.id, {"rename_format": DEFAULT_USER["rename_format"]})
-    await msg.reply_text(f"✅ **Format reset to default:**\n`{DEFAULT_USER['rename_format']}`")
+    default_fmt = DEFAULT_USER["rename_format"]
+    await update_user(msg.from_user.id, {"rename_format": default_fmt})
+    await msg.reply_text("✅ **Format reset to default:**\n`" + default_fmt + "`")
 
 @app.on_message(filters.command("setcaption") & filters.private)
 async def setcaption_cmd(client, msg: Message):
@@ -1460,7 +1507,8 @@ async def banlist_cmd(client, msg: Message):
     banned = await users_col.find({"banned": True}).to_list(100)
     if not banned:
         return await msg.reply_text("✅ No banned users.")
-    await msg.reply_text("🚫 **Banned:**\n" + "\n".join(f"• `{u['_id']}`" for u in banned))
+    lines = "\n".join("• `" + str(u["_id"]) + "`" for u in banned)
+    await msg.reply_text("🚫 **Banned:**\n" + lines)
 
 @app.on_message(filters.command("broadcast") & filters.private)
 @owner_only
@@ -1487,7 +1535,9 @@ async def ongoing_cmd(client, msg: Message):
     text = f"🔄 **All Ongoing Tasks ({len(all_tasks)}):**\n\n"
     for tid, t in all_tasks.items():
         elapsed = int(time.time() - t["time"])
-        text   += f"• `{t['uid']}` | `{t['file'][:22]}` | `{elapsed}s`\n  ID: `{tid}`\n\n"
+        tuid  = str(t["uid"])
+        tfile = t["file"][:22]
+        text  += "• `" + tuid + "` | `" + tfile + "` | `" + str(elapsed) + "s`\n  ID: `" + tid + "`\n\n"
     await msg.reply_text(
         text,
         reply_markup=InlineKeyboardMarkup([[
@@ -1554,14 +1604,51 @@ async def setlimit_cmd(client, msg: Message):
     await set_size_limit(val)
     await msg.reply_text(f"✅ **Limit set to:** `{human(val)}`")
 
+@app.on_message(filters.command("setpremiumlimit") & filters.private)
+@owner_only
+async def setpremiumlimit_cmd(client, msg: Message):
+    """Set file size limit for Premium users. 0 = unlimited."""
+    args = msg.text.split()
+    if len(args) < 2:
+        cur = await get_premium_limit()
+        cur_str = human(cur) if cur else "Unlimited"
+        return await msg.reply_text(
+            "✨ **Set Premium User File Size Limit**\n\n"
+            "**Current:** `" + cur_str + "`\n\n"
+            "**Usage:** `/setpremiumlimit 4GB` or `/setpremiumlimit 0` (unlimited)\n\n"
+            "**Note:** Owner always bypasses all limits."
+        )
+    val_str = args[1]
+    if val_str == "0":
+        await set_premium_limit(0)
+        return await msg.reply_text("✅ **Premium limit removed (Unlimited).**")
+    val = parse_size(val_str)
+    if not val:
+        return await msg.reply_text("❌ Invalid. Use: `4GB`, `2GB`, `500MB`")
+    await set_premium_limit(val)
+    await msg.reply_text("✅ **Premium limit set to:** `" + human(val) + "`")
+
+@app.on_message(filters.command("setsettingsimg") & filters.private)
+@owner_only
+async def setsettingsimg_cmd(client, msg: Message):
+    """Set image shown when any user opens /settings."""
+    if msg.reply_to_message and msg.reply_to_message.photo:
+        await set_bot_setting("settings_img", msg.reply_to_message.photo.file_id)
+        return await msg.reply_text("✅ **Settings image updated!**\n\nThis image will show when users open /settings.")
+    user_states[msg.from_user.id] = "set_settings_img"
+    await msg.reply_text("🖼 **Reply to a photo or send a photo now** to set as settings image.\nType `cancel` to abort.")
+
 @app.on_message(filters.command("getlimit") & filters.private)
 async def getlimit_cmd(client, msg: Message):
-    limit = await get_size_limit()
+    limit      = await get_size_limit()
+    prem_limit = await get_premium_limit()
+    lim_str  = human(limit)      if limit      else "Unlimited"
+    plim_str = human(prem_limit) if prem_limit else "Unlimited"
     await msg.reply_text(
-        f"📏 **Current File Size Limit:**\n\n"
-        f"👤 **Normal Users:** `{human(limit) if limit else 'Unlimited'}`\n"
-        f"✨ **Premium Users:** `Unlimited`\n"
-        f"👑 **Owner:** `Unlimited`"
+        "📏 **Current File Size Limits:**\n\n"
+        "👤 **Normal Users:** `" + lim_str + "`\n"
+        "✨ **Premium Users:** `" + plim_str + "`\n"
+        "👑 **Owner:** `Unlimited`"
     )
 
 @app.on_message(filters.command("setstartmsg") & filters.private)
@@ -1730,7 +1817,7 @@ async def premiumlist_cmd(client, msg: Message):
             exp_str = "❌ Expired"
         else:
             exp_str = exp.strftime("%d %b %Y")
-        text += f"• `{p['_id']}` — {exp_str}\n"
+        text += "• `" + str(p["_id"]) + "` — " + exp_str + "\n"
     await msg.reply_text(text)
 
 @app.on_callback_query(filters.regex("^noop$"))
