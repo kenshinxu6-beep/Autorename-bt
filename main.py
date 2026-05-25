@@ -761,39 +761,52 @@ def start_kb():
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, msg: Message):
     uid = msg.from_user.id
+
     if await is_banned(uid):
         return await msg.reply_text("🚫 You are banned.")
+
     is_new = not bool(await users_col.find_one({"_id": uid}))
     await get_user(uid)
+
+    bs = await get_bot_settings()
+
     if is_new:
         uname = msg.from_user.username or ""
         fname = msg.from_user.first_name or ""
         await log_new_user(client, uid, uname, fname)
-        bs   = await get_bot_settings()
+
     prem = await is_premium(uid)
-    
-    # Ye raha naya replace karne wala code:
+
     premium_text = "🌟 You are a **Premium** user!\n\n" if prem else ""
 
-text = bs.get("start_msg") or (
-    f"{'✨' if prem else '👋'} **Welcome, {msg.from_user.first_name}!**\n\n"
-    f"{premium_text}"
-    "Send me any **video / audio / document** and I'll:\n"
-    "• ✅ Rename with your custom format\n"
-    "• ✅ Set all metadata fresh\n"
-    f"• ✅ Handle **{MAX_TASKS}** concurrent tasks per user\n\n"
-    "Tap ⚙️ **Settings** to configure!\n\n"
-    "**Support:** @KENSHIN_ANIME_CHAT"
-)
-  
+    text = bs.get("start_msg") or (
+        f"{'✨' if prem else '👋'} **Welcome, {msg.from_user.first_name}!**\n\n"
+        f"{premium_text}"
+        "Send me any **video / audio / document** and I'll:\n"
+        "• ✅ Rename with your custom format\n"
+        "• ✅ Set all metadata fresh\n"
+        f"• ✅ Handle **{MAX_TASKS}** concurrent tasks per user\n\n"
+        "Tap ⚙️ **Settings** to configure!\n\n"
+        "**Support:** @KENSHIN_ANIME_CHAT"
+    )
+
     img = bs.get("start_img")
+
     if img:
         try:
-            await msg.reply_photo(img, caption=text, reply_markup=start_kb())
+            await msg.reply_photo(
+                img,
+                caption=text,
+                reply_markup=start_kb()
+            )
             return
         except Exception:
             pass
-    await msg.reply_text(text, reply_markup=start_kb())
+
+    await msg.reply_text(
+        text,
+        reply_markup=start_kb()
+      )
 
 # ═══════════════════════════════════════════════════════
 #  MEDIA HANDLER
