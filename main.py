@@ -41,7 +41,7 @@ VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts", ".flv", ".
 #  SPEED & CLEANUP CONFIG
 # ═══════════════════════════════════════════════════════
 # How long (seconds) to wait before deleting temp files after upload
-CLEANUP_DELAY   = 30
+CLEANUP_DELAY   = 0   # 0 = instant delete after upload
 # Progress bar update interval (seconds) — lower = more updates = more Telegram API calls
 PROGRESS_INTERVAL = 1.5
 # Max concurrent global rename tasks (across all users)
@@ -77,7 +77,9 @@ DEFAULT_USER = {
     "media_format":  "video",
 }
 
-async def get_size_limit() -> int:
+async def get_cleanup_delay() -> int:
+    s = await settings_col.find_one({"_id": "global"})
+    return int((s or {}).get("cleanup_delay", CLEANUP_DELAY))
     s = await settings_col.find_one({"_id": "global"})
     return int((s or {}).get("file_size_limit", 0))
 
@@ -485,19 +487,21 @@ async def upload_file(
     start = time.time()
     last  = [0.0]
     async def cb(cur, tot):
-        # Throttle progress updates to reduce API rate-limit hits → faster net throughput
         if time.time() - last[0] > PROGRESS_INTERVAL:
             last[0] = time.time()
             await fast_progress(cur, tot, prog_msg, "Uploading", start, task_id, final_name)
 
-    ext       = os.path.splitext(out_path)[1].lower()
     user_mode = user.get("media_format", "video")
+    # Verify thumb file actually exists on disk before passing to Pyrogram
+    thumb = thumb_path if (thumb_path and os.path.exists(thumb_path)) else None
+    if thumb_path and not thumb:
+        logger.warning(f"Thumb file missing at upload time: {thumb_path}")
 
     if user_mode == "file":
         await client.send_document(
             msg.chat.id, out_path,
             caption=caption, file_name=final_name,
-            thumb=thumb_path, progress=cb,
+            thumb=thumb, progress=cb,
         )
     else:
         dur = w = h = 0
@@ -509,7 +513,7 @@ async def upload_file(
         await client.send_video(
             msg.chat.id, out_path,
             caption=caption, file_name=final_name,
-            thumb=thumb_path,
+            thumb=thumb,
             duration=dur, width=w, height=h,
             supports_streaming=True, progress=cb,
         )
@@ -578,21 +582,22 @@ async def process_rename(client: Client, msg: Message, task_id: str):
             if cancel_flags.get(task_id):
                 raise asyncio.CancelledError()
 
-            # Thumbnail — always fetch fresh from DB for each task (bulk-safe)
+            # Thumbnail — always fetch fresh from DB (bulk-safe, works for 10M videos)
             fresh_user  = await get_user(uid)
             thumb_raw   = fresh_user.get("thumbnail")
             thumb_path  = None
             if thumb_raw:
                 try:
-                    # Handle bson.Binary, bytes, memoryview all safely
                     if hasattr(thumb_raw, "tobytes"):
                         thumb_bytes = thumb_raw.tobytes()
                     else:
                         thumb_bytes = bytes(thumb_raw)
+                    # Write thumb to unique path — keep it alive until AFTER upload
                     thumb_path = f"/tmp/thumb_{task_id}.jpg"
                     processed  = make_thumb(thumb_bytes)
-                    async with aiofiles.open(thumb_path, "wb") as f:
-                        await f.write(processed)
+                    with open(thumb_path, "wb") as tf:
+                        tf.write(processed)
+                    logger.info(f"Thumb written: {thumb_path} ({len(processed)} bytes)")
                 except Exception as te:
                     logger.warning(f"Thumb error uid={uid}: {te}")
                     thumb_path = None
@@ -601,7 +606,7 @@ async def process_rename(client: Client, msg: Message, task_id: str):
             cap_tpl = fresh_user.get("caption") or ""
             caption = apply_ph(cap_tpl, info) if cap_tpl else ""
 
-            # Upload
+            # Upload — thumb_path must exist during this call
             await prog_msg.edit_text(f"📤 **Uploading...**\n`{final_name}`")
             await upload_file(
                 client, msg, out_path, prog_msg, task_id,
@@ -614,34 +619,30 @@ async def process_rename(client: Client, msg: Message, task_id: str):
             real_size = os.path.getsize(out_path) if os.path.exists(out_path) else file_size
             await log_rename(client, uid, msg.from_user.username or "", orig_name, final_name, real_size)
 
-            # ── Schedule cleanup 30s after upload completes ──────────────
-            asyncio.create_task(_delayed_cleanup(CLEANUP_DELAY, dl_path, out_path, thumb_path, task_id))
+            # ── Cleanup AFTER upload is fully done ──
+            # thumb_path intentionally included — upload already finished above
+            delay = await get_cleanup_delay()
+            asyncio.create_task(_delayed_cleanup(delay, dl_path, out_path, thumb_path))
 
         except asyncio.CancelledError:
             try:
                 await prog_msg.edit_text("❌ **Task cancelled.**")
             except Exception:
                 pass
-            # Immediate cleanup on cancel
             for p in [dl_path, out_path, thumb_path]:
                 if p and os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
+                    try: os.remove(p)
+                    except Exception: pass
         except Exception as e:
             logger.error(f"Task {task_id}: {e}", exc_info=True)
             try:
                 await prog_msg.edit_text(f"❌ **Error:** `{e}`")
             except Exception:
                 pass
-            # Immediate cleanup on error
             for p in [dl_path, out_path, thumb_path]:
                 if p and os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
+                    try: os.remove(p)
+                    except Exception: pass
         finally:
             cancel_flags.pop(task_id, None)
             all_tasks.pop(task_id, None)
@@ -655,8 +656,12 @@ async def process_rename(client: Client, msg: Message, task_id: str):
 #  DELAYED CLEANUP — deletes temp files N seconds after upload
 # ═══════════════════════════════════════════════════════
 async def _delayed_cleanup(delay: int, *paths):
-    """Wait `delay` seconds then silently delete all given file paths."""
-    await asyncio.sleep(delay)
+    """Wait `delay` seconds then silently delete all given file paths.
+    delay = -1 means disabled (keep files). delay = 0 means instant."""
+    if delay < 0:
+        return  # disabled — keep files
+    if delay > 0:
+        await asyncio.sleep(delay)
     for p in paths:
         if p and os.path.exists(p):
             try:
@@ -841,7 +846,7 @@ ALL_CMDS = [
     "setmedia","ping","allusers","getthumb","delthumb","resetme","setthumb","setlimit",
     "getlimit","myid","info","setcaption","setformat","setaudio","setsub","settings",
     "clearcaption","clearformat","addpremium","removepremium","premiumlist","mypremium",
-    "exportdb","hi","sysinfo",
+    "exportdb","hi","sysinfo","setcleanup",
 ]
 
 # ═══════════════════════════════════════════════════════
@@ -1259,11 +1264,63 @@ async def sysinfo_cmd(client, msg: Message):
 
         f"━━━ ⚡ SPEED CONFIG ━━━\n"
         f"🧵 **Workers:** `32`  📡 **Streams:** `4`\n"
-        f"🗑 **Auto Cleanup:** `{CLEANUP_DELAY}s` after upload\n"
+        f"🗑 **Auto Cleanup:** `{await get_cleanup_delay()}s` after upload\n"
         f"📊 **Progress Interval:** `{PROGRESS_INTERVAL}s`\n"
     )
 
     await m.edit_text(text)
+
+# ═══════════════════════════════════════════════════════
+#  SET CLEANUP DELAY (Owner only)
+# ═══════════════════════════════════════════════════════
+@app.on_message(filters.command("setcleanup") & filters.private)
+@owner_only
+async def setcleanup_cmd(client, msg: Message):
+    """
+    /setcleanup          → show current delay
+    /setcleanup 0        → instant delete (0 sec)
+    /setcleanup 30       → delete 30 sec after upload
+    /setcleanup 120      → delete 2 minutes after upload
+    /setcleanup off      → disable auto-delete (keep files)
+    """
+    args = msg.text.split()
+    cur  = await get_cleanup_delay()
+    cur_str = "Disabled (files kept)" if cur < 0 else (f"`{cur}s`" if cur > 0 else "`0s` (instant)")
+
+    if len(args) < 2:
+        return await msg.reply_text(
+            f"🗑 **Auto Cleanup Delay**\n\n"
+            f"**Current:** {cur_str}\n\n"
+            f"**Usage:**\n"
+            f"`/setcleanup 0` — Instant delete after upload\n"
+            f"`/setcleanup 30` — Delete 30 sec after upload\n"
+            f"`/setcleanup 300` — Delete 5 min after upload\n"
+            f"`/setcleanup off` — Disable (keep files)\n\n"
+            f"💡 Tip: `0` = max storage saving, `off` = files stay until restart"
+        )
+
+    val = args[1].lower()
+
+    if val == "off":
+        await settings_col.update_one({"_id": "global"}, {"$set": {"cleanup_delay": -1}}, upsert=True)
+        return await msg.reply_text("✅ **Auto cleanup disabled.** Files will be kept until bot restart.")
+
+    if not val.isdigit():
+        return await msg.reply_text("❌ Invalid value. Use a number in seconds, or `off`.")
+
+    secs = int(val)
+    await settings_col.update_one({"_id": "global"}, {"$set": {"cleanup_delay": secs}}, upsert=True)
+
+    if secs == 0:
+        label = "⚡ **Instant** — files deleted immediately after upload!"
+    elif secs < 60:
+        label = f"⏱ **{secs} seconds** after upload"
+    elif secs < 3600:
+        label = f"⏱ **{secs // 60}m {secs % 60}s** after upload"
+    else:
+        label = f"⏱ **{secs // 3600}h {(secs % 3600) // 60}m** after upload"
+
+    await msg.reply_text(f"✅ **Cleanup delay set!**\n\n🗑 {label}")
 
 @app.on_message(filters.command("myid") & filters.private)
 async def myid_cmd(client, msg: Message):
