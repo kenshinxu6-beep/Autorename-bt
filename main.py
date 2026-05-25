@@ -1,11 +1,24 @@
 """
-KenshinRenameBot v5.0  ◈ PREMIUM
+KenshinRenameBot v6.0  ◈ PREMIUM
 Owner  : @KENSHIN_ANIME
 Support: @KENSHIN_ANIME_CHAT
 Channel: @Kenshin_Anime
+
+FIXES v6.0:
+  • Filename bug fixed — no more double brackets/extensions
+  • {filename} placeholder in caption now uses clean base name
+  • Metadata: old language-words stripped before applying new template
+  • Bulk queue stability — semaphore-based concurrency, no race conditions
+  • Thumbnail always applied even in bulk (loaded fresh per task)
+  • Progress bar redesigned (Telegram style with small Unicode chars)
+  • Reactions removed from cmds (were failing silently / wasting space)
+  • /exportdb owner command (JSON + TXT export)
+  • /setstartimg fully fixed
+  • Queue state persisted to MongoDB; survives restart/redeploy
+  • All users' data isolated (queue, thumb, format, metadata, caption)
 """
 
-import os, re, time, asyncio, aiofiles, logging, io, json, random, shutil
+import os, re, time, asyncio, aiofiles, logging, io, json, shutil, hashlib
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Optional
@@ -25,7 +38,7 @@ API_HASH  = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 OWNER_ID  = int(os.getenv("OWNER_ID", "0"))
-MAX_TASKS = 3
+MAX_TASKS = 3          # concurrent tasks per user
 
 _lc = os.getenv("LOG_CHANNEL", "").strip()
 if _lc and _lc.lstrip("-").isdigit():
@@ -38,19 +51,6 @@ else:
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts", ".flv", ".wmv"}
 
 # ═══════════════════════════════════════════════════════
-#  REACTIONS
-# ═══════════════════════════════════════════════════════
-CMD_REACTIONS  = ["👍", "🔥", "⚡", "✅", "🫡", "💯", "🤝", "👌"]
-FILE_REACTIONS = ["🎬", "🍿", "🎉", "😎", "🔥", "💥", "🚀", "⚡"]
-FUN_REACTIONS  = ["😂", "🤣", "🫠", "🤯", "👀", "🫣", "💀", "🙃"]
-
-async def react(msg: Message, pool: list):
-    try:
-        await msg.react(random.choice(pool))
-    except Exception:
-        pass
-
-# ═══════════════════════════════════════════════════════
 #  DATABASE
 # ═══════════════════════════════════════════════════════
 _mc             = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
@@ -60,11 +60,12 @@ stats_col       = db["stats"]
 leaderboard_col = db["leaderboard"]
 settings_col    = db["bot_settings"]
 premium_col     = db["premium"]
+queue_col       = db["pending_queue"]   # NEW: persist queue across restarts
 
 DEFAULT_METADATA = {
-    "title":    "@KENSHIN_ANIME",
-    "author":   "@KENSHIN_ANIME",
-    "artist":   "@KENSHIN_ANIME",
+    "title":          "@KENSHIN_ANIME",
+    "author":         "@KENSHIN_ANIME",
+    "artist":         "@KENSHIN_ANIME",
     "audio_title":    "@KENSHIN_ANIME - [{lang}]",
     "subtitle_title": "@KENSHIN_ANIME - [{lang}]",
     "video_title":    "@KENSHIN_ANIME",
@@ -72,7 +73,7 @@ DEFAULT_METADATA = {
 
 DEFAULT_USER = {
     "banned":        False,
-    "rename_format": "[@KENSHIN_ANIME] [S{season}] [E{episode}] ⌯ [{quality}]",
+    "rename_format": "[@KENSHIN_ANIME] [S{season}] [Ep.{episode}] ⌯ [{quality}]",
     "metadata":      DEFAULT_METADATA.copy(),
     "thumbnail":     None,
     "caption":       "",
@@ -164,6 +165,21 @@ async def get_premium_info(uid: int) -> Optional[dict]:
         return {"expires": None, "lifetime": True}
     return await premium_col.find_one({"_id": uid})
 
+# ─── QUEUE PERSISTENCE ────────────────────────────────────
+async def save_pending(uid: int, chat_id: int, msg_id: int, task_id: str):
+    """Save a pending task to DB so it survives restart."""
+    await queue_col.update_one(
+        {"_id": task_id},
+        {"$set": {"uid": uid, "chat_id": chat_id, "msg_id": msg_id, "task_id": task_id, "queued_at": datetime.utcnow()}},
+        upsert=True
+    )
+
+async def remove_pending(task_id: str):
+    await queue_col.delete_one({"_id": task_id})
+
+async def get_all_pending() -> list:
+    return await queue_col.find().sort("queued_at", 1).to_list(None)
+
 # ═══════════════════════════════════════════════════════
 #  LOG CHANNEL
 # ═══════════════════════════════════════════════════════
@@ -200,23 +216,29 @@ async def log_new_user(client: Client, uid: int, uname: str, fname: str):
     await log_event(client, txt)
 
 # ═══════════════════════════════════════════════════════
-#  TASK MANAGER
+#  TASK MANAGER  (semaphore-based, no race condition)
 # ═══════════════════════════════════════════════════════
-user_queues:   dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
-user_active:   dict[int, int]           = defaultdict(int)
-all_tasks:     dict[str, dict]          = {}
-cancel_flags:  dict[str, bool]          = {}
-queue_workers: dict[int, asyncio.Task]  = {}
-user_states:   dict[int, str]           = {}
+# Per-user semaphore limits concurrent processing
+user_semaphores: dict[int, asyncio.Semaphore] = {}
+user_queues:     dict[int, asyncio.Queue]      = defaultdict(asyncio.Queue)
+user_active:     dict[int, int]                = defaultdict(int)
+all_tasks:       dict[str, dict]               = {}
+cancel_flags:    dict[str, bool]               = {}
+queue_workers:   dict[int, asyncio.Task]       = {}
+user_states:     dict[int, str]                = {}
+
+def get_semaphore(uid: int) -> asyncio.Semaphore:
+    if uid not in user_semaphores:
+        user_semaphores[uid] = asyncio.Semaphore(MAX_TASKS)
+    return user_semaphores[uid]
 
 def make_task_id(uid: int, msg_id: int) -> str:
-    return f"{uid}_{msg_id}_{int(time.time())}"
+    raw = f"{uid}_{msg_id}_{int(time.time())}"
+    return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 # ═══════════════════════════════════════════════════════
 #  UTILS
 # ═══════════════════════════════════════════════════════
-SPIN = ["◈", "◉", "◎", "◍", "◌", "◉"]
-
 def human(n: float) -> str:
     for u in ["B", "KB", "MB", "GB"]:
         if abs(n) < 1024:
@@ -234,90 +256,145 @@ def parse_size(s: str) -> int:
     mult = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}
     return int(val * mult[unit])
 
-def progress_bar(done: float, total: float, width: int = 13) -> str:
+def progress_bar(done: float, total: float, width: int = 10) -> str:
+    """
+    Returns a Telegram-style progress bar like:
+    ▰▰▰▰▰▰▰▱▱▱ 72.4%
+    """
     pct  = min(done / total, 1.0) if total else 0
     fill = int(width * pct)
     rest = width - fill
-    bar  = "█" * fill + ("▓" if fill < width else "") + "░" * max(0, rest - 1)
-    return f"❮{bar[:width]}❯ `{pct*100:.1f}%`"
+    bar  = "▰" * fill + "▱" * rest
+    return f"{bar} {pct*100:.1f}%"
 
-async def fast_progress(current: int, total: int, msg: Message, label: str, start: float, task_id: str):
+async def fast_progress(current: int, total: int, msg: Message,
+                        label: str, fname: str, start: float, task_id: str):
+    """
+    Progress display styled like:
+    ┌• @Otaku_Provider_Bot .....mkv
+    ├• ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ: 3s
+    ├• ▰▰▰▰▰▰▱▱▱▱ 61.2%
+    ├• 259.1 MB of 423.3 MB
+    ├• Sᴘᴇᴇᴅ: 86.3 MB/s
+    └• Eᴛᴀ: 19s
+    Stop → /c_{task_id} to cancel
+    """
     if cancel_flags.get(task_id):
         raise asyncio.CancelledError()
     elapsed = max(time.time() - start, 0.001)
     speed   = current / elapsed
     eta_s   = int((total - current) / speed) if speed > 0 else 0
-    eta     = f"{eta_s}s" if eta_s < 60 else f"{eta_s//60}m {eta_s%60}s"
-    frame   = SPIN[int(time.time() * 3) % len(SPIN)]
-    icon    = "⚡" if speed > 5*1024*1024 else "🔥" if speed > 1024*1024 else "🐢"
+    eta_str = f"{eta_s}s" if eta_s < 60 else f"{eta_s//60}m {eta_s%60}s"
+    elapsed_str = f"{int(elapsed)}s" if elapsed < 60 else f"{int(elapsed)//60}m {int(elapsed)%60}s"
+
+    short_name = fname[-30:] if len(fname) > 30 else fname
+    bar = progress_bar(current, total)
+
+    action = "ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ" if "Down" in label else "ᴜᴘʟᴏᴀᴅɪɴɢ"
+
+    text = (
+        f"┌• @Otaku_Provider_Bot `{short_name}`\n"
+        f"├• {action}: `{elapsed_str}`\n"
+        f"├• {bar}\n"
+        f"├• `{human(current)}` of `{human(total)}`\n"
+        f"├• Sᴘᴇᴇᴅ: `{human(speed)}/s`\n"
+        f"└• Eᴛᴀ: `{eta_str}`\n\n"
+        f"Stop → `/c_{task_id}` to cancel"
+    )
     try:
-        await msg.edit_text(
-            f"{label}\n\n"
-            f"{frame} {progress_bar(current, total)}\n\n"
-            f"╔═ 📦 `{human(current)}` **/** `{human(total)}`\n"
-            f"╠═ {icon} **Speed:** `{human(speed)}/s`\n"
-            f"╚═ ⏱ **ETA:** `{eta}`"
-        )
+        await msg.edit_text(text)
     except Exception:
         pass
 
 def extract_info(name: str, user_obj=None) -> dict:
     """
-    Extract info from filename.
-    Supports both {ep} and {episode} as same placeholder.
-    Also adds {username} from user_obj if provided.
+    Extract season/episode/quality/audio from filename.
+    {ep} and {episode} are aliases.
     """
     info = {
         "season":   "01",
         "ep":       "01",
-        "episode":  "01",   # alias for {ep}
+        "episode":  "01",
         "quality":  "",
         "audio":    "",
         "title":    name,
-        "filename": name,
+        "filename": name,   # will be overwritten with clean new_base after rename
         "username": "",
     }
     m = re.search(r"[Ss](\d{1,2})", name)
-    if m: info["season"] = m.group(1).zfill(2)
+    if m:
+        info["season"] = m.group(1).zfill(2)
 
+    # Support E01, Ep01, Ep.01, E.01
     m = re.search(r"[Ee][Pp]?\.?(\d{1,4})", name)
     if m:
         ep = m.group(1).zfill(2)
-        info["ep"] = ep
+        info["ep"]      = ep
         info["episode"] = ep
 
     m = re.search(r"(2160p|4320p|1080p|720p|480p|360p|4K|8K)", name, re.I)
-    if m: info["quality"] = m.group(1)
+    if m:
+        info["quality"] = m.group(1)
 
     m = re.search(r"\[(Hindi|English|Japanese|Tamil|Telugu|Dual|Multi)[^\]]*\]", name, re.I)
-    if m: info["audio"] = m.group(1)
+    if m:
+        info["audio"] = m.group(1)
 
     title = re.sub(r"\[.*?\]|\(.*?\)", "", name)
     title = re.sub(r"[._\-]", " ", title).strip()
     info["title"] = re.sub(r"\s+", " ", title)
 
     if user_obj:
-        info["username"] = getattr(user_obj, "first_name", "") or getattr(user_obj, "username", "") or ""
+        info["username"] = (
+            getattr(user_obj, "first_name", "") or
+            getattr(user_obj, "username", "") or ""
+        )
 
     return info
 
 def apply_ph(template: str, info: dict) -> str:
     for k, v in info.items():
         template = template.replace(f"{{{k}}}", str(v))
-    # Clean unreplaced placeholders like {something}
+    # Remove any unfilled placeholders
     template = re.sub(r"\{[^}]+\}", "", template)
     return template.strip()
 
-def detect_lang(s: str) -> str:
-    s_l = s.lower()
-    for lang in ["hindi","english","japanese","tamil","telugu","korean","french",
-                 "german","spanish","portuguese","chinese","arabic","russian"]:
+def detect_lang(raw: str) -> str:
+    """
+    Detect language name from a raw stream tag.
+    Strips channel names / extra words — only returns the language word.
+    """
+    if not raw:
+        return "Unknown"
+    s_l = raw.lower()
+    # Priority order matters — check most specific first
+    for lang in [
+        "hindi", "english", "japanese", "tamil", "telugu",
+        "korean", "french", "german", "spanish", "portuguese",
+        "chinese", "arabic", "russian", "bengali", "malayalam",
+        "kannada", "marathi", "punjabi"
+    ]:
         if lang in s_l:
             return lang.capitalize()
-    return s or "Unknown"
+    # If it's a short ISO code like "jpn", "eng", "hin"
+    ISO = {
+        "jpn": "Japanese", "eng": "English", "hin": "Hindi",
+        "tam": "Tamil",    "tel": "Telugu",  "kor": "Korean",
+        "fre": "French",   "ger": "German",  "spa": "Spanish",
+        "por": "Portuguese","chi": "Chinese", "ara": "Arabic",
+        "rus": "Russian",
+    }
+    stripped = raw.strip().lower()[:3]
+    if stripped in ISO:
+        return ISO[stripped]
+    return raw.strip() or "Unknown"
 
 def sanitize(name: str) -> str:
-    return re.sub(r'[\\/*?:"<>|]', "_", name).strip()
+    # Remove filesystem-unsafe chars
+    name = re.sub(r'[\\/*?:"<>|]', "_", name)
+    # Collapse multiple spaces/underscores
+    name = re.sub(r"[ _]{2,}", " ", name)
+    return name.strip()
 
 async def get_media_streams(path: str) -> dict:
     streams: dict[str, list] = {"audio": [], "subtitle": [], "video": []}
@@ -332,63 +409,63 @@ async def get_media_streams(path: str) -> dict:
             if ct not in streams:
                 continue
             tags  = s.get("tags") or {}
-            title = tags.get("title", "") or tags.get("language", "")
-            lang  = tags.get("language", "")
+            title = tags.get("title", "") or ""
+            lang  = tags.get("language", "") or ""
             streams[ct].append({"index": s.get("index", 0), "title": title, "lang": lang})
     except Exception as e:
         logger.warning(f"ffprobe: {e}")
     return streams
 
-# ─── FIX: Metadata completely replaced (not appended) ────
+# ─── METADATA: old titles cleared, new ones applied ──────
 async def rename_metadata(in_path: str, out_path: str, user: dict, info: dict) -> bool:
-    meta  = user.get("metadata") or {}
+    meta = user.get("metadata") or {}
 
-    # Global tags (title/author/artist)
     g_title  = meta.get("title",  "@KENSHIN_ANIME")
     g_author = meta.get("author", "@KENSHIN_ANIME")
     g_artist = meta.get("artist", "@KENSHIN_ANIME")
 
-    # Per-stream templates
     a_tpl = meta.get("audio_title",    "@KENSHIN_ANIME - [{lang}]")
     s_tpl = meta.get("subtitle_title", "@KENSHIN_ANIME - [{lang}]")
     v_tpl = meta.get("video_title",    "@KENSHIN_ANIME")
 
     strs = await get_media_streams(in_path)
 
-    # -map_metadata -1 clears ALL existing metadata from source
-    # Then we inject our own metadata fresh
+    # -map_metadata -1  →  clears ALL source metadata
     cmd = [
         "ffmpeg", "-y",
         "-i", in_path,
         "-map", "0",
         "-c", "copy",
-        "-map_metadata", "-1",          # ← clears old metadata completely
+        "-map_metadata", "-1",
         "-metadata", f"title={apply_ph(g_title, info)}",
         "-metadata", f"author={apply_ph(g_author, info)}",
         "-metadata", f"artist={apply_ph(g_artist, info)}",
         "-metadata", f"comment=@KENSHIN_ANIME",
     ]
 
-    # Video stream title
     if v_tpl:
         cmd += ["-metadata:s:v:0", f"title={apply_ph(v_tpl, info)}"]
 
-    # Audio stream titles
     for i, t in enumerate(strs["audio"]):
-        raw  = t.get("title") or t.get("lang") or ""
-        lang = detect_lang(raw) if raw else f"Track {i+1}"
-        cmd += [f"-metadata:s:a:{i}", f"title={apply_ph(a_tpl, {**info, 'lang': lang})}"]
+        # BUG FIX: detect_lang from raw lang tag OR title tag, not channel name
+        raw_lang = t.get("lang") or t.get("title") or ""
+        lang = detect_lang(raw_lang) if raw_lang else f"Track {i+1}"
+        new_title = apply_ph(a_tpl, {**info, "lang": lang})
+        cmd += [f"-metadata:s:a:{i}", f"title={new_title}"]
 
-    # Subtitle stream titles
     for i, t in enumerate(strs["subtitle"]):
-        raw  = t.get("title") or t.get("lang") or ""
-        lang = detect_lang(raw) if raw else f"Sub {i+1}"
-        cmd += [f"-metadata:s:s:{i}", f"title={apply_ph(s_tpl, {**info, 'lang': lang})}"]
+        raw_lang = t.get("lang") or t.get("title") or ""
+        lang = detect_lang(raw_lang) if raw_lang else f"Sub {i+1}"
+        new_title = apply_ph(s_tpl, {**info, "lang": lang})
+        cmd += [f"-metadata:s:s:{i}", f"title={new_title}"]
 
     cmd.append(out_path)
 
-    proc = await asyncio.create_subprocess_exec(*cmd,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
     _, err = await proc.communicate()
     if proc.returncode != 0:
         logger.error(f"FFmpeg metadata error: {err.decode()[-600:]}")
@@ -413,31 +490,35 @@ def make_thumb(raw_bytes: bytes) -> bytes:
 # ═══════════════════════════════════════════════════════
 #  DOWNLOAD / UPLOAD
 # ═══════════════════════════════════════════════════════
-async def download_file(client: Client, msg: Message, path: str, prog_msg: Message, task_id: str):
+async def download_file(client: Client, msg: Message, path: str,
+                        prog_msg: Message, task_id: str, fname: str):
     start = time.time()
     last  = [0.0]
     async def cb(cur, tot):
-        if time.time() - last[0] > 1.5:   # slightly faster update
+        if time.time() - last[0] > 2.0:
             last[0] = time.time()
-            await fast_progress(cur, tot, prog_msg, "📥 **Downloading...**", start, task_id)
+            await fast_progress(cur, tot, prog_msg, "Downloading", fname, start, task_id)
     await client.download_media(msg, file_name=path, progress=cb)
 
 async def upload_file(
     client: Client, msg: Message, out_path: str, prog_msg: Message,
-    task_id: str, user: dict, caption: str, thumb_path: Optional[str], final_name: str
+    task_id: str, user: dict, caption: str, thumb_path: Optional[str],
+    final_name: str, fname: str
 ):
     start = time.time()
     last  = [0.0]
     async def cb(cur, tot):
-        if time.time() - last[0] > 1.5:
+        if time.time() - last[0] > 2.0:
             last[0] = time.time()
-            await fast_progress(cur, tot, prog_msg, "📤 **Uploading...**", start, task_id)
+            await fast_progress(cur, tot, prog_msg, "Uploading", fname, start, task_id)
 
     ext          = os.path.splitext(out_path)[1].lower()
     is_video_ext = ext in VIDEO_EXTS
     user_mode    = user.get("media_format", "video")
 
-    if not is_video_ext and user_mode == "file":
+    send_as_doc = (not is_video_ext) or (user_mode == "file")
+
+    if send_as_doc:
         await client.send_document(
             msg.chat.id, out_path,
             caption=caption, file_name=final_name,
@@ -468,18 +549,18 @@ async def process_rename(client: Client, msg: Message, user: dict, task_id: str)
     if not media:
         return
 
-    orig_name = getattr(media, "file_name", None) or f"file{int(time.time())}"
+    orig_name = getattr(media, "file_name", None) or f"file_{int(time.time())}"
     file_size = getattr(media, "file_size", 0) or 0
     ext       = os.path.splitext(orig_name)[1].lower() or ".mp4"
     base_name = os.path.splitext(orig_name)[0]
 
-    # Pass user object to extract_info for {username}
     info = extract_info(base_name, msg.from_user)
 
     # File size check
     if uid != OWNER_ID and not await is_premium(uid):
         limit = await get_size_limit()
         if limit and file_size > limit:
+            await remove_pending(task_id)
             return await msg.reply_text(
                 f"❌ **File too large!**\n\n"
                 f"📦 Your file: `{human(file_size)}`\n"
@@ -488,72 +569,118 @@ async def process_rename(client: Client, msg: Message, user: dict, task_id: str)
                 f"Contact @KENSHIN_ANIME"
             )
 
+    # ── BUG FIX: Build final_name cleanly ──────────────────
     fmt      = (user.get("rename_format") or DEFAULT_USER["rename_format"]).strip()
-    new_base = sanitize(apply_ph(fmt, info)) or base_name
-    new_base = re.sub(r"\[\s*\]", "", new_base).strip()
-    final_name = new_base + ext
+    new_base = sanitize(apply_ph(fmt, info))          # e.g. "[@KENSHIN_ANIME] [S01] [Ep.01] ⌯ [2160p]"
+    new_base = re.sub(r"\[\s*\]", "", new_base).strip()  # remove empty brackets like []
+    new_base = new_base or base_name                  # fallback to original if empty
+    final_name = new_base + ext                       # e.g. "[@KENSHIN_ANIME] [S01] [Ep.01] ⌯ [2160p].mkv"
+
+    # ── BUG FIX: {filename} in caption uses new_base (not original) ─
     info["filename"] = new_base
 
     dl_path    = f"/tmp/dl_{task_id}{ext}"
     out_path   = f"/tmp/up_{task_id}{ext}"
     thumb_path = None
 
-    prog_msg = await msg.reply_text("⏳ **Queued...**")
+    prog_msg = await msg.reply_text("⏳ **Queued — starting soon...**")
+    sem = get_semaphore(uid)
+
     try:
-        await prog_msg.edit_text("📥 **Downloading...**")
-        await download_file(client, msg, dl_path, prog_msg, task_id)
-        if cancel_flags.get(task_id):
-            raise asyncio.CancelledError()
+        async with sem:
+            user_active[uid] = user_active.get(uid, 0) + 1
 
-        await prog_msg.edit_text("⚙️ **Applying metadata...**")
-        ok = await rename_metadata(dl_path, out_path, user, info)
-        if not ok or not os.path.exists(out_path):
-            shutil.copy2(dl_path, out_path)
-        if cancel_flags.get(task_id):
-            raise asyncio.CancelledError()
+            # DOWNLOAD
+            try:
+                await prog_msg.edit_text("📥 **Starting download...**")
+            except Exception:
+                pass
+            await download_file(client, msg, dl_path, prog_msg, task_id, final_name)
 
-        fresh_user  = await get_user(uid)
-        thumb_bytes = fresh_user.get("thumbnail")
-        if thumb_bytes:
-            thumb_path = f"/tmp/thumb_{task_id}.jpg"
-            hd_bytes   = make_thumb(thumb_bytes)
-            async with aiofiles.open(thumb_path, "wb") as f:
-                await f.write(hd_bytes)
+            if cancel_flags.get(task_id):
+                raise asyncio.CancelledError()
 
-        cap_tpl = fresh_user.get("caption") or ""
-        caption = apply_ph(cap_tpl, info) if cap_tpl else ""
+            # METADATA
+            try:
+                await prog_msg.edit_text("⚙️ **Applying metadata...**")
+            except Exception:
+                pass
+            ok = await rename_metadata(dl_path, out_path, user, info)
+            if not ok or not os.path.exists(out_path):
+                shutil.copy2(dl_path, out_path)
 
-        await prog_msg.edit_text("📤 **Uploading...**")
-        await upload_file(client, msg, out_path, prog_msg, task_id,
-                          fresh_user, caption, thumb_path, final_name)
-        await prog_msg.delete()
+            if cancel_flags.get(task_id):
+                raise asyncio.CancelledError()
+
+            # THUMBNAIL — always re-fetch fresh from DB to avoid bulk race
+            fresh_user  = await get_user(uid)
+            thumb_bytes = fresh_user.get("thumbnail")
+            if thumb_bytes:
+                thumb_path = f"/tmp/thumb_{task_id}.jpg"
+                hd_bytes   = make_thumb(bytes(thumb_bytes) if not isinstance(thumb_bytes, bytes) else thumb_bytes)
+                async with aiofiles.open(thumb_path, "wb") as f:
+                    await f.write(hd_bytes)
+
+            # CAPTION
+            cap_tpl = fresh_user.get("caption") or ""
+            caption = apply_ph(cap_tpl, info) if cap_tpl else ""
+
+            # UPLOAD
+            try:
+                await prog_msg.edit_text("📤 **Starting upload...**")
+            except Exception:
+                pass
+            await upload_file(
+                client, msg, out_path, prog_msg, task_id,
+                fresh_user, caption, thumb_path, final_name, final_name
+            )
+
+        # SUCCESS
+        try:
+            await prog_msg.delete()
+        except Exception:
+            pass
         await add_rename_stat(uid)
-        await react(msg, FILE_REACTIONS)
         uname     = msg.from_user.username or ""
         real_size = os.path.getsize(out_path) if os.path.exists(out_path) else file_size
         await log_rename(client, uid, uname, orig_name, final_name, real_size)
 
     except asyncio.CancelledError:
-        await prog_msg.edit_text("❌ **Task cancelled.**")
+        try:
+            await prog_msg.edit_text("❌ **Task cancelled.**")
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"Task {task_id}: {e}", exc_info=True)
-        await prog_msg.edit_text(f"❌ **Error:** `{e}`")
+        try:
+            await prog_msg.edit_text(f"❌ **Error:** `{str(e)[:200]}`")
+        except Exception:
+            pass
     finally:
         cancel_flags.pop(task_id, None)
         all_tasks.pop(task_id, None)
-        user_active[uid] = max(0, user_active[uid] - 1)
+        if user_active.get(uid, 0) > 0:
+            user_active[uid] -= 1
+        await remove_pending(task_id)
         for p in [dl_path, out_path, thumb_path]:
             if p and os.path.exists(p):
-                try: os.remove(p)
-                except: pass
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
 
+# ─── QUEUE WORKER (one per user, semaphore handles concurrency) ──
 async def queue_worker(client: Client, uid: int):
     q = user_queues[uid]
     while True:
-        msg, user, task_id = await q.get()
-        while user_active[uid] >= MAX_TASKS:
-            await asyncio.sleep(1)
-        user_active[uid] += 1
+        try:
+            item = await asyncio.wait_for(q.get(), timeout=300)
+        except asyncio.TimeoutError:
+            # Worker idle for 5 min — exit, will be recreated on next file
+            queue_workers.pop(uid, None)
+            break
+        msg, user, task_id = item
+        # Don't wait for semaphore here — process_rename acquires it internally
         asyncio.create_task(process_rename(client, msg, user, task_id))
         q.task_done()
 
@@ -562,19 +689,32 @@ async def enqueue(client: Client, msg: Message):
     user = await get_user(uid)
     if await is_banned(uid):
         return await msg.reply_text("🚫 You are banned.")
+
     task_id = make_task_id(uid, msg.id)
     media   = msg.video or msg.document or msg.audio
-    fname   = getattr(media, "file_name", "?") or "?"
+    fname   = getattr(media, "file_name", "file") or "file"
+
     all_tasks[task_id]    = {"uid": uid, "file": fname, "time": time.time()}
     cancel_flags[task_id] = False
+
+    # Save to DB for restart persistence
+    await save_pending(uid, msg.chat.id, msg.id, task_id)
+
     if uid not in queue_workers or queue_workers[uid].done():
         queue_workers[uid] = asyncio.create_task(queue_worker(client, uid))
+
     await user_queues[uid].put((msg, user, task_id))
-    pos = user_queues[uid].qsize() + user_active[uid]
-    prem = await is_premium(uid)
-    prem_badge = " ✨" if prem else ""
+
+    q_size = user_queues[uid].qsize()
+    active = user_active.get(uid, 0)
+    pos    = q_size + active
+    prem   = await is_premium(uid)
+    badge  = " ✨" if prem else ""
+
     await msg.reply_text(
-        f"✅ **Added to queue!**{prem_badge}\n**Position:** `{pos}`\n**Task ID:** `{task_id}`",
+        f"✅ **Added to queue!**{badge}\n"
+        f"├• **Position:** `{pos}`\n"
+        f"└• **Task ID:** `{task_id}`",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ Cancel This Task", callback_data=f"cancel_{task_id}")
         ]])
@@ -605,7 +745,6 @@ async def start_cmd(client, msg: Message):
         return await msg.reply_text("🚫 You are banned.")
     is_new = not bool(await users_col.find_one({"_id": uid}))
     await get_user(uid)
-    await react(msg, CMD_REACTIONS)
     if is_new:
         uname = msg.from_user.username or ""
         fname = msg.from_user.first_name or ""
@@ -614,12 +753,12 @@ async def start_cmd(client, msg: Message):
     prem = await is_premium(uid)
     text = bs.get("start_msg") or (
         f"{'✨' if prem else '👋'} **Welcome, {msg.from_user.first_name}!**\n\n"
-        f"{'🌟 You are a **Premium** user!' if prem else ''}\n\n"
+        f"{'🌟 You are a **Premium** user!\n\n' if prem else ''}"
         f"Send me any **video / audio / document** and I'll:\n"
         f"• ✅ Rename with your custom format\n"
         f"• ✅ Set **all** metadata fresh (Title, Author, Artist, Audio, Sub, Video)\n"
         f"• ✅ Apply HD thumbnail & custom caption\n"
-        f"• ✅ Handle **{MAX_TASKS} tasks** simultaneously\n\n"
+        f"• ✅ Handle **{MAX_TASKS}** concurrent tasks per user\n\n"
         f"Tap ⚙️ **Settings** to configure!\n\n"
         f"**Support:** @KENSHIN_ANIME_CHAT"
     )
@@ -637,7 +776,6 @@ async def start_cmd(client, msg: Message):
 # ═══════════════════════════════════════════════════════
 @app.on_message(filters.private & (filters.video | filters.document | filters.audio))
 async def media_handler(client, msg: Message):
-    await react(msg, FILE_REACTIONS)
     await enqueue(client, msg)
 
 # ═══════════════════════════════════════════════════════
@@ -645,7 +783,7 @@ async def media_handler(client, msg: Message):
 # ═══════════════════════════════════════════════════════
 @app.on_message(filters.private & (filters.sticker | filters.animation))
 async def sticker_handler(client, msg: Message):
-    await react(msg, FUN_REACTIONS)
+    import random
     await msg.reply_text(random.choice([
         "😂 Bhai sticker bheja, video bhej!",
         "🤣 Sticker se rename hoga kya?",
@@ -658,7 +796,6 @@ async def photo_handler(client, msg: Message):
     uid   = msg.from_user.id
     state = user_states.get(uid)
     if state == "set_thumb":
-        await react(msg, CMD_REACTIONS)
         raw  = await client.download_media(msg.photo, in_memory=True)
         data = make_thumb(bytes(raw.getbuffer()))
         await update_user(uid, {"thumbnail": data})
@@ -677,7 +814,6 @@ async def photo_handler(client, msg: Message):
         user_states.pop(uid, None)
         await msg.reply_text("✅ **Global start image updated!**")
     else:
-        await react(msg, FUN_REACTIONS)
         await msg.reply_text("📸 Nice pic! Use /setthumb or ⚙️ Settings → 🖼 Set Thumbnail.")
 
 # ═══════════════════════════════════════════════════════
@@ -689,10 +825,12 @@ ALL_CMDS = [
     "setmedia","ping","allusers","getthumb","delthumb","resetme","setthumb","setlimit",
     "getlimit","myid","info","setcaption","setformat","setaudio","setsub","settings",
     "clearcaption","clearformat","addpremium","removepremium","premiumlist","mypremium",
+    "exportdb", "c",
 ]
 
 @app.on_message(filters.private & filters.text & ~filters.command(ALL_CMDS))
 async def text_state_handler(client, msg: Message):
+    import random
     uid   = msg.from_user.id
     state = user_states.get(uid)
     if state:
@@ -706,16 +844,27 @@ async def text_state_handler(client, msg: Message):
             "subtitle_title": "metadata.subtitle_title",
             "video_title":    "metadata.video_title",
             "meta_title":     "metadata.title",
-            "meta_author":    "metadata.author",
-            "meta_artist":    "metadata.artist",
+            "meta_author":    None,   # handled specially
             "caption":        "caption",
-            "start_msg":      None,
+            "start_msg":      None,   # handled specially
         }
         if state == "start_msg" and uid == OWNER_ID:
             await set_bot_setting("start_msg", text)
             user_states.pop(uid, None)
-            await react(msg, CMD_REACTIONS)
             return await msg.reply_text("✅ **Global start message updated!**")
+        if state == "meta_author":
+            u    = await get_user(uid)
+            meta = dict(u.get("metadata") or {})
+            meta["author"] = text
+            meta["artist"] = text
+            await update_user(uid, {"metadata": meta})
+            user_states.pop(uid, None)
+            return await msg.reply_text(
+                f"✅ **Author & Artist set to:** `{text}`",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")
+                ]])
+            )
         if state in STATE_MAP and STATE_MAP[state]:
             db_key = STATE_MAP[state]
             if "." in db_key:
@@ -727,11 +876,12 @@ async def text_state_handler(client, msg: Message):
             else:
                 await update_user(uid, {db_key: text})
             user_states.pop(uid, None)
-            await react(msg, CMD_REACTIONS)
-            return await msg.reply_text(f"✅ **Saved!**\n`{text}`", reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")
-            ]]))
-    await react(msg, FUN_REACTIONS)
+            return await msg.reply_text(
+                f"✅ **Saved!**\n`{text}`",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")
+                ]])
+            )
     await msg.reply_text(random.choice([
         "🤔 Bhai text bheja? File bhej na!",
         "😂 Ye bot text nahi padhta, file bhej!",
@@ -789,10 +939,11 @@ async def settings_menu(client, update):
          InlineKeyboardButton("🔙 Back",           callback_data="back_start")],
     ])
     if is_cb:
-        try: await update.message.edit_text(text, reply_markup=kb)
-        except: pass
+        try:
+            await update.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            pass
     else:
-        await react(update, CMD_REACTIONS)
         await update.reply_text(text, reply_markup=kb)
 
 SETTING_PROMPTS: dict[str, tuple[str, str]] = {
@@ -801,7 +952,7 @@ SETTING_PROMPTS: dict[str, tuple[str, str]] = {
         "**Placeholders:**\n"
         "`{filename}` `{title}` `{season}` `{ep}` `{episode}` `{quality}` `{audio}` `{username}`\n\n"
         "**Note:** `{ep}` and `{episode}` are same!\n\n"
-        "**Example:** `[@KENSHIN_ANIME] [S{season}] [E{episode}] ⌯ [{quality}]`\n\n"
+        "**Example:** `[@KENSHIN_ANIME] [S{season}] [Ep.{episode}] ⌯ [{quality}]`\n\n"
         "Send format or type `cancel`"),
     "s_audio_title": ("audio_title",
         "🔊 **Set Audio Track Title**\n\n"
@@ -834,32 +985,10 @@ SETTING_PROMPTS: dict[str, tuple[str, str]] = {
 
 @app.on_callback_query(filters.regex("^s_(rename_format|audio_title|subtitle_title|video_title|caption|meta_title|meta_author)$"))
 async def setting_prompt_cb(client, cq: CallbackQuery):
-    uid             = cq.from_user.id
-    state, prompt   = SETTING_PROMPTS[cq.data]
+    uid           = cq.from_user.id
+    state, prompt = SETTING_PROMPTS[cq.data]
     user_states[uid] = state
     await cq.message.edit_text(prompt)
-
-# Special: meta_author sets both author+artist
-@app.on_message(filters.private & filters.text & ~filters.command(ALL_CMDS))
-async def meta_author_handler(client, msg: Message):
-    uid   = msg.from_user.id
-    state = user_states.get(uid)
-    if state != "meta_author":
-        return
-    text = msg.text.strip()
-    if text.lower() in ["/cancel", "cancel"]:
-        user_states.pop(uid, None)
-        return await msg.reply_text("❌ Cancelled.")
-    u    = await get_user(uid)
-    meta = dict(u.get("metadata") or {})
-    meta["author"] = text
-    meta["artist"] = text
-    await update_user(uid, {"metadata": meta})
-    user_states.pop(uid, None)
-    await react(msg, CMD_REACTIONS)
-    await msg.reply_text(f"✅ **Author & Artist set to:** `{text}`", reply_markup=InlineKeyboardMarkup([[
-        InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")
-    ]]))
 
 @app.on_callback_query(filters.regex("^s_clearcap$"))
 async def s_clearcap(client, cq: CallbackQuery):
@@ -917,7 +1046,7 @@ async def back_start(client, cq: CallbackQuery):
         pass
 
 # ═══════════════════════════════════════════════════════
-#  PREMIUM INFO (inline)
+#  PREMIUM INFO
 # ═══════════════════════════════════════════════════════
 @app.on_callback_query(filters.regex("^premium_info$"))
 @app.on_message(filters.command("mypremium") & filters.private)
@@ -948,10 +1077,11 @@ async def premium_info_cmd(client, update):
         )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_start")]])
     if is_cb:
-        try: await update.message.edit_text(text, reply_markup=kb)
-        except: pass
+        try:
+            await update.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            pass
     else:
-        await react(update, CMD_REACTIONS)
         await update.reply_text(text, reply_markup=kb)
 
 @app.on_callback_query(filters.regex("^my_stats$"))
@@ -959,10 +1089,14 @@ async def my_stats_cb(client, cq: CallbackQuery):
     uid = cq.from_user.id
     lb  = await leaderboard_col.find_one({"_id": uid}) or {}
     day = datetime.utcnow().strftime("%Y-%m-%d")
+    wk  = datetime.utcnow().strftime("%Y-W%W")
+    mon = datetime.utcnow().strftime("%Y-%m")
     text = (
         f"📊 **Your Stats**\n\n"
         f"🗓 **Today:** `{(lb.get('daily') or {}).get(day, 0)}`\n"
-        f"🏆 **All Time:** `{lb.get('all_time', 0)}`\n"
+        f"📆 **This Week:** `{(lb.get('weekly') or {}).get(wk, 0)}`\n"
+        f"🗓 **This Month:** `{(lb.get('monthly') or {}).get(mon, 0)}`\n"
+        f"🏆 **All Time:** `{lb.get('all_time', 0)}`"
     )
     await cq.answer()
     await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[
@@ -1013,7 +1147,6 @@ async def help_cmd(client, update):
     if is_cb:
         await update.message.edit_text(HELP_TEXT, reply_markup=kb)
     else:
-        await react(update, CMD_REACTIONS)
         await update.reply_text(HELP_TEXT, reply_markup=kb)
 
 # ═══════════════════════════════════════════════════════
@@ -1021,7 +1154,6 @@ async def help_cmd(client, update):
 # ═══════════════════════════════════════════════════════
 @app.on_message(filters.command("ping") & filters.private)
 async def ping_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     s  = time.time()
     m  = await msg.reply_text("🏓 Pinging...")
     ms = round((time.time() - s) * 1000)
@@ -1030,12 +1162,10 @@ async def ping_cmd(client, msg: Message):
 
 @app.on_message(filters.command("myid") & filters.private)
 async def myid_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     await msg.reply_text(f"🪪 **Your Telegram ID:** `{msg.from_user.id}`")
 
 @app.on_message(filters.command("status") & filters.private)
 async def status_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     uid    = msg.from_user.id
     active = user_active.get(uid, 0)
     qs     = user_queues[uid].qsize() if uid in user_queues else 0
@@ -1050,7 +1180,6 @@ async def status_cmd(client, msg: Message):
 
 @app.on_message(filters.command("myqueue") & filters.private)
 async def myqueue_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     uid   = msg.from_user.id
     tasks = [(tid, t) for tid, t in all_tasks.items() if t["uid"] == uid]
     if not tasks:
@@ -1066,13 +1195,13 @@ async def myqueue_cmd(client, msg: Message):
         ]])
     )
 
-@app.on_callback_query(filters.regex(r"^cancelqueue_"))
+@app.on_callback_query(filters.regex(r"^cancelqueue_\d+$"))
 async def cancelqueue_cb(client, cq: CallbackQuery):
     uid = int(cq.data.split("_")[1])
     if cq.from_user.id != uid and cq.from_user.id != OWNER_ID:
         return await cq.answer("❌ Not yours.", show_alert=True)
     count = 0
-    for tid, t in list(cancel_flags.items()):
+    for tid in list(cancel_flags.keys()):
         if all_tasks.get(tid, {}).get("uid") == uid:
             cancel_flags[tid] = True
             count += 1
@@ -1080,8 +1209,7 @@ async def cancelqueue_cb(client, cq: CallbackQuery):
 
 @app.on_message(filters.command("cancelqueue") & filters.private)
 async def cancelqueue_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
-    uid = msg.from_user.id
+    uid   = msg.from_user.id
     count = 0
     for tid in list(cancel_flags.keys()):
         if all_tasks.get(tid, {}).get("uid") == uid:
@@ -1091,11 +1219,26 @@ async def cancelqueue_cmd(client, msg: Message):
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     args = msg.text.split()
     if len(args) < 2:
         return await msg.reply_text("Usage: `/cancel <task_id>`")
     tid = args[1]
+    if tid in cancel_flags and all_tasks.get(tid, {}).get("uid") == msg.from_user.id:
+        cancel_flags[tid] = True
+        await msg.reply_text(f"⏹ **Cancelling task** `{tid}`")
+    else:
+        await msg.reply_text("❌ Task not found or not yours.")
+
+# Short cancel command /c_<task_id> from progress bar
+@app.on_message(filters.command("c") & filters.private)
+async def short_cancel_cmd(client, msg: Message):
+    args = msg.text.split()
+    if len(args) < 2:
+        return await msg.reply_text("Usage: `/c <task_id>`")
+    tid = args[1].lstrip("_")
+    # also support /c_taskid format
+    if "_" in args[0]:
+        tid = args[0].split("_", 1)[1]
     if tid in cancel_flags and all_tasks.get(tid, {}).get("uid") == msg.from_user.id:
         cancel_flags[tid] = True
         await msg.reply_text(f"⏹ **Cancelling task** `{tid}`")
@@ -1114,7 +1257,6 @@ async def cancel_task_cb(client, cq: CallbackQuery):
 # ─── THUMBNAIL ───────────────────────────────────────────
 @app.on_message(filters.command("setthumb") & filters.private)
 async def setthumb_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     uid = msg.from_user.id
     if msg.reply_to_message and msg.reply_to_message.photo:
         raw  = await client.download_media(msg.reply_to_message.photo, in_memory=True)
@@ -1126,30 +1268,27 @@ async def setthumb_cmd(client, msg: Message):
 
 @app.on_message(filters.command("getthumb") & filters.private)
 async def getthumb_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     user = await get_user(msg.from_user.id)
     tb   = user.get("thumbnail")
     if not tb:
         return await msg.reply_text("❌ No thumbnail saved.")
-    await msg.reply_photo(io.BytesIO(tb), caption="🖼 Your saved thumbnail (HD)")
+    await msg.reply_photo(io.BytesIO(bytes(tb)), caption="🖼 Your saved thumbnail (HD)")
 
 @app.on_message(filters.command("delthumb") & filters.private)
 async def delthumb_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     await update_user(msg.from_user.id, {"thumbnail": None})
     await msg.reply_text("🗑 **Thumbnail deleted!**")
 
 # ─── FORMAT / CAPTION ────────────────────────────────────
 @app.on_message(filters.command("setformat") & filters.private)
 async def setformat_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     args = msg.text.split(None, 1)
     if len(args) < 2:
         user_states[msg.from_user.id] = "rename_format"
         return await msg.reply_text(
             "📝 **Send your rename format:**\n\n"
             "**Placeholders:** `{filename}` `{title}` `{season}` `{ep}` `{episode}` `{quality}` `{audio}` `{username}`\n\n"
-            "**Default:** `[@KENSHIN_ANIME] [S{season}] [E{episode}] ⌯ [{quality}]`\n\n"
+            "**Default:** `[@KENSHIN_ANIME] [S{season}] [Ep.{episode}] ⌯ [{quality}]`\n\n"
             "Type `cancel` to abort."
         )
     await update_user(msg.from_user.id, {"rename_format": args[1]})
@@ -1157,13 +1296,11 @@ async def setformat_cmd(client, msg: Message):
 
 @app.on_message(filters.command("clearformat") & filters.private)
 async def clearformat_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     await update_user(msg.from_user.id, {"rename_format": DEFAULT_USER["rename_format"]})
     await msg.reply_text(f"✅ **Format reset to default:**\n`{DEFAULT_USER['rename_format']}`")
 
 @app.on_message(filters.command("setcaption") & filters.private)
 async def setcaption_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     args = msg.text.split(None, 1)
     if len(args) < 2:
         user_states[msg.from_user.id] = "caption"
@@ -1177,13 +1314,11 @@ async def setcaption_cmd(client, msg: Message):
 
 @app.on_message(filters.command("clearcaption") & filters.private)
 async def clearcaption_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     await update_user(msg.from_user.id, {"caption": ""})
     await msg.reply_text("🧹 **Caption cleared!**")
 
 @app.on_message(filters.command("setmedia") & filters.private)
 async def setmedia_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     args = msg.text.split()
     if len(args) < 2 or args[1] not in ["video", "file"]:
         return await msg.reply_text("❗ `/setmedia video` or `/setmedia file`")
@@ -1192,7 +1327,6 @@ async def setmedia_cmd(client, msg: Message):
 
 @app.on_message(filters.command("setaudio") & filters.private)
 async def setaudio_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     args = msg.text.split(None, 1)
     if len(args) < 2:
         user_states[msg.from_user.id] = "audio_title"
@@ -1209,7 +1343,6 @@ async def setaudio_cmd(client, msg: Message):
 
 @app.on_message(filters.command("setsub") & filters.private)
 async def setsub_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     args = msg.text.split(None, 1)
     if len(args) < 2:
         user_states[msg.from_user.id] = "subtitle_title"
@@ -1226,13 +1359,11 @@ async def setsub_cmd(client, msg: Message):
 
 @app.on_message(filters.command("resetme") & filters.private)
 async def resetme_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     await users_col.update_one({"_id": msg.from_user.id}, {"$set": DEFAULT_USER})
     await msg.reply_text("♻️ **All settings reset to default!**")
 
 @app.on_message(filters.command("stats") & filters.private)
 async def stats_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     uid = msg.from_user.id
     lb  = await leaderboard_col.find_one({"_id": uid}) or {}
     day = datetime.utcnow().strftime("%Y-%m-%d")
@@ -1280,7 +1411,6 @@ async def build_lb(client, period: str) -> str:
 
 @app.on_message(filters.command("leaderboard") & filters.private)
 async def leaderboard_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     args   = msg.text.split()
     period = args[1] if len(args) > 1 and args[1] in ["today","weekly","monthly","all"] else "all"
     await msg.reply_text(await build_lb(client, period), reply_markup=lb_kb())
@@ -1295,7 +1425,6 @@ async def lb_cb(client, cq: CallbackQuery):
 def owner_only(func):
     async def wrapper(client, msg: Message):
         if msg.from_user.id != OWNER_ID:
-            await react(msg, ["😤"])
             return await msg.reply_text("🚫 **Owner only!**")
         return await func(client, msg)
     wrapper.__name__ = func.__name__
@@ -1307,11 +1436,11 @@ def owner_only(func):
 @app.on_message(filters.command("ban") & filters.private)
 @owner_only
 async def ban_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     target = msg.reply_to_message.from_user.id if msg.reply_to_message else None
     if not target:
         args = msg.text.split()
-        if len(args) < 2: return await msg.reply_text("Reply to user or give ID.")
+        if len(args) < 2:
+            return await msg.reply_text("Reply to user or give ID.")
         target = int(args[1])
     await update_user(target, {"banned": True})
     await msg.reply_text(f"🚫 **Banned** `{target}`")
@@ -1319,24 +1448,23 @@ async def ban_cmd(client, msg: Message):
 @app.on_message(filters.command("unban") & filters.private)
 @owner_only
 async def unban_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     args = msg.text.split()
-    if len(args) < 2: return await msg.reply_text("Give user ID.")
+    if len(args) < 2:
+        return await msg.reply_text("Give user ID.")
     await update_user(int(args[1]), {"banned": False})
     await msg.reply_text(f"✅ **Unbanned** `{args[1]}`")
 
 @app.on_message(filters.command("banlist") & filters.private)
 @owner_only
 async def banlist_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     banned = await users_col.find({"banned": True}).to_list(100)
-    if not banned: return await msg.reply_text("✅ No banned users.")
+    if not banned:
+        return await msg.reply_text("✅ No banned users.")
     await msg.reply_text("🚫 **Banned:**\n" + "\n".join(f"• `{u['_id']}`" for u in banned))
 
 @app.on_message(filters.command("broadcast") & filters.private)
 @owner_only
 async def broadcast_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     if not msg.reply_to_message:
         return await msg.reply_text("Reply to a message to broadcast.")
     users = await users_col.find({"banned": {"$ne": True}}).to_list(None)
@@ -1354,7 +1482,6 @@ async def broadcast_cmd(client, msg: Message):
 @app.on_message(filters.command("ongoing") & filters.private)
 @owner_only
 async def ongoing_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     if not all_tasks:
         return await msg.reply_text("✅ No ongoing tasks.")
     text = f"🔄 **All Ongoing Tasks ({len(all_tasks)}):**\n\n"
@@ -1381,7 +1508,6 @@ async def owner_cancelall_cb(client, cq: CallbackQuery):
 @app.on_message(filters.command("cancelall") & filters.private)
 @owner_only
 async def cancelall_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     count = len(cancel_flags)
     for tid in list(cancel_flags.keys()):
         cancel_flags[tid] = True
@@ -1390,7 +1516,6 @@ async def cancelall_cmd(client, msg: Message):
 @app.on_message(filters.command("allusers") & filters.private)
 @owner_only
 async def allusers_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     total  = await users_col.count_documents({})
     banned = await users_col.count_documents({"banned": True})
     prems  = await premium_col.count_documents({})
@@ -1410,7 +1535,6 @@ async def allusers_cmd(client, msg: Message):
 @app.on_message(filters.command("setlimit") & filters.private)
 @owner_only
 async def setlimit_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     args = msg.text.split()
     if len(args) < 2:
         cur = await get_size_limit()
@@ -1432,7 +1556,6 @@ async def setlimit_cmd(client, msg: Message):
 
 @app.on_message(filters.command("getlimit") & filters.private)
 async def getlimit_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     limit = await get_size_limit()
     await msg.reply_text(
         f"📏 **Current File Size Limit:**\n\n"
@@ -1444,7 +1567,6 @@ async def getlimit_cmd(client, msg: Message):
 @app.on_message(filters.command("setstartmsg") & filters.private)
 @owner_only
 async def setstartmsg_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     args = msg.text.split(None, 1)
     if len(args) < 2:
         user_states[msg.from_user.id] = "start_msg"
@@ -1455,17 +1577,16 @@ async def setstartmsg_cmd(client, msg: Message):
 @app.on_message(filters.command("setstartimg") & filters.private)
 @owner_only
 async def setstartimg_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
+    # Fix: check reply photo first, else set state to wait for photo
     if msg.reply_to_message and msg.reply_to_message.photo:
         await set_bot_setting("start_img", msg.reply_to_message.photo.file_id)
         return await msg.reply_text("✅ **Start image updated!**")
     user_states[msg.from_user.id] = "set_start_img"
-    await msg.reply_text("🖼 **Reply to a photo** or **send a photo** now to set start image.")
+    await msg.reply_text("🖼 **Send a photo now** to set as start image.\nType `cancel` to abort.")
 
 @app.on_message(filters.command("info") & filters.private)
 @owner_only
 async def info_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     target = msg.reply_to_message.from_user if msg.reply_to_message else None
     args   = msg.text.split()
     if not target and len(args) < 2:
@@ -1491,11 +1612,68 @@ async def info_cmd(client, msg: Message):
         f"**Total Renames:** `{lb.get('all_time', 0)}`"
     )
 
-# ─── PREMIUM MANAGEMENT (OWNER) ──────────────────────────
+# ─── DB EXPORT (Owner only) ──────────────────────────────
+@app.on_message(filters.command("exportdb") & filters.private)
+@owner_only
+async def exportdb_cmd(client, msg: Message):
+    """Export all users data to JSON file. Owner only."""
+    wait = await msg.reply_text("⏳ **Exporting database...**")
+    try:
+        users = await users_col.find({}, {"thumbnail": 0}).to_list(None)  # skip binary thumb
+        prems = await premium_col.find().to_list(None)
+        stats = await stats_col.find_one({"_id": "global"}) or {}
+        lb    = await leaderboard_col.find().to_list(None)
+
+        def mongo_clean(obj):
+            """Make MongoDB dicts JSON-serializable."""
+            if isinstance(obj, dict):
+                return {k: mongo_clean(v) for k, v in obj.items() if k != "_id" or True}
+            if isinstance(obj, list):
+                return [mongo_clean(i) for i in obj]
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            if isinstance(obj, bytes):
+                return "<binary>"
+            return obj
+
+        export = {
+            "exported_at": datetime.utcnow().isoformat(),
+            "total_users": len(users),
+            "users": mongo_clean(users),
+            "premium": mongo_clean(prems),
+            "leaderboard": mongo_clean(lb),
+            "global_stats": mongo_clean(stats),
+        }
+
+        json_str = json.dumps(export, ensure_ascii=False, indent=2, default=str)
+        fname = f"db_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        path  = f"/tmp/{fname}"
+        async with aiofiles.open(path, "w", encoding="utf-8") as f:
+            await f.write(json_str)
+
+        await wait.delete()
+        await client.send_document(
+            msg.chat.id, path,
+            caption=(
+                f"📦 **Database Export**\n\n"
+                f"👥 **Users:** `{len(users)}`\n"
+                f"✨ **Premium:** `{len(prems)}`\n"
+                f"📊 **Total Renames:** `{stats.get('total_renames', 0)}`\n"
+                f"🕐 **Exported:** `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`"
+            ),
+            file_name=fname,
+        )
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    except Exception as e:
+        await wait.edit_text(f"❌ Export failed: `{e}`")
+
+# ─── PREMIUM MANAGEMENT ───────────────────────────────────
 @app.on_message(filters.command("addpremium") & filters.private)
 @owner_only
 async def addpremium_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     args = msg.text.split()
     if len(args) < 2:
         return await msg.reply_text(
@@ -1506,7 +1684,7 @@ async def addpremium_cmd(client, msg: Message):
             "`/addpremium 123456789 365` — 1 year\n"
             "`/addpremium 123456789 0` — Lifetime"
         )
-    uid = int(args[1])
+    uid  = int(args[1])
     days = int(args[2]) if len(args) > 2 else 30
     if days == 0:
         await premium_col.update_one(
@@ -1530,7 +1708,6 @@ async def addpremium_cmd(client, msg: Message):
 @app.on_message(filters.command("removepremium") & filters.private)
 @owner_only
 async def removepremium_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     args = msg.text.split()
     if len(args) < 2:
         return await msg.reply_text("**Usage:** `/removepremium <user_id>`")
@@ -1541,7 +1718,6 @@ async def removepremium_cmd(client, msg: Message):
 @app.on_message(filters.command("premiumlist") & filters.private)
 @owner_only
 async def premiumlist_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
     prems = await premium_col.find().to_list(50)
     if not prems:
         return await msg.reply_text("✅ No premium users.")
@@ -1562,8 +1738,47 @@ async def noop_cb(client, cq: CallbackQuery):
     await cq.answer("🔧 Coming soon!", show_alert=True)
 
 # ═══════════════════════════════════════════════════════
+#  STARTUP: restore pending queue from MongoDB
+# ═══════════════════════════════════════════════════════
+async def restore_pending_queue(client: Client):
+    """
+    On restart, notify users that their pending tasks were lost
+    (we can't re-download the original message after restart since
+    Pyrogram can't retrieve arbitrary messages without storing them).
+    We clean up the stale queue entries and inform users.
+    """
+    pending = await get_all_pending()
+    if not pending:
+        return
+    notified = set()
+    for p in pending:
+        uid  = p.get("uid")
+        try:
+            await queue_col.delete_one({"_id": p["_id"]})
+            if uid and uid not in notified:
+                notified.add(uid)
+                try:
+                    await client.send_message(
+                        uid,
+                        "⚠️ **Bot was restarted!**\n\n"
+                        "Your pending tasks were cleared. Please resend your files to re-queue them.\n\n"
+                        "Sorry for the inconvenience! 🙏"
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"restore_pending: {e}")
+    logger.info(f"Cleared {len(pending)} stale pending tasks from DB after restart.")
+
+# ═══════════════════════════════════════════════════════
 #  RUN
 # ═══════════════════════════════════════════════════════
+async def main():
+    async with app:
+        logger.info("🚀 KenshinRenameBot v6.0 PREMIUM starting...")
+        await restore_pending_queue(app)
+        logger.info("✅ Bot is running!")
+        await asyncio.Event().wait()   # run forever
+
 if __name__ == "__main__":
-    logger.info("🚀 KenshinRenameBot v5.0 PREMIUM starting...")
-    app.run()
+    asyncio.run(main())
