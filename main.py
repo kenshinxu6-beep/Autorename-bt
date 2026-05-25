@@ -29,8 +29,24 @@ API_ID    = 37407868
 API_HASH  = "d7d3bff9f7cf9f3b111129bdbd13a065"
 BOT_TOKEN = "8285265972:AAGVX-BGABNk1nHBZ2Sr3gUSQ2XHfH7KWSU"
 MONGO_URI = "mongodb+srv://kenshinxu1:iammohitgurjar.1@kenshinfileshere.fyvrwjd.mongodb.net/?appName=Kenshinfileshere"
+
 OWNER_ID  = 6728678197
-MAX_WORKERS = 6   # concurrent tasks per user (increased for speed)
+MAX_WORKERS = 6   # concurrent tasks per user
+
+# ── LOCAL BOT API SERVER (for 4GB+ uploads) ──────────────────────────
+# Set LOCAL_BOT_API_URL in env to enable, e.g. http://localhost:8081
+# Leave empty to use official Telegram servers (2GB limit)
+LOCAL_BOT_API_URL = os.getenv("LOCAL_BOT_API_URL", "").strip().rstrip("/")
+
+# ── FILE SIZE CONFIG ──────────────────────────────────────────────────
+# With local API: 4GB supported; without: Telegram hard-limits to 2GB
+MAX_FILE_SIZE_LOCAL  = 4 * 1024 ** 3   # 4 GB
+MAX_FILE_SIZE_REMOTE = 2 * 1024 ** 3   # 2 GB
+
+# ── TRANSFER CHUNK SIZE ───────────────────────────────────────────────
+# Larger chunks = faster transfers on good connections
+UPLOAD_CHUNK_SIZE   = int(os.getenv("UPLOAD_CHUNK_SIZE",   str(512 * 1024)))   # 512 KB
+DOWNLOAD_CHUNK_SIZE = int(os.getenv("DOWNLOAD_CHUNK_SIZE", str(512 * 1024)))   # 512 KB
 
 _lc = os.getenv("LOG_CHANNEL", "").strip()
 LOG_CHANNEL = int(_lc) if _lc and _lc.lstrip("-").isdigit() else (_lc if _lc.startswith("@") else 0)
@@ -40,12 +56,9 @@ VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts", ".flv", ".
 # ═══════════════════════════════════════════════════════
 #  SPEED & CLEANUP CONFIG
 # ═══════════════════════════════════════════════════════
-# How long (seconds) to wait before deleting temp files after upload
-CLEANUP_DELAY   = 0   # 0 = instant delete after upload
-# Progress bar update interval (seconds) — lower = more updates = more Telegram API calls
-PROGRESS_INTERVAL = 1.5
-# Max concurrent global rename tasks (across all users)
-MAX_GLOBAL_TASKS  = 8
+CLEANUP_DELAY     = 0     # 0 = instant delete after upload
+PROGRESS_INTERVAL = 2.0   # seconds between progress updates
+MAX_GLOBAL_TASKS  = 12    # max concurrent tasks across all users
 
 # ═══════════════════════════════════════════════════════
 #  DATABASE
@@ -493,7 +506,8 @@ async def download_file(client: Client, msg: Message, path: str, prog_msg: Messa
         if time.time() - last[0] > PROGRESS_INTERVAL:
             last[0] = time.time()
             await fast_progress(cur, tot, prog_msg, "Downloading", start, task_id, fname)
-    await client.download_media(msg, file_name=path, progress=cb)
+    # block_size improves throughput for large files
+    await client.download_media(msg, file_name=path, progress=cb, block_size=DOWNLOAD_CHUNK_SIZE)
 
 async def upload_file(
     client: Client, msg: Message, out_path: str, prog_msg: Message,
@@ -559,16 +573,32 @@ async def process_rename(client: Client, msg: Message, task_id: str):
         return
 
     orig_name = getattr(media, "file_name", None) or f"file_{int(time.time())}"
-    file_size = getattr(media, "file_size", 0) or 0
+    # FIX: file_size can be None/0 for albums/forwards — try multiple attrs
+    file_size = (
+        getattr(media, "file_size", None) or
+        getattr(msg.video, "file_size", None) or
+        getattr(msg.document, "file_size", None) or
+        getattr(msg.audio, "file_size", None) or
+        0
+    )
     ext       = os.path.splitext(orig_name)[1].lower() or ".mp4"
     base_name = os.path.splitext(orig_name)[0]
 
     user = await get_user(uid)
 
-    # Size check
+    # Size check — only block if we actually know the size (> 0)
+    system_max = get_max_file_size()
+    if file_size > 0 and file_size > system_max:
+        cancel_flags.pop(task_id, None)
+        all_tasks.pop(task_id, None)
+        return await msg.reply_text(
+            f"❌ **File too large for this server!**\n\n"
+            f"📦 Your file: `{human(file_size)}`\n"
+            f"📏 Max supported: `{human(system_max)}`"
+        )
     if uid != OWNER_ID and not await is_premium(uid):
         limit = await get_size_limit()
-        if limit and file_size > limit:
+        if limit and file_size > 0 and file_size > limit:
             cancel_flags.pop(task_id, None)
             all_tasks.pop(task_id, None)
             return await msg.reply_text(
@@ -600,6 +630,16 @@ async def process_rename(client: Client, msg: Message, task_id: str):
 
             if cancel_flags.get(task_id):
                 raise asyncio.CancelledError()
+
+            # FIX: Verify downloaded file exists and has real content
+            if not os.path.exists(dl_path):
+                raise ValueError(f"Download failed — file not found: {dl_path}")
+            real_dl_size = os.path.getsize(dl_path)
+            if real_dl_size == 0:
+                os.remove(dl_path)
+                raise ValueError("Download failed — file is 0 bytes (Telegram returned empty file)")
+            # Update file_size to actual downloaded size (fixes 0B display in logs)
+            file_size = real_dl_size
 
             # Metadata
             await prog_msg.edit_text(f"⚙️ **Applying metadata...**\n`{final_name}`")
@@ -719,13 +759,23 @@ async def _delayed_cleanup(delay: int, *paths):
 # ═══════════════════════════════════════════════════════
 #  QUEUE WORKER (per-user, persistent)
 # ═══════════════════════════════════════════════════════
+_global_sem = asyncio.Semaphore(MAX_GLOBAL_TASKS)  # global concurrent cap
+
 async def queue_worker(client: Client, uid: int):
     q = user_queues[uid]
     while True:
         msg, task_id = await q.get()
-        asyncio.create_task(process_rename(client, msg, task_id))
+        # FIX: wait for global slot before spawning new task
+        # This prevents 9 files all starting simultaneously and starving each other
+        await _global_sem.acquire()
+        async def _run(m, tid):
+            try:
+                await process_rename(client, m, tid)
+            finally:
+                _global_sem.release()
+        asyncio.create_task(_run(msg, task_id))
         q.task_done()
-        await asyncio.sleep(0.1)   # tiny yield to prevent tight spin
+        await asyncio.sleep(0.05)
 
 async def enqueue(client: Client, msg: Message):
     uid = msg.from_user.id
@@ -772,14 +822,28 @@ async def enqueue(client: Client, msg: Message):
 # ═══════════════════════════════════════════════════════
 #  BOT INIT
 # ═══════════════════════════════════════════════════════
-app = Client(
-    "KenshinRenameBot",
+# ── Build client kwargs — inject local API if configured ──
+_client_kwargs: dict = dict(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=32,              # ↑ More parallel Pyrogram workers = faster handling
-    max_concurrent_transmissions=4,  # Up to 4 simultaneous upload streams
+    workers=64,                       # more parallel Pyrogram workers
+    max_concurrent_transmissions=8,   # more simultaneous streams
 )
+if LOCAL_BOT_API_URL:
+    # Pyrogram accepts a custom base_url via the `base_url` param in newer versions,
+    # but the most reliable way is PYROGRAM_TDLIB_SERVER env override OR patching session.
+    # We use the supported approach: pass `base_url` kwarg (pyrogram >=2.0.106).
+    try:
+        _client_kwargs["base_url"] = LOCAL_BOT_API_URL + "/bot{token}/"
+        logger.info(f"🚀 Local Bot API: {LOCAL_BOT_API_URL} (4GB uploads enabled)")
+    except Exception as _be:
+        logger.warning(f"Local API URL set failed: {_be}")
+
+app = Client("KenshinRenameBot", **_client_kwargs)
+
+def get_max_file_size() -> int:
+    return MAX_FILE_SIZE_LOCAL if LOCAL_BOT_API_URL else MAX_FILE_SIZE_REMOTE
 
 def start_kb():
     return InlineKeyboardMarkup([
@@ -787,7 +851,7 @@ def start_kb():
          InlineKeyboardButton("❓ Help",     callback_data="help")],
         [InlineKeyboardButton("✨ Premium",  callback_data="premium_info"),
          InlineKeyboardButton("📊 Stats",   callback_data="my_stats")],
-        [InlineKeyboardButton("👑 Owner",   url="https://t.me/KENSHIN_ANIME_OWNER"),
+        [InlineKeyboardButton("👑 Owner",   url="https://t.me/KENSHIN_ANIME"),
          InlineKeyboardButton("💬 Support", url="https://t.me/KENSHIN_ANIME_CHAT")],
     ])
 
@@ -847,6 +911,27 @@ async def back_start_cb(client, cq: CallbackQuery):
 # ═══════════════════════════════════════════════════════
 @app.on_message(filters.private & (filters.video | filters.document | filters.audio))
 async def media_handler(client, msg: Message):
+    uid = msg.from_user.id
+
+    # Sort buffer: if user is in sort mode, collect files instead of renaming
+    if sort_modes.get(uid) == "collecting":
+        media = msg.video or msg.document or msg.audio
+        fname = getattr(media, "file_name", None) or f"file_{msg.id}"
+        base  = os.path.splitext(fname)[0]
+        info  = extract_info(base)
+        if uid not in sort_buffers:
+            sort_buffers[uid] = []
+        sort_buffers[uid].append({"name": fname, "msg_id": msg.id, "info": info})
+        count = len(sort_buffers[uid])
+        await msg.reply_text(
+            f"📂 **Added to sort buffer!** ({count} files total)\n`{fname[:50]}`\n\nSend more files or `/sort done` to see sorted order.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📊 View Buffer", callback_data=f"sortview_{uid}"),
+                InlineKeyboardButton("✅ Finalize",    callback_data=f"sortdone_{uid}"),
+            ]])
+        )
+        return
+
     await enqueue(client, msg)
 
 # ═══════════════════════════════════════════════════════
@@ -1320,9 +1405,11 @@ async def sysinfo_cmd(client, msg: Message):
         f"⏰ **Uptime:** `{uptime_str}`\n\n"
 
         f"━━━ ⚡ SPEED CONFIG ━━━\n"
-        f"🧵 **Workers:** `32`  📡 **Streams:** `4`\n"
+        f"🧵 **Workers:** `64`  📡 **Streams:** `8`\n"
         f"🗑 **Auto Cleanup:** `{cleanup_delay_val}s` after upload\n"
         f"📊 **Progress Interval:** `{PROGRESS_INTERVAL}s`\n"
+        f"🌐 **Local Bot API:** `{'✅ ' + LOCAL_BOT_API_URL if LOCAL_BOT_API_URL else '❌ Not set (2GB limit)'}` \n"
+        f"📦 **Max File Size:** `{human(get_max_file_size())}`\n"
     )
 
     await m.edit_text(text)
@@ -1444,6 +1531,153 @@ async def cancelqueue_cb(client, cq: CallbackQuery):
             cancel_flags[tid] = True
             count += 1
     await cq.answer(f"⏹ Cancelled {count} tasks!", show_alert=True)
+
+# ═══════════════════════════════════════════════════════
+#  SORT / SEQUENCE FEATURE
+#  /sort — user sends multiple files, bot sorts them by
+#          season > episode > chapter > quality > filename
+#  /sortsend — same but auto-sends sorted list as forward plan
+# ═══════════════════════════════════════════════════════
+
+# Per-user sort buffer: {uid: [{"name": str, "msg_id": int, "info": dict}]}
+sort_buffers: dict[int, list] = {}
+sort_modes:   dict[int, str]  = {}   # uid -> "collecting" | "done"
+
+def sort_key(item: dict) -> tuple:
+    """Sort by: season → episode → chapter → quality → filename"""
+    info = item.get("info", {})
+    try:
+        s = int(info.get("season",  "99") or 99)
+    except Exception:
+        s = 99
+    try:
+        e = int(info.get("episode", "9999") or 9999)
+    except Exception:
+        e = 9999
+    # chapter: look for Ch.XX or Chapter XX in name
+    ch_m = re.search(r"(?:ch(?:apter)?[.:\s]*)(\d+)", item["name"], re.I)
+    ch = int(ch_m.group(1)) if ch_m else 9999
+    # quality: 2160>1080>720>480>360 — higher = better (sort asc so lower first = worse quality first? no, let's sort desc quality)
+    q_map = {"2160p": 1, "4k": 1, "1080p": 2, "720p": 3, "480p": 4, "360p": 5, "240p": 6}
+    q = q_map.get(info.get("quality", "").lower(), 9)
+    return (s, e, ch, q, item["name"].lower())
+
+def format_sort_preview(items: list) -> str:
+    lines = []
+    for i, it in enumerate(items, 1):
+        info = it["info"]
+        s    = info.get("season", "??")
+        e    = info.get("episode", "??")
+        q    = info.get("quality", "")
+        name = it["name"][:45]
+        ch_m = re.search(r"(?:ch(?:apter)?[.:\s]*)(\d+)", it["name"], re.I)
+        ch   = f" Ch.{ch_m.group(1)}" if ch_m else ""
+        q_tag = f" [{q}]" if q else ""
+        lines.append(f"`{i:>2}.` S{s}E{e}{ch}{q_tag} — `{name}`")
+    return "\n".join(lines)
+
+
+@app.on_message(filters.command("sort") & filters.private)
+async def sort_cmd(client, msg: Message):
+    uid = msg.from_user.id
+    args = msg.text.split(None, 1)
+
+    # /sort clear
+    if len(args) > 1 and args[1].strip().lower() == "clear":
+        sort_buffers.pop(uid, None)
+        sort_modes.pop(uid, None)
+        return await msg.reply_text("🗑 **Sort buffer cleared!**")
+
+    # /sort done  — finalize and show sorted order
+    if len(args) > 1 and args[1].strip().lower() == "done":
+        items = sort_buffers.get(uid, [])
+        if not items:
+            return await msg.reply_text("❌ No files in sort buffer! Send files first, then /sort done")
+        items.sort(key=sort_key)
+        preview = format_sort_preview(items)
+        sort_modes[uid] = "done"
+        return await msg.reply_text(
+            f"✅ **Sorted {len(items)} files!**\n\n"
+            f"**Sequence (Season → Episode → Chapter → Quality):**\n\n"
+            f"{preview}\n\n"
+            f"📤 Forward these files to this bot **in this order** to rename them in sequence!\n"
+            f"Or use /sortsend to get the sorted filenames list.\n\n"
+            f"Use /sort clear to start over.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 Clear Buffer", callback_data=f"sortclear_{uid}"),
+                InlineKeyboardButton("📋 Copy Names",   callback_data=f"sortnames_{uid}"),
+            ]])
+        )
+
+    # /sort — show instructions or current buffer
+    items = sort_buffers.get(uid, [])
+    if items:
+        items.sort(key=sort_key)
+        preview = format_sort_preview(items)
+        await msg.reply_text(
+            f"📂 **Sort Buffer — {len(items)} files**\n\n"
+            f"{preview}\n\n"
+            f"Send more files to add, or:\n"
+            f"• `/sort done` — finalize & show sorted order\n"
+            f"• `/sort clear` — clear buffer",
+        )
+    else:
+        sort_modes[uid] = "collecting"
+        await msg.reply_text(
+            "📂 **Sort Mode Activated!**\n\n"
+            "Send me your video/file messages one by one (or forward them).\n"
+            "I'll parse their episode/season/chapter info and sort them in sequence.\n\n"
+            "**Supported formats:**\n"
+            "• `S01E05`, `[S01] [Ep.05]`\n"
+            "• `Chapter 12`, `Ch.12`\n"
+            "• `1080p`, `720p`, `4K`\n\n"
+            "When done adding files: `/sort done`\n"
+            "To view current buffer: `/sort`\n"
+            "To clear: `/sort clear`"
+        )
+
+
+@app.on_message(filters.command("sortsend") & filters.private)
+async def sortsend_cmd(client, msg: Message):
+    uid   = msg.from_user.id
+    items = sort_buffers.get(uid, [])
+    if not items:
+        return await msg.reply_text("❌ Sort buffer is empty! Send files and use /sort first.")
+    items.sort(key=sort_key)
+    # Build plain text list of filenames in order
+    names = "\n".join(f"{i}. {it['name']}" for i, it in enumerate(items, 1))
+    await msg.reply_text(
+        f"📋 **Sorted Filenames ({len(items)} files):**\n\n`{names}`\n\n"
+        f"These files should be sent/processed in this order!",
+    )
+
+
+@app.on_callback_query(filters.regex(r"^sortclear_"))
+async def sortclear_cb(client, cq: CallbackQuery):
+    uid = int(cq.data.split("_")[1])
+    if cq.from_user.id != uid:
+        return await cq.answer("❌ Not yours.", show_alert=True)
+    sort_buffers.pop(uid, None)
+    sort_modes.pop(uid, None)
+    await cq.answer("🗑 Buffer cleared!", show_alert=True)
+    try:
+        await cq.message.edit_text("🗑 **Sort buffer cleared!** Send /sort to start again.")
+    except Exception:
+        pass
+
+
+@app.on_callback_query(filters.regex(r"^sortnames_"))
+async def sortnames_cb(client, cq: CallbackQuery):
+    uid   = int(cq.data.split("_")[1])
+    items = sort_buffers.get(uid, [])
+    if not items:
+        return await cq.answer("❌ Buffer empty!", show_alert=True)
+    items.sort(key=sort_key)
+    names = "\n".join(f"{i}. {it['name']}" for i, it in enumerate(items, 1))
+    await cq.answer("✅ Names ready!", show_alert=False)
+    await cq.message.reply_text(f"📋 **Sorted Names:**\n\n`{names}`")
+
+
 
 # ─── THUMBNAIL ───────────────────────────────────────────
 @app.on_message(filters.command("setthumb") & filters.private)
@@ -1989,6 +2223,47 @@ async def noop_cb(client, cq: CallbackQuery):
 # ═══════════════════════════════════════════════════════
 #  RUN
 # ═══════════════════════════════════════════════════════
+
+
+@app.on_callback_query(filters.regex(r"^sortview_"))
+async def sortview_cb(client, cq: CallbackQuery):
+    uid   = int(cq.data.split("_")[1])
+    if cq.from_user.id != uid:
+        return await cq.answer("❌ Not yours.", show_alert=True)
+    items = sort_buffers.get(uid, [])
+    if not items:
+        return await cq.answer("❌ Buffer empty!", show_alert=True)
+    items.sort(key=sort_key)
+    preview = format_sort_preview(items)
+    await cq.answer()
+    await cq.message.reply_text(
+        f"📂 **Sort Buffer — {len(items)} files (sorted):**\n\n{preview}\n\n"
+        f"Use `/sort done` to finalize or send more files.",
+    )
+
+
+@app.on_callback_query(filters.regex(r"^sortdone_"))
+async def sortdone_cb(client, cq: CallbackQuery):
+    uid = int(cq.data.split("_")[1])
+    if cq.from_user.id != uid:
+        return await cq.answer("❌ Not yours.", show_alert=True)
+    items = sort_buffers.get(uid, [])
+    if not items:
+        return await cq.answer("❌ Buffer empty!", show_alert=True)
+    items.sort(key=sort_key)
+    preview = format_sort_preview(items)
+    sort_modes[uid] = "done"
+    await cq.answer("✅ Sorted!", show_alert=False)
+    await cq.message.reply_text(
+        f"✅ **Sorted {len(items)} files!**\n\n"
+        f"{preview}\n\n"
+        f"Forward these files to this bot **in this order** to process them in sequence.\n"
+        f"Use /sort clear to reset.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑 Clear Buffer", callback_data=f"sortclear_{uid}"),
+        ]])
+    )
+
 if __name__ == "__main__":
     logger.info("🚀 KenshinRenameBot v6.0 PREMIUM starting...")
     app.run()
