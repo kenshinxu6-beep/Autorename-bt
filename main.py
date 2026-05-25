@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════
 API_ID    = 37407868
 API_HASH  = "d7d3bff9f7cf9f3b111129bdbd13a065"
-BOT_TOKEN = "8285265972:AAGVX-BGABNk1nHBZ2Sr3gUSQ2XHfH7KWSU"
+BOT_TOKEN = "8766627147:AAGqquwD8XkZwf0O1vkop5qkDPSize_g3lo"
 MONGO_URI = "mongodb+srv://kenshinxu1:iammohitgurjar.1@kenshinfileshere.fyvrwjd.mongodb.net/?appName=Kenshinfileshere"
 
 OWNER_ID  = 6728678197
