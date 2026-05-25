@@ -1,6 +1,6 @@
 """
 KenshinRenameBot v6.0  ◈ PREMIUM
-Owner  : @KENSHIN_ANIME_OWNER
+Owner  : @KENSHIN_ANIME
 Support: @KENSHIN_ANIME_CHAT
 Channel: @Kenshin_Anime
 """
@@ -13,6 +13,11 @@ import motor.motor_asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from PIL import Image
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -25,12 +30,22 @@ API_HASH  = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 OWNER_ID  = int(os.getenv("OWNER_ID", os.getenv("KENSHIN_ANIME_OWNER", "0")))
-MAX_WORKERS = 4   # concurrent tasks per user
+MAX_WORKERS = 6   # concurrent tasks per user (increased for speed)
 
 _lc = os.getenv("LOG_CHANNEL", "").strip()
 LOG_CHANNEL = int(_lc) if _lc and _lc.lstrip("-").isdigit() else (_lc if _lc.startswith("@") else 0)
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts", ".flv", ".wmv"}
+
+# ═══════════════════════════════════════════════════════
+#  SPEED & CLEANUP CONFIG
+# ═══════════════════════════════════════════════════════
+# How long (seconds) to wait before deleting temp files after upload
+CLEANUP_DELAY   = 30
+# Progress bar update interval (seconds) — lower = more updates = more Telegram API calls
+PROGRESS_INTERVAL = 1.5
+# Max concurrent global rename tasks (across all users)
+MAX_GLOBAL_TASKS  = 8
 
 # ═══════════════════════════════════════════════════════
 #  DATABASE
@@ -458,7 +473,7 @@ async def download_file(client: Client, msg: Message, path: str, prog_msg: Messa
     start = time.time()
     last  = [0.0]
     async def cb(cur, tot):
-        if time.time() - last[0] > 1.2:
+        if time.time() - last[0] > PROGRESS_INTERVAL:
             last[0] = time.time()
             await fast_progress(cur, tot, prog_msg, "Downloading", start, task_id, fname)
     await client.download_media(msg, file_name=path, progress=cb)
@@ -470,7 +485,8 @@ async def upload_file(
     start = time.time()
     last  = [0.0]
     async def cb(cur, tot):
-        if time.time() - last[0] > 1.2:
+        # Throttle progress updates to reduce API rate-limit hits → faster net throughput
+        if time.time() - last[0] > PROGRESS_INTERVAL:
             last[0] = time.time()
             await fast_progress(cur, tot, prog_msg, "Uploading", start, task_id, final_name)
 
@@ -483,21 +499,20 @@ async def upload_file(
             caption=caption, file_name=final_name,
             thumb=thumb_path, progress=cb,
         )
-        return
+    else:
+        dur = w = h = 0
+        if msg.video:
+            dur, w, h = msg.video.duration or 0, msg.video.width or 1280, msg.video.height or 720
+        elif msg.document:
+            dur, w, h = 0, 1280, 720
 
-    dur = w = h = 0
-    if msg.video:
-        dur, w, h = msg.video.duration or 0, msg.video.width or 1280, msg.video.height or 720
-    elif msg.document:
-        dur, w, h = 0, 1280, 720
-
-    await client.send_video(
-        msg.chat.id, out_path,
-        caption=caption, file_name=final_name,
-        thumb=thumb_path,
-        duration=dur, width=w, height=h,
-        supports_streaming=True, progress=cb,
-    )
+        await client.send_video(
+            msg.chat.id, out_path,
+            caption=caption, file_name=final_name,
+            thumb=thumb_path,
+            duration=dur, width=w, height=h,
+            supports_streaming=True, progress=cb,
+        )
 
 # ═══════════════════════════════════════════════════════
 #  CORE RENAME TASK
@@ -599,31 +614,56 @@ async def process_rename(client: Client, msg: Message, task_id: str):
             real_size = os.path.getsize(out_path) if os.path.exists(out_path) else file_size
             await log_rename(client, uid, msg.from_user.username or "", orig_name, final_name, real_size)
 
+            # ── Schedule cleanup 30s after upload completes ──────────────
+            asyncio.create_task(_delayed_cleanup(CLEANUP_DELAY, dl_path, out_path, thumb_path, task_id))
+
         except asyncio.CancelledError:
             try:
                 await prog_msg.edit_text("❌ **Task cancelled.**")
             except Exception:
                 pass
-        except Exception as e:
-            logger.error(f"Task {task_id}: {e}", exc_info=True)
-            try:
-                await prog_msg.edit_text(f"❌ **Error:** `{e}`")
-            except Exception:
-                pass
-        finally:
-            cancel_flags.pop(task_id, None)
-            all_tasks.pop(task_id, None)
+            # Immediate cleanup on cancel
             for p in [dl_path, out_path, thumb_path]:
                 if p and os.path.exists(p):
                     try:
                         os.remove(p)
                     except Exception:
                         pass
+        except Exception as e:
+            logger.error(f"Task {task_id}: {e}", exc_info=True)
+            try:
+                await prog_msg.edit_text(f"❌ **Error:** `{e}`")
+            except Exception:
+                pass
+            # Immediate cleanup on error
+            for p in [dl_path, out_path, thumb_path]:
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+        finally:
+            cancel_flags.pop(task_id, None)
+            all_tasks.pop(task_id, None)
             # Remove from persistent queue
             try:
                 await queue_col.delete_one({"task_id": task_id})
             except Exception:
                 pass
+
+# ═══════════════════════════════════════════════════════
+#  DELAYED CLEANUP — deletes temp files N seconds after upload
+# ═══════════════════════════════════════════════════════
+async def _delayed_cleanup(delay: int, *paths):
+    """Wait `delay` seconds then silently delete all given file paths."""
+    await asyncio.sleep(delay)
+    for p in paths:
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+                logger.info(f"🗑 Cleaned up: {p}")
+            except Exception as e:
+                logger.warning(f"Cleanup failed {p}: {e}")
 
 # ═══════════════════════════════════════════════════════
 #  QUEUE WORKER (per-user, persistent)
@@ -686,7 +726,8 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=16,              # Pyrogram internal workers
+    workers=32,              # ↑ More parallel Pyrogram workers = faster handling
+    max_concurrent_transmissions=4,  # Up to 4 simultaneous upload streams
 )
 
 def start_kb():
@@ -800,7 +841,7 @@ ALL_CMDS = [
     "setmedia","ping","allusers","getthumb","delthumb","resetme","setthumb","setlimit",
     "getlimit","myid","info","setcaption","setformat","setaudio","setsub","settings",
     "clearcaption","clearformat","addpremium","removepremium","premiumlist","mypremium",
-    "exportdb","hi",
+    "exportdb","hi","sysinfo",
 ]
 
 # ═══════════════════════════════════════════════════════
@@ -1068,6 +1109,10 @@ HELP_TEXT = (
     "/myid — Your Telegram ID\n"
     "/hi — Say hello to bot\n"
     "/resetme — Reset all settings\n\n"
+    "**👑 Owner Commands:**\n"
+    "/sysinfo — VPS CPU/RAM/Disk/Network health\n"
+    "/allusers — Total user stats\n"
+    "/broadcast — Send message to all users\n\n"
     "**⚙️ Quick Commands:**\n"
     "/setformat `<format>` — Set rename format\n"
     "/clearformat — Reset to default format\n"
@@ -1106,6 +1151,119 @@ async def ping_cmd(client, msg: Message):
     ms = round((time.time() - s) * 1000)
     tier = "🟢 Fast" if ms < 200 else "🟡 Medium" if ms < 500 else "🔴 Slow"
     await m.edit_text(f"🏓 **Pong!** `{ms}ms` {tier}")
+
+@app.on_message(filters.command("sysinfo") & filters.private)
+@owner_only
+async def sysinfo_cmd(client, msg: Message):
+    """Show VPS CPU, RAM, Disk, Network and bot health."""
+    m = await msg.reply_text("⏳ Fetching system info...")
+
+    if not HAS_PSUTIL:
+        return await m.edit_text(
+            "❌ `psutil` not installed.\n\nRun: `pip install psutil`"
+        )
+
+    # ── CPU ──────────────────────────────────────────────
+    cpu_pct     = psutil.cpu_percent(interval=1)
+    cpu_count   = psutil.cpu_count(logical=True)
+    cpu_freq    = psutil.cpu_freq()
+    freq_str    = f"{cpu_freq.current:.0f} MHz" if cpu_freq else "N/A"
+    cpu_bar     = progress_bar(cpu_pct, 100, width=10)
+
+    # ── RAM ──────────────────────────────────────────────
+    ram         = psutil.virtual_memory()
+    ram_used    = human(ram.used)
+    ram_total   = human(ram.total)
+    ram_bar     = progress_bar(ram.percent, 100, width=10)
+
+    # ── SWAP ─────────────────────────────────────────────
+    swap        = psutil.swap_memory()
+    swap_str    = f"{human(swap.used)} / {human(swap.total)}" if swap.total else "N/A"
+
+    # ── DISK ─────────────────────────────────────────────
+    disk        = psutil.disk_usage("/")
+    disk_used   = human(disk.used)
+    disk_total  = human(disk.total)
+    disk_free   = human(disk.free)
+    disk_bar    = progress_bar(disk.percent, 100, width=10)
+
+    # ── DISK /tmp specifically ────────────────────────────
+    try:
+        tmp_disk    = psutil.disk_usage("/tmp")
+        tmp_free    = human(tmp_disk.free)
+        tmp_used    = human(tmp_disk.used)
+    except Exception:
+        tmp_free = tmp_used = "N/A"
+
+    # ── NETWORK ──────────────────────────────────────────
+    net1        = psutil.net_io_counters()
+    await asyncio.sleep(1)
+    net2        = psutil.net_io_counters()
+    net_up      = human(net2.bytes_sent - net1.bytes_sent) + "/s"
+    net_down    = human(net2.bytes_recv - net1.bytes_recv) + "/s"
+    net_sent    = human(net2.bytes_sent)
+    net_recv    = human(net2.bytes_recv)
+
+    # ── UPTIME ───────────────────────────────────────────
+    boot_time   = datetime.fromtimestamp(psutil.boot_time())
+    uptime_secs = int((datetime.now() - boot_time).total_seconds())
+    uptime_str  = (
+        f"{uptime_secs // 86400}d "
+        f"{(uptime_secs % 86400) // 3600}h "
+        f"{(uptime_secs % 3600) // 60}m"
+    )
+
+    # ── BOT HEALTH ───────────────────────────────────────
+    active_tasks   = len(all_tasks)
+    queued_total   = sum(q.qsize() for q in user_queues.values())
+    proc           = psutil.Process(os.getpid())
+    bot_ram        = human(proc.memory_info().rss)
+    bot_cpu        = proc.cpu_percent(interval=0.2)
+    tmp_files      = len([f for f in os.listdir("/tmp") if f.startswith(("dl_", "up_", "thumb_"))])
+
+    # ── EMOJI HEALTH INDICATOR ───────────────────────────
+    def health_icon(pct):
+        if pct < 60:  return "🟢"
+        if pct < 85:  return "🟡"
+        return "🔴"
+
+    text = (
+        f"🖥 **System Info — KenshinRenameBot**\n\n"
+
+        f"━━━ 🔲 CPU ━━━\n"
+        f"{health_icon(cpu_pct)} **Usage:** `{cpu_pct:.1f}%`  {cpu_bar}\n"
+        f"⚙️ **Cores:** `{cpu_count}`  🔁 **Freq:** `{freq_str}`\n\n"
+
+        f"━━━ 🧠 RAM ━━━\n"
+        f"{health_icon(ram.percent)} **Used:** `{ram_used} / {ram_total}` ({ram.percent:.1f}%)  {ram_bar}\n"
+        f"💾 **Swap:** `{swap_str}`\n\n"
+
+        f"━━━ 💽 DISK ━━━\n"
+        f"{health_icon(disk.percent)} **Root:** `{disk_used} / {disk_total}` ({disk.percent:.1f}%)  {disk_bar}\n"
+        f"🆓 **Free:** `{disk_free}`\n"
+        f"📁 **/tmp Used:** `{tmp_used}`  🆓 Free: `{tmp_free}`\n\n"
+
+        f"━━━ 🌐 NETWORK ━━━\n"
+        f"⬆️ **Upload now:** `{net_up}`\n"
+        f"⬇️ **Download now:** `{net_down}`\n"
+        f"📤 **Total Sent:** `{net_sent}`\n"
+        f"📥 **Total Recv:** `{net_recv}`\n\n"
+
+        f"━━━ 🤖 BOT HEALTH ━━━\n"
+        f"🔄 **Active Tasks:** `{active_tasks}`\n"
+        f"📋 **Queued Tasks:** `{queued_total}`\n"
+        f"💾 **Bot RAM:** `{bot_ram}`\n"
+        f"🔲 **Bot CPU:** `{bot_cpu:.1f}%`\n"
+        f"🗂 **Temp Files:** `{tmp_files}` in /tmp\n"
+        f"⏰ **Uptime:** `{uptime_str}`\n\n"
+
+        f"━━━ ⚡ SPEED CONFIG ━━━\n"
+        f"🧵 **Workers:** `32`  📡 **Streams:** `4`\n"
+        f"🗑 **Auto Cleanup:** `{CLEANUP_DELAY}s` after upload\n"
+        f"📊 **Progress Interval:** `{PROGRESS_INTERVAL}s`\n"
+    )
+
+    await m.edit_text(text)
 
 @app.on_message(filters.command("myid") & filters.private)
 async def myid_cmd(client, msg: Message):
