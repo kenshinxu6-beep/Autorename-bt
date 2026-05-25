@@ -769,19 +769,22 @@ async def start_cmd(client, msg: Message):
         uname = msg.from_user.username or ""
         fname = msg.from_user.first_name or ""
         await log_new_user(client, uid, uname, fname)
-    bs   = await get_bot_settings()
+        bs   = await get_bot_settings()
     prem = await is_premium(uid)
+    
+    # Ye raha naya replace karne wala code:
     text = bs.get("start_msg") or (
         f"{'✨' if prem else '👋'} **Welcome, {msg.from_user.first_name}!**\n\n"
         f"{'🌟 You are a **Premium** user!\n\n' if prem else ''}"
-        f"Send me any **video / audio / document** and I'll:\n"
-        f"• ✅ Rename with your custom format\n"
-        f"• ✅ Set **all** metadata fresh (Title, Author, Artist, Audio, Sub, Video)\n"
-        f"• ✅ Apply HD thumbnail & custom caption\n"
+        "Send me any **video / audio / document** and I'll:\n"
+        "• ✅ Rename with your custom format\n"
+        "• ✅ Set **all** metadata fresh (Title, Author, Artist, Audio, Sub, Video)\n"
+        "• ✅ Apply HD thumbnail & custom caption\n"
         f"• ✅ Handle **{MAX_TASKS}** concurrent tasks per user\n\n"
-        f"Tap ⚙️ **Settings** to configure!\n\n"
-        f"**Support:** @KENSHIN_ANIME_CHAT"
+        "Tap ⚙️ **Settings** to configure!\n\n"
+        "**Support:** @KENSHIN_ANIME_CHAT"
     )
+  
     img = bs.get("start_img")
     if img:
         try:
