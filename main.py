@@ -80,6 +80,8 @@ DEFAULT_USER = {
 async def get_cleanup_delay() -> int:
     s = await settings_col.find_one({"_id": "global"})
     return int((s or {}).get("cleanup_delay", CLEANUP_DELAY))
+
+async def get_size_limit() -> int:
     s = await settings_col.find_one({"_id": "global"})
     return int((s or {}).get("file_size_limit", 0))
 
@@ -406,17 +408,30 @@ async def rename_metadata(in_path: str, out_path: str, user: dict, info: dict) -
 # ═══════════════════════════════════════════════════════
 #  THUMBNAIL
 # ═══════════════════════════════════════════════════════
-def make_thumb(raw_bytes: bytes) -> bytes:
+def make_thumb(raw_bytes: bytes, target_w: int = 1280, target_h: int = 720) -> bytes:
+    """
+    Resize thumbnail to match video dimensions (default 1280x720).
+    Maintains aspect ratio, always outputs valid JPEG.
+    """
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    MAX_W, MAX_H = 1280, 720
     ow, oh = img.size
-    ratio  = min(MAX_W / ow, MAX_H / oh, 1.0)
-    nw, nh = int(ow * ratio), int(oh * ratio)
+    target_w = max(target_w, 320)
+    target_h = max(target_h, 180)
+    ratio = min(target_w / ow, target_h / oh)
+    nw = max(int(ow * ratio), 1)
+    nh = max(int(oh * ratio), 1)
     if (nw, nh) != (ow, oh):
         img = img.resize((nw, nh), Image.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=95, optimize=True)
+    img.save(buf, "JPEG", quality=95, optimize=True, progressive=True)
     return buf.getvalue()
+
+
+def make_thumb_from_video_size(raw_bytes: bytes, video_w: int, video_h: int) -> bytes:
+    """Make thumb sized to match the video's actual dimensions."""
+    if not video_w or not video_h:
+        return make_thumb(raw_bytes)
+    return make_thumb(raw_bytes, target_w=video_w, target_h=video_h)
 
 # ═══════════════════════════════════════════════════════
 #  TASK MANAGER (in-memory + per-user semaphore)
@@ -506,9 +521,22 @@ async def upload_file(
     else:
         dur = w = h = 0
         if msg.video:
-            dur, w, h = msg.video.duration or 0, msg.video.width or 1280, msg.video.height or 720
+            dur = msg.video.duration or 0
+            w   = msg.video.width or 1280
+            h   = msg.video.height or 720
         elif msg.document:
             dur, w, h = 0, 1280, 720
+
+        # If we have a thumb, get its actual dimensions so Telegram renders correctly
+        if thumb:
+            try:
+                with Image.open(thumb) as timg:
+                    tw, th = timg.size
+                    # Use thumb dims only if they're reasonable
+                    if tw > 0 and th > 0:
+                        w, h = tw, th
+            except Exception:
+                pass
 
         await client.send_video(
             msg.chat.id, out_path,
@@ -586,18 +614,36 @@ async def process_rename(client: Client, msg: Message, task_id: str):
             fresh_user  = await get_user(uid)
             thumb_raw   = fresh_user.get("thumbnail")
             thumb_path  = None
+
+            # Get video dimensions for properly-sized thumbnail
+            vid_w = vid_h = 0
+            if msg.video:
+                vid_w = msg.video.width or 1280
+                vid_h = msg.video.height or 720
+            elif msg.document:
+                vid_w, vid_h = 1280, 720
+
             if thumb_raw:
                 try:
-                    if hasattr(thumb_raw, "tobytes"):
+                    # Handle different storage types from MongoDB (bytes, Binary, bytearray, memoryview)
+                    if isinstance(thumb_raw, (bytes, bytearray)):
+                        thumb_bytes = bytes(thumb_raw)
+                    elif hasattr(thumb_raw, "tobytes"):
                         thumb_bytes = thumb_raw.tobytes()
+                    elif hasattr(thumb_raw, "read"):
+                        thumb_bytes = thumb_raw.read()
                     else:
                         thumb_bytes = bytes(thumb_raw)
-                    # Write thumb to unique path — keep it alive until AFTER upload
+
+                    if len(thumb_bytes) < 100:
+                        raise ValueError(f"Thumb data too small: {len(thumb_bytes)} bytes")
+
+                    # Write thumb resized to video dimensions
                     thumb_path = f"/tmp/thumb_{task_id}.jpg"
-                    processed  = make_thumb(thumb_bytes)
+                    processed  = make_thumb_from_video_size(thumb_bytes, vid_w, vid_h)
                     with open(thumb_path, "wb") as tf:
                         tf.write(processed)
-                    logger.info(f"Thumb written: {thumb_path} ({len(processed)} bytes)")
+                    logger.info(f"Thumb written: {thumb_path} ({len(processed)} bytes, {vid_w}x{vid_h})")
                 except Exception as te:
                     logger.warning(f"Thumb error uid={uid}: {te}")
                     thumb_path = None
@@ -820,16 +866,26 @@ async def photo_handler(client, msg: Message):
     uid   = msg.from_user.id
     state = user_states.get(uid)
     if state == "set_thumb":
-        raw  = await client.download_media(msg.photo, in_memory=True)
-        data = make_thumb(bytes(raw.getbuffer()))
+        raw_buf = await client.download_media(msg.photo, in_memory=True)
+        raw_bytes = bytes(raw_buf.getbuffer())
+        data = make_thumb(raw_bytes)
         await update_user(uid, {"thumbnail": data})
         user_states.pop(uid, None)
-        await msg.reply_text(
-            "✅ **Thumbnail saved! (HD)**\n\nIt'll appear on all your uploads.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")
-            ]])
-        )
+        try:
+            await msg.reply_photo(
+                io.BytesIO(data),
+                caption="✅ **Thumbnail saved! (HD)**\n\nIt will appear on all your uploads.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")
+                ]])
+            )
+        except Exception:
+            await msg.reply_text(
+                "✅ **Thumbnail saved! (HD)**\n\nIt will appear on all your uploads.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")
+                ]])
+            )
     elif state == "set_start_img" and uid == OWNER_ID:
         await set_bot_setting("start_img", msg.photo.file_id)
         user_states.pop(uid, None)
@@ -1232,6 +1288,7 @@ async def sysinfo_cmd(client, msg: Message):
         if pct < 85:  return "🟡"
         return "🔴"
 
+    cleanup_delay_val = await get_cleanup_delay()
     text = (
         f"🖥 **System Info — KenshinRenameBot**\n\n"
 
@@ -1264,7 +1321,7 @@ async def sysinfo_cmd(client, msg: Message):
 
         f"━━━ ⚡ SPEED CONFIG ━━━\n"
         f"🧵 **Workers:** `32`  📡 **Streams:** `4`\n"
-        f"🗑 **Auto Cleanup:** `{await get_cleanup_delay()}s` after upload\n"
+        f"🗑 **Auto Cleanup:** `{cleanup_delay_val}s` after upload\n"
         f"📊 **Progress Interval:** `{PROGRESS_INTERVAL}s`\n"
     )
 
@@ -1393,10 +1450,14 @@ async def cancelqueue_cb(client, cq: CallbackQuery):
 async def setthumb_cmd(client, msg: Message):
     uid = msg.from_user.id
     if msg.reply_to_message and msg.reply_to_message.photo:
-        raw  = await client.download_media(msg.reply_to_message.photo, in_memory=True)
-        data = make_thumb(bytes(raw.getbuffer()))
+        raw_buf = await client.download_media(msg.reply_to_message.photo, in_memory=True)
+        raw_bytes = bytes(raw_buf.getbuffer())
+        data = make_thumb(raw_bytes)
         await update_user(uid, {"thumbnail": data})
-        return await msg.reply_text("✅ **Thumbnail saved! (HD)**")
+        try:
+            return await msg.reply_photo(io.BytesIO(data), caption="✅ **Thumbnail saved! (HD)**")
+        except Exception:
+            return await msg.reply_text("✅ **Thumbnail saved! (HD)**")
     user_states[uid] = "set_thumb"
     await msg.reply_text("🖼 **Send a photo** to set as HD thumbnail.\nType `cancel` to abort.")
 
