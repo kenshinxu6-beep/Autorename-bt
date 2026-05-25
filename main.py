@@ -1,12 +1,12 @@
 """
-KenshinRenameBot v4.0
-Owner  : @KENSHIN_ANIME_OWNER
+KenshinRenameBot v5.0  ◈ PREMIUM
+Owner  : @KENSHIN_ANIME
 Support: @KENSHIN_ANIME_CHAT
 Channel: @Kenshin_Anime
 """
 
 import os, re, time, asyncio, aiofiles, logging, io, json, random, shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Optional
 import motor.motor_asyncio
@@ -27,12 +27,11 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 OWNER_ID  = int(os.getenv("OWNER_ID", "0"))
 MAX_TASKS = 3
 
-# Safe LOG_CHANNEL parse (handles empty string, username like @chan, or numeric ID)
 _lc = os.getenv("LOG_CHANNEL", "").strip()
 if _lc and _lc.lstrip("-").isdigit():
     LOG_CHANNEL: int | str = int(_lc)
 elif _lc.startswith("@"):
-    LOG_CHANNEL = _lc          # Pyrogram accepts @username too
+    LOG_CHANNEL = _lc
 else:
     LOG_CHANNEL = 0
 
@@ -60,25 +59,29 @@ users_col       = db["users"]
 stats_col       = db["stats"]
 leaderboard_col = db["leaderboard"]
 settings_col    = db["bot_settings"]
+premium_col     = db["premium"]
+
+DEFAULT_METADATA = {
+    "title":    "@KENSHIN_ANIME",
+    "author":   "@KENSHIN_ANIME",
+    "artist":   "@KENSHIN_ANIME",
+    "audio_title":    "@KENSHIN_ANIME - [{lang}]",
+    "subtitle_title": "@KENSHIN_ANIME - [{lang}]",
+    "video_title":    "@KENSHIN_ANIME",
+}
 
 DEFAULT_USER = {
     "banned":        False,
-    "rename_format": "[@KENSHIN_ANIME] [S{season}] [E{ep}] ⌯ [{quality}]",
-    "metadata": {
-        "audio_title":    "@Kenshin_Anime - [{lang}]",
-        "subtitle_title": "@Kenshin_Anime - [{lang}]",
-        "video_title":    "",
-    },
-    "thumbnail":    None,
-    "caption":      "",
-    "media_format": "video",   # "video" | "file"
+    "rename_format": "[@KENSHIN_ANIME] [S{season}] [E{episode}] ⌯ [{quality}]",
+    "metadata":      DEFAULT_METADATA.copy(),
+    "thumbnail":     None,
+    "caption":       "",
+    "media_format":  "video",
 }
 
-# Global file-size limit in bytes (0 = unlimited). Owner can change via /setlimit
 _BOT_LIMIT_KEY = "file_size_limit"
 
 async def get_size_limit() -> int:
-    """Returns max file size in bytes for normal users. 0 = unlimited."""
     s = await settings_col.find_one({"_id": "global"})
     return int((s or {}).get(_BOT_LIMIT_KEY, 0))
 
@@ -90,10 +93,17 @@ async def get_user(uid: int) -> dict:
     if not u:
         u = {"_id": uid, **DEFAULT_USER}
         await users_col.insert_one(u)
-    needs = {k: v for k, v in DEFAULT_USER.items() if k not in u}
+    needs = {}
+    for k, v in DEFAULT_USER.items():
+        if k not in u:
+            needs[k] = v
+        elif k == "metadata" and isinstance(u.get("metadata"), dict):
+            for mk, mv in DEFAULT_METADATA.items():
+                if mk not in u["metadata"]:
+                    needs[f"metadata.{mk}"] = mv
     if needs:
         await users_col.update_one({"_id": uid}, {"$set": needs})
-        u.update(needs)
+        u = await users_col.find_one({"_id": uid})
     return u
 
 async def update_user(uid: int, data: dict):
@@ -124,8 +134,38 @@ async def get_bot_settings() -> dict:
 async def set_bot_setting(key: str, val):
     await settings_col.update_one({"_id": "global"}, {"$set": {key: val}}, upsert=True)
 
+# ─── PREMIUM ─────────────────────────────────────────────
+async def is_premium(uid: int) -> bool:
+    if uid == OWNER_ID:
+        return True
+    p = await premium_col.find_one({"_id": uid})
+    if not p:
+        return False
+    exp = p.get("expires")
+    if exp and datetime.utcnow() > exp:
+        await premium_col.delete_one({"_id": uid})
+        return False
+    return True
+
+async def set_premium(uid: int, days: int):
+    expires = datetime.utcnow() + timedelta(days=days)
+    await premium_col.update_one(
+        {"_id": uid},
+        {"$set": {"expires": expires, "granted_by": OWNER_ID, "granted_at": datetime.utcnow()}},
+        upsert=True
+    )
+    return expires
+
+async def remove_premium(uid: int):
+    await premium_col.delete_one({"_id": uid})
+
+async def get_premium_info(uid: int) -> Optional[dict]:
+    if uid == OWNER_ID:
+        return {"expires": None, "lifetime": True}
+    return await premium_col.find_one({"_id": uid})
+
 # ═══════════════════════════════════════════════════════
-#  LOG CHANNEL  (fixed – passes client properly)
+#  LOG CHANNEL
 # ═══════════════════════════════════════════════════════
 async def log_event(client: Client, text: str, photo_path: Optional[str] = None):
     if not LOG_CHANNEL:
@@ -164,7 +204,7 @@ async def log_new_user(client: Client, uid: int, uname: str, fname: str):
 # ═══════════════════════════════════════════════════════
 user_queues:   dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
 user_active:   dict[int, int]           = defaultdict(int)
-all_tasks:     dict[str, dict]          = {}   # task_id → {uid, file, time, prog_msg_id}
+all_tasks:     dict[str, dict]          = {}
 cancel_flags:  dict[str, bool]          = {}
 queue_workers: dict[int, asyncio.Task]  = {}
 user_states:   dict[int, str]           = {}
@@ -185,7 +225,6 @@ def human(n: float) -> str:
     return f"{n:.1f} TB"
 
 def parse_size(s: str) -> int:
-    """Parse '2GB', '500MB', '1024KB' → bytes. Returns 0 on fail."""
     s = s.strip().upper()
     m = re.match(r"^(\d+(?:\.\d+)?)\s*(GB|MB|KB|B)?$", s)
     if not m:
@@ -222,25 +261,52 @@ async def fast_progress(current: int, total: int, msg: Message, label: str, star
     except Exception:
         pass
 
-def extract_info(name: str) -> dict:
-    info = {"season": "01", "ep": "01", "quality": "", "audio": "", "title": name, "filename": name}
+def extract_info(name: str, user_obj=None) -> dict:
+    """
+    Extract info from filename.
+    Supports both {ep} and {episode} as same placeholder.
+    Also adds {username} from user_obj if provided.
+    """
+    info = {
+        "season":   "01",
+        "ep":       "01",
+        "episode":  "01",   # alias for {ep}
+        "quality":  "",
+        "audio":    "",
+        "title":    name,
+        "filename": name,
+        "username": "",
+    }
     m = re.search(r"[Ss](\d{1,2})", name)
     if m: info["season"] = m.group(1).zfill(2)
-    m = re.search(r"[Ee][Pp]?(\d{1,4})", name)
-    if m: info["ep"] = m.group(1).zfill(2)
-    m = re.search(r"(2160p|1080p|720p|480p|360p|4K|8K)", name, re.I)
+
+    m = re.search(r"[Ee][Pp]?\.?(\d{1,4})", name)
+    if m:
+        ep = m.group(1).zfill(2)
+        info["ep"] = ep
+        info["episode"] = ep
+
+    m = re.search(r"(2160p|4320p|1080p|720p|480p|360p|4K|8K)", name, re.I)
     if m: info["quality"] = m.group(1)
+
     m = re.search(r"\[(Hindi|English|Japanese|Tamil|Telugu|Dual|Multi)[^\]]*\]", name, re.I)
     if m: info["audio"] = m.group(1)
+
     title = re.sub(r"\[.*?\]|\(.*?\)", "", name)
     title = re.sub(r"[._\-]", " ", title).strip()
     info["title"] = re.sub(r"\s+", " ", title)
+
+    if user_obj:
+        info["username"] = getattr(user_obj, "first_name", "") or getattr(user_obj, "username", "") or ""
+
     return info
 
 def apply_ph(template: str, info: dict) -> str:
     for k, v in info.items():
         template = template.replace(f"{{{k}}}", str(v))
-    return template
+    # Clean unreplaced placeholders like {something}
+    template = re.sub(r"\{[^}]+\}", "", template)
+    return template.strip()
 
 def detect_lang(s: str) -> str:
     s_l = s.lower()
@@ -273,44 +339,69 @@ async def get_media_streams(path: str) -> dict:
         logger.warning(f"ffprobe: {e}")
     return streams
 
+# ─── FIX: Metadata completely replaced (not appended) ────
 async def rename_metadata(in_path: str, out_path: str, user: dict, info: dict) -> bool:
     meta  = user.get("metadata") or {}
-    a_tpl = meta.get("audio_title",    "@Kenshin_Anime - [{lang}]")
-    s_tpl = meta.get("subtitle_title", "@Kenshin_Anime - [{lang}]")
-    v_tpl = meta.get("video_title",    "")
-    strs  = await get_media_streams(in_path)
-    cmd   = ["ffmpeg", "-y", "-i", in_path, "-map", "0", "-c", "copy"]
+
+    # Global tags (title/author/artist)
+    g_title  = meta.get("title",  "@KENSHIN_ANIME")
+    g_author = meta.get("author", "@KENSHIN_ANIME")
+    g_artist = meta.get("artist", "@KENSHIN_ANIME")
+
+    # Per-stream templates
+    a_tpl = meta.get("audio_title",    "@KENSHIN_ANIME - [{lang}]")
+    s_tpl = meta.get("subtitle_title", "@KENSHIN_ANIME - [{lang}]")
+    v_tpl = meta.get("video_title",    "@KENSHIN_ANIME")
+
+    strs = await get_media_streams(in_path)
+
+    # -map_metadata -1 clears ALL existing metadata from source
+    # Then we inject our own metadata fresh
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", in_path,
+        "-map", "0",
+        "-c", "copy",
+        "-map_metadata", "-1",          # ← clears old metadata completely
+        "-metadata", f"title={apply_ph(g_title, info)}",
+        "-metadata", f"author={apply_ph(g_author, info)}",
+        "-metadata", f"artist={apply_ph(g_artist, info)}",
+        "-metadata", f"comment=@KENSHIN_ANIME",
+    ]
+
+    # Video stream title
     if v_tpl:
         cmd += ["-metadata:s:v:0", f"title={apply_ph(v_tpl, info)}"]
+
+    # Audio stream titles
     for i, t in enumerate(strs["audio"]):
         raw  = t.get("title") or t.get("lang") or ""
         lang = detect_lang(raw) if raw else f"Track {i+1}"
         cmd += [f"-metadata:s:a:{i}", f"title={apply_ph(a_tpl, {**info, 'lang': lang})}"]
+
+    # Subtitle stream titles
     for i, t in enumerate(strs["subtitle"]):
         raw  = t.get("title") or t.get("lang") or ""
         lang = detect_lang(raw) if raw else f"Sub {i+1}"
         cmd += [f"-metadata:s:s:{i}", f"title={apply_ph(s_tpl, {**info, 'lang': lang})}"]
+
     cmd.append(out_path)
+
     proc = await asyncio.create_subprocess_exec(*cmd,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     _, err = await proc.communicate()
     if proc.returncode != 0:
-        logger.error(f"FFmpeg: {err.decode()[-400:]}")
+        logger.error(f"FFmpeg metadata error: {err.decode()[-600:]}")
         return False
     return True
 
 # ═══════════════════════════════════════════════════════
-#  THUMBNAIL – HD, aspect-ratio preserved
+#  THUMBNAIL
 # ═══════════════════════════════════════════════════════
 def make_thumb(raw_bytes: bytes) -> bytes:
-    """
-    Resize to max 1280×720 keeping aspect ratio, save as high-quality JPEG.
-    Never upscale small images beyond original size.
-    """
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     MAX_W, MAX_H = 1280, 720
     ow, oh = img.size
-    # Only downscale, never upscale
     ratio = min(MAX_W / ow, MAX_H / oh, 1.0)
     nw, nh = int(ow * ratio), int(oh * ratio)
     if (nw, nh) != (ow, oh):
@@ -320,20 +411,17 @@ def make_thumb(raw_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 # ═══════════════════════════════════════════════════════
-#  DOWNLOAD
+#  DOWNLOAD / UPLOAD
 # ═══════════════════════════════════════════════════════
 async def download_file(client: Client, msg: Message, path: str, prog_msg: Message, task_id: str):
     start = time.time()
     last  = [0.0]
     async def cb(cur, tot):
-        if time.time() - last[0] > 2:
+        if time.time() - last[0] > 1.5:   # slightly faster update
             last[0] = time.time()
             await fast_progress(cur, tot, prog_msg, "📥 **Downloading...**", start, task_id)
     await client.download_media(msg, file_name=path, progress=cb)
 
-# ═══════════════════════════════════════════════════════
-#  UPLOAD  – always video player for video files
-# ═══════════════════════════════════════════════════════
 async def upload_file(
     client: Client, msg: Message, out_path: str, prog_msg: Message,
     task_id: str, user: dict, caption: str, thumb_path: Optional[str], final_name: str
@@ -341,7 +429,7 @@ async def upload_file(
     start = time.time()
     last  = [0.0]
     async def cb(cur, tot):
-        if time.time() - last[0] > 2:
+        if time.time() - last[0] > 1.5:
             last[0] = time.time()
             await fast_progress(cur, tot, prog_msg, "📤 **Uploading...**", start, task_id)
 
@@ -349,7 +437,6 @@ async def upload_file(
     is_video_ext = ext in VIDEO_EXTS
     user_mode    = user.get("media_format", "video")
 
-    # Non-video file + user wants document → send_document
     if not is_video_ext and user_mode == "file":
         await client.send_document(
             msg.chat.id, out_path,
@@ -358,7 +445,6 @@ async def upload_file(
         )
         return
 
-    # All video extensions → send_video (opens in Telegram player, NOT notepad)
     dur = w = h = 0
     if msg.video:
         dur, w, h = msg.video.duration or 0, msg.video.width or 1280, msg.video.height or 720
@@ -386,17 +472,20 @@ async def process_rename(client: Client, msg: Message, user: dict, task_id: str)
     file_size = getattr(media, "file_size", 0) or 0
     ext       = os.path.splitext(orig_name)[1].lower() or ".mp4"
     base_name = os.path.splitext(orig_name)[0]
-    info      = extract_info(base_name)
 
-    # File size limit check (owner bypasses)
-    if uid != OWNER_ID and file_size:
+    # Pass user object to extract_info for {username}
+    info = extract_info(base_name, msg.from_user)
+
+    # File size check
+    if uid != OWNER_ID and not await is_premium(uid):
         limit = await get_size_limit()
         if limit and file_size > limit:
             return await msg.reply_text(
                 f"❌ **File too large!**\n\n"
                 f"📦 Your file: `{human(file_size)}`\n"
                 f"📏 Limit: `{human(limit)}`\n\n"
-                f"Contact @KENSHIN_ANIME_OWNER to increase limit."
+                f"✨ Get **Premium** for unlimited size!\n"
+                f"Contact @KENSHIN_ANIME"
             )
 
     fmt      = (user.get("rename_format") or DEFAULT_USER["rename_format"]).strip()
@@ -426,7 +515,6 @@ async def process_rename(client: Client, msg: Message, user: dict, task_id: str)
         fresh_user  = await get_user(uid)
         thumb_bytes = fresh_user.get("thumbnail")
         if thumb_bytes:
-            # Always write fresh HD thumb
             thumb_path = f"/tmp/thumb_{task_id}.jpg"
             hd_bytes   = make_thumb(thumb_bytes)
             async with aiofiles.open(thumb_path, "wb") as f:
@@ -441,8 +529,7 @@ async def process_rename(client: Client, msg: Message, user: dict, task_id: str)
         await prog_msg.delete()
         await add_rename_stat(uid)
         await react(msg, FILE_REACTIONS)
-        # Log
-        uname = msg.from_user.username or ""
+        uname     = msg.from_user.username or ""
         real_size = os.path.getsize(out_path) if os.path.exists(out_path) else file_size
         await log_rename(client, uid, uname, orig_name, final_name, real_size)
 
@@ -484,8 +571,10 @@ async def enqueue(client: Client, msg: Message):
         queue_workers[uid] = asyncio.create_task(queue_worker(client, uid))
     await user_queues[uid].put((msg, user, task_id))
     pos = user_queues[uid].qsize() + user_active[uid]
+    prem = await is_premium(uid)
+    prem_badge = " ✨" if prem else ""
     await msg.reply_text(
-        f"✅ **Added to queue!**\n**Position:** `{pos}`\n**Task ID:** `{task_id}`",
+        f"✅ **Added to queue!**{prem_badge}\n**Position:** `{pos}`\n**Task ID:** `{task_id}`",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ Cancel This Task", callback_data=f"cancel_{task_id}")
         ]])
@@ -498,9 +587,11 @@ app = Client("KenshinRenameBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT
 
 def start_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
-         InlineKeyboardButton("❓ Help",     callback_data="help")],
-        [InlineKeyboardButton("👑 Owner",    url="https://t.me/KENSHIN_ANIME_OWNER"),
+        [InlineKeyboardButton("⚙️ Settings",  callback_data="settings"),
+         InlineKeyboardButton("❓ Help",      callback_data="help")],
+        [InlineKeyboardButton("✨ Premium",   callback_data="premium_info"),
+         InlineKeyboardButton("📊 Stats",    callback_data="my_stats")],
+        [InlineKeyboardButton("👑 Owner",    url="https://t.me/KENSHIN_ANIME"),
          InlineKeyboardButton("💬 Support",  url="https://t.me/KENSHIN_ANIME_CHAT")],
     ])
 
@@ -520,14 +611,16 @@ async def start_cmd(client, msg: Message):
         fname = msg.from_user.first_name or ""
         await log_new_user(client, uid, uname, fname)
     bs   = await get_bot_settings()
+    prem = await is_premium(uid)
     text = bs.get("start_msg") or (
-        f"👋 **Welcome to KenshinRenameBot!**\n\n"
+        f"{'✨' if prem else '👋'} **Welcome, {msg.from_user.first_name}!**\n\n"
+        f"{'🌟 You are a **Premium** user!' if prem else ''}\n\n"
         f"Send me any **video / audio / document** and I'll:\n"
         f"• ✅ Rename with your custom format\n"
-        f"• ✅ Set metadata on ALL audio & subtitle tracks\n"
+        f"• ✅ Set **all** metadata fresh (Title, Author, Artist, Audio, Sub, Video)\n"
         f"• ✅ Apply HD thumbnail & custom caption\n"
-        f"• ✅ Handle **{MAX_TASKS} tasks** simultaneously per user\n\n"
-        f"Tap ⚙️ **Settings** to configure everything!\n\n"
+        f"• ✅ Handle **{MAX_TASKS} tasks** simultaneously\n\n"
+        f"Tap ⚙️ **Settings** to configure!\n\n"
         f"**Support:** @KENSHIN_ANIME_CHAT"
     )
     img = bs.get("start_img")
@@ -548,7 +641,7 @@ async def media_handler(client, msg: Message):
     await enqueue(client, msg)
 
 # ═══════════════════════════════════════════════════════
-#  STICKER / GIF / PHOTO
+#  STICKER / PHOTO
 # ═══════════════════════════════════════════════════════
 @app.on_message(filters.private & (filters.sticker | filters.animation))
 async def sticker_handler(client, msg: Message):
@@ -588,14 +681,14 @@ async def photo_handler(client, msg: Message):
         await msg.reply_text("📸 Nice pic! Use /setthumb or ⚙️ Settings → 🖼 Set Thumbnail.")
 
 # ═══════════════════════════════════════════════════════
-#  ALL KNOWN COMMANDS (for unknown-text filter)
+#  ALL KNOWN COMMANDS
 # ═══════════════════════════════════════════════════════
 ALL_CMDS = [
     "start","help","cancel","ban","unban","banlist","broadcast","status","myqueue",
     "cancelqueue","stats","leaderboard","ongoing","cancelall","setstartmsg","setstartimg",
     "setmedia","ping","allusers","getthumb","delthumb","resetme","setthumb","setlimit",
     "getlimit","myid","info","setcaption","setformat","setaudio","setsub","settings",
-    "clearcaption","clearformat","someone",
+    "clearcaption","clearformat","addpremium","removepremium","premiumlist","mypremium",
 ]
 
 @app.on_message(filters.private & filters.text & ~filters.command(ALL_CMDS))
@@ -612,8 +705,11 @@ async def text_state_handler(client, msg: Message):
             "audio_title":    "metadata.audio_title",
             "subtitle_title": "metadata.subtitle_title",
             "video_title":    "metadata.video_title",
+            "meta_title":     "metadata.title",
+            "meta_author":    "metadata.author",
+            "meta_artist":    "metadata.artist",
             "caption":        "caption",
-            "start_msg":      None,   # handled separately
+            "start_msg":      None,
         }
         if state == "start_msg" and uid == OWNER_ID:
             await set_bot_setting("start_msg", text)
@@ -645,7 +741,7 @@ async def text_state_handler(client, msg: Message):
     ]))
 
 # ═══════════════════════════════════════════════════════
-#  SETTINGS MENU (cmd + inline)
+#  SETTINGS MENU
 # ═══════════════════════════════════════════════════════
 @app.on_callback_query(filters.regex("^settings$"))
 @app.on_message(filters.command("settings") & filters.private)
@@ -662,13 +758,15 @@ async def settings_menu(client, update):
     thumb = "✅ Set" if user.get("thumbnail") else "❌ None"
     limit = await get_size_limit()
     lim_d = human(limit) if limit else "Unlimited"
+    prem  = await is_premium(uid)
 
     text = (
-        f"⚙️ **Settings**\n\n"
+        f"⚙️ **Settings** {'✨ Premium' if prem else ''}\n\n"
         f"📝 **Format:** `{fmt_d}`\n"
         f"🎬 **Send As:** `{mf}`\n"
         f"🖼 **Thumbnail:** {thumb}\n"
         f"📋 **Caption:** `{cap_d}`\n"
+        f"🔤 **Global Title:** `{meta.get('title','@KENSHIN_ANIME')[:22]}`\n"
         f"🔊 **Audio Meta:** `{meta.get('audio_title','')[:22]}`\n"
         f"📄 **Sub Meta:** `{meta.get('subtitle_title','')[:22]}`\n"
         f"📏 **Size Limit:** `{lim_d}`\n\n"
@@ -681,11 +779,14 @@ async def settings_menu(client, update):
          InlineKeyboardButton("🗑 Del Thumb",      callback_data="s_delthumb")],
         [InlineKeyboardButton("📋 Set Caption",    callback_data="s_caption"),
          InlineKeyboardButton("🧹 Clear Caption",  callback_data="s_clearcap")],
+        [InlineKeyboardButton("🔤 Global Title",   callback_data="s_meta_title"),
+         InlineKeyboardButton("✍️ Author/Artist",  callback_data="s_meta_author")],
         [InlineKeyboardButton("🔊 Audio Meta",     callback_data="s_audio_title"),
          InlineKeyboardButton("📄 Sub Meta",       callback_data="s_subtitle_title")],
         [InlineKeyboardButton("🎞 Video Title",    callback_data="s_video_title"),
          InlineKeyboardButton("♻️ Reset All",      callback_data="s_reset")],
-        [InlineKeyboardButton("🔙 Back",           callback_data="back_start")],
+        [InlineKeyboardButton("✨ My Premium",      callback_data="premium_info"),
+         InlineKeyboardButton("🔙 Back",           callback_data="back_start")],
     ])
     if is_cb:
         try: await update.message.edit_text(text, reply_markup=kb)
@@ -697,33 +798,68 @@ async def settings_menu(client, update):
 SETTING_PROMPTS: dict[str, tuple[str, str]] = {
     "s_rename_format": ("rename_format",
         "📝 **Set Rename Format**\n\n"
-        "**Placeholders:** `{filename}` `{title}` `{season}` `{ep}` `{quality}` `{audio}`\n\n"
-        "**Default:** `[@KENSHIN_ANIME] [S{season}] [E{ep}] ⌯ [{quality}]`\n\n"
+        "**Placeholders:**\n"
+        "`{filename}` `{title}` `{season}` `{ep}` `{episode}` `{quality}` `{audio}` `{username}`\n\n"
+        "**Note:** `{ep}` and `{episode}` are same!\n\n"
+        "**Example:** `[@KENSHIN_ANIME] [S{season}] [E{episode}] ⌯ [{quality}]`\n\n"
         "Send format or type `cancel`"),
     "s_audio_title": ("audio_title",
         "🔊 **Set Audio Track Title**\n\n"
-        "**Placeholders:** `{lang}` `{title}` `{season}` `{ep}`\n\n"
-        "**Default:** `@Kenshin_Anime - [{lang}]`\n\n"
+        "**Placeholders:** `{lang}` `{season}` `{episode}`\n\n"
+        "**Default:** `@KENSHIN_ANIME - [{lang}]`\n\n"
         "Send format or type `cancel`"),
     "s_subtitle_title": ("subtitle_title",
         "📄 **Set Subtitle Track Title**\n\n"
         "**Placeholders:** `{lang}`\n\n"
-        "**Default:** `@Kenshin_Anime - [{lang}]`\n\nSend format or type `cancel`"),
+        "**Default:** `@KENSHIN_ANIME - [{lang}]`\n\nSend format or type `cancel`"),
     "s_video_title": ("video_title",
         "🎞 **Set Video Stream Title**\n\n"
-        "**Example:** `{title} | @Kenshin_Anime`\n\nSend or type `cancel`"),
+        "**Example:** `@KENSHIN_ANIME`\n\nSend or type `cancel`"),
     "s_caption": ("caption",
         "📋 **Set Upload Caption**\n\n"
-        "**Placeholders:** `{filename}` `{title}` `{season}` `{ep}` `{quality}` `{audio}`\n\n"
-        "**Example:** `🎬 {title} S{season}E{ep} | {quality}`\n\nSend caption or type `cancel`"),
+        "**Placeholders:**\n"
+        "`{filename}` `{title}` `{season}` `{ep}` `{episode}` `{quality}` `{audio}` `{username}`\n\n"
+        "**Example:**\n"
+        "`🎬 {title}\n📟 Episode - E{episode} ( S{season} )\n📀 Quality: {quality}`\n\n"
+        "Send caption or type `cancel`"),
+    "s_meta_title": ("meta_title",
+        "🔤 **Set Global File Title Metadata**\n\n"
+        "This sets the main `title` tag in the file.\n\n"
+        "**Default:** `@KENSHIN_ANIME`\n\nSend value or type `cancel`"),
+    "s_meta_author": ("meta_author",
+        "✍️ **Set Author & Artist Metadata**\n\n"
+        "Sets both `author` and `artist` tags.\n\n"
+        "**Default:** `@KENSHIN_ANIME`\n\nSend value or type `cancel`"),
 }
 
-@app.on_callback_query(filters.regex("^s_(rename_format|audio_title|subtitle_title|video_title|caption)$"))
+@app.on_callback_query(filters.regex("^s_(rename_format|audio_title|subtitle_title|video_title|caption|meta_title|meta_author)$"))
 async def setting_prompt_cb(client, cq: CallbackQuery):
     uid             = cq.from_user.id
     state, prompt   = SETTING_PROMPTS[cq.data]
     user_states[uid] = state
     await cq.message.edit_text(prompt)
+
+# Special: meta_author sets both author+artist
+@app.on_message(filters.private & filters.text & ~filters.command(ALL_CMDS))
+async def meta_author_handler(client, msg: Message):
+    uid   = msg.from_user.id
+    state = user_states.get(uid)
+    if state != "meta_author":
+        return
+    text = msg.text.strip()
+    if text.lower() in ["/cancel", "cancel"]:
+        user_states.pop(uid, None)
+        return await msg.reply_text("❌ Cancelled.")
+    u    = await get_user(uid)
+    meta = dict(u.get("metadata") or {})
+    meta["author"] = text
+    meta["artist"] = text
+    await update_user(uid, {"metadata": meta})
+    user_states.pop(uid, None)
+    await react(msg, CMD_REACTIONS)
+    await msg.reply_text(f"✅ **Author & Artist set to:** `{text}`", reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")
+    ]]))
 
 @app.on_callback_query(filters.regex("^s_clearcap$"))
 async def s_clearcap(client, cq: CallbackQuery):
@@ -781,6 +917,59 @@ async def back_start(client, cq: CallbackQuery):
         pass
 
 # ═══════════════════════════════════════════════════════
+#  PREMIUM INFO (inline)
+# ═══════════════════════════════════════════════════════
+@app.on_callback_query(filters.regex("^premium_info$"))
+@app.on_message(filters.command("mypremium") & filters.private)
+async def premium_info_cmd(client, update):
+    is_cb = isinstance(update, CallbackQuery)
+    uid   = update.from_user.id
+    p     = await get_premium_info(uid)
+    if uid == OWNER_ID:
+        text = "👑 **You are the Owner — Lifetime Premium!**"
+    elif p:
+        exp = p.get("expires")
+        exp_str = exp.strftime("%d %b %Y") if exp else "Lifetime"
+        text = (
+            f"✨ **You have Premium!**\n\n"
+            f"🗓 **Expires:** `{exp_str}`\n\n"
+            f"**Premium Benefits:**\n"
+            f"• ♾ No file size limit\n"
+            f"• ⚡ Priority processing\n"
+            f"• 🎬 All features unlocked"
+        )
+    else:
+        text = (
+            f"✨ **Premium Benefits**\n\n"
+            f"• ♾ **No file size limit**\n"
+            f"• ⚡ Priority queue\n"
+            f"• 🎬 All features unlocked\n\n"
+            f"Contact **@KENSHIN_ANIME** to get Premium!"
+        )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_start")]])
+    if is_cb:
+        try: await update.message.edit_text(text, reply_markup=kb)
+        except: pass
+    else:
+        await react(update, CMD_REACTIONS)
+        await update.reply_text(text, reply_markup=kb)
+
+@app.on_callback_query(filters.regex("^my_stats$"))
+async def my_stats_cb(client, cq: CallbackQuery):
+    uid = cq.from_user.id
+    lb  = await leaderboard_col.find_one({"_id": uid}) or {}
+    day = datetime.utcnow().strftime("%Y-%m-%d")
+    text = (
+        f"📊 **Your Stats**\n\n"
+        f"🗓 **Today:** `{(lb.get('daily') or {}).get(day, 0)}`\n"
+        f"🏆 **All Time:** `{lb.get('all_time', 0)}`\n"
+    )
+    await cq.answer()
+    await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔙 Back", callback_data="back_start")
+    ]]))
+
+# ═══════════════════════════════════════════════════════
 #  HELP
 # ═══════════════════════════════════════════════════════
 HELP_TEXT = (
@@ -790,11 +979,11 @@ HELP_TEXT = (
     "/start — Main menu\n"
     "/settings — Settings panel\n"
     "/status — Your active tasks\n"
-    "/myqueue — See all your queued tasks\n"
-    "/cancelqueue — Cancel ALL your queued tasks\n"
+    "/myqueue — Your queued tasks\n"
+    "/cancelqueue — Cancel all your tasks\n"
     "/stats — Your rename stats\n"
     "/leaderboard — Top users\n"
-    "/cancel `<task_id>` — Cancel a specific task\n"
+    "/mypremium — Premium status\n"
     "/ping — Bot latency\n"
     "/myid — Your Telegram ID\n"
     "/resetme — Reset all settings\n\n"
@@ -810,9 +999,10 @@ HELP_TEXT = (
     "/getthumb — View your thumbnail\n"
     "/delthumb — Delete thumbnail\n\n"
     "**📌 Placeholders:**\n"
-    "`{filename}` `{title}` `{season}` `{ep}` `{quality}` `{audio}` `{lang}`\n\n"
+    "`{filename}` `{title}` `{season}` `{ep}` `{episode}` `{quality}` `{audio}` `{lang}` `{username}`\n\n"
+    "**Note:** `{ep}` = `{episode}` (both work!)\n\n"
     "**💬 Support:** @KENSHIN_ANIME_CHAT\n"
-    "**👑 Owner:** @KENSHIN_ANIME_OWNER"
+    "**👑 Owner:** @KENSHIN_ANIME"
 )
 
 @app.on_callback_query(filters.regex("^help$"))
@@ -863,7 +1053,6 @@ async def myqueue_cmd(client, msg: Message):
     await react(msg, CMD_REACTIONS)
     uid   = msg.from_user.id
     tasks = [(tid, t) for tid, t in all_tasks.items() if t["uid"] == uid]
-    qs    = user_queues[uid].qsize() if uid in user_queues else 0
     if not tasks:
         return await msg.reply_text("✅ No tasks in queue.")
     text = f"📋 **Your Queue ({len(tasks)} tasks)**\n\n"
@@ -877,55 +1066,39 @@ async def myqueue_cmd(client, msg: Message):
         ]])
     )
 
-@app.on_callback_query(filters.regex(r"^cancelqueue_(\d+)$"))
+@app.on_callback_query(filters.regex(r"^cancelqueue_"))
 async def cancelqueue_cb(client, cq: CallbackQuery):
     uid = int(cq.data.split("_")[1])
-    if cq.from_user.id != uid:
-        return await cq.answer("❌ Not your queue!", show_alert=True)
+    if cq.from_user.id != uid and cq.from_user.id != OWNER_ID:
+        return await cq.answer("❌ Not yours.", show_alert=True)
     count = 0
-    for tid in list(cancel_flags.keys()):
+    for tid, t in list(cancel_flags.items()):
         if all_tasks.get(tid, {}).get("uid") == uid:
             cancel_flags[tid] = True
             count += 1
-    await cq.answer(f"⏹ Cancelled {count} task(s).", show_alert=True)
-    await cq.message.edit_text(f"⏹ **Cancelled {count} task(s) from your queue.**")
+    await cq.answer(f"⏹ Cancelled {count} tasks!", show_alert=True)
 
 @app.on_message(filters.command("cancelqueue") & filters.private)
 async def cancelqueue_cmd(client, msg: Message):
     await react(msg, CMD_REACTIONS)
-    uid   = msg.from_user.id
+    uid = msg.from_user.id
     count = 0
     for tid in list(cancel_flags.keys()):
         if all_tasks.get(tid, {}).get("uid") == uid:
             cancel_flags[tid] = True
             count += 1
-    await msg.reply_text(f"⏹ **Cancelled {count} of your task(s).**")
-
-@app.on_message(filters.command("stats") & filters.private)
-async def stats_cmd(client, msg: Message):
-    await react(msg, CMD_REACTIONS)
-    uid = msg.from_user.id
-    lb  = await leaderboard_col.find_one({"_id": uid}) or {}
-    g   = await stats_col.find_one({"_id": "global"}) or {}
-    day = datetime.utcnow().strftime("%Y-%m-%d")
-    await msg.reply_text(
-        f"📈 **Your Stats**\n\n"
-        f"📅 **Today:** `{(lb.get('daily') or {}).get(day, 0)}`\n"
-        f"🏆 **All Time:** `{lb.get('all_time', 0)}`\n\n"
-        f"🌐 **Bot Total Renames:** `{g.get('total_renames', 0)}`\n"
-        f"👥 **Total Users:** `{await users_col.count_documents({})}`"
-    )
+    await msg.reply_text(f"⏹ **Cancelled `{count}` tasks.**")
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_cmd(client, msg: Message):
     await react(msg, CMD_REACTIONS)
     args = msg.text.split()
     if len(args) < 2:
-        return await msg.reply_text("❗ Usage: /cancel `<task_id>`")
+        return await msg.reply_text("Usage: `/cancel <task_id>`")
     tid = args[1]
     if tid in cancel_flags and all_tasks.get(tid, {}).get("uid") == msg.from_user.id:
         cancel_flags[tid] = True
-        await msg.reply_text(f"⏹ Cancelling task `{tid}`...")
+        await msg.reply_text(f"⏹ **Cancelling task** `{tid}`")
     else:
         await msg.reply_text("❌ Task not found or not yours.")
 
@@ -938,7 +1111,7 @@ async def cancel_task_cb(client, cq: CallbackQuery):
     else:
         await cq.answer("❌ Task not found or not yours.", show_alert=True)
 
-# ─── THUMBNAIL ──────────────────────────────────────────
+# ─── THUMBNAIL ───────────────────────────────────────────
 @app.on_message(filters.command("setthumb") & filters.private)
 async def setthumb_cmd(client, msg: Message):
     await react(msg, CMD_REACTIONS)
@@ -966,7 +1139,7 @@ async def delthumb_cmd(client, msg: Message):
     await update_user(msg.from_user.id, {"thumbnail": None})
     await msg.reply_text("🗑 **Thumbnail deleted!**")
 
-# ─── FORMAT / CAPTION ───────────────────────────────────
+# ─── FORMAT / CAPTION ────────────────────────────────────
 @app.on_message(filters.command("setformat") & filters.private)
 async def setformat_cmd(client, msg: Message):
     await react(msg, CMD_REACTIONS)
@@ -975,8 +1148,8 @@ async def setformat_cmd(client, msg: Message):
         user_states[msg.from_user.id] = "rename_format"
         return await msg.reply_text(
             "📝 **Send your rename format:**\n\n"
-            "**Placeholders:** `{filename}` `{title}` `{season}` `{ep}` `{quality}` `{audio}`\n\n"
-            "**Default:** `[@KENSHIN_ANIME] [S{season}] [E{ep}] ⌯ [{quality}]`\n\n"
+            "**Placeholders:** `{filename}` `{title}` `{season}` `{ep}` `{episode}` `{quality}` `{audio}` `{username}`\n\n"
+            "**Default:** `[@KENSHIN_ANIME] [S{season}] [E{episode}] ⌯ [{quality}]`\n\n"
             "Type `cancel` to abort."
         )
     await update_user(msg.from_user.id, {"rename_format": args[1]})
@@ -996,7 +1169,7 @@ async def setcaption_cmd(client, msg: Message):
         user_states[msg.from_user.id] = "caption"
         return await msg.reply_text(
             "📋 **Send your caption:**\n\n"
-            "**Placeholders:** `{filename}` `{title}` `{season}` `{ep}` `{quality}` `{audio}`\n\n"
+            "**Placeholders:** `{filename}` `{title}` `{season}` `{ep}` `{episode}` `{quality}` `{audio}` `{username}`\n\n"
             "Type `cancel` to abort."
         )
     await update_user(msg.from_user.id, {"caption": args[1]})
@@ -1013,10 +1186,7 @@ async def setmedia_cmd(client, msg: Message):
     await react(msg, CMD_REACTIONS)
     args = msg.text.split()
     if len(args) < 2 or args[1] not in ["video", "file"]:
-        return await msg.reply_text(
-            "❗ `/setmedia video` or `/setmedia file`\n\n"
-            "• `video` — Telegram inline player\n• `file` — raw document"
-        )
+        return await msg.reply_text("❗ `/setmedia video` or `/setmedia file`")
     await update_user(msg.from_user.id, {"media_format": args[1]})
     await msg.reply_text(f"✅ Send as **{args[1].upper()}**.")
 
@@ -1028,8 +1198,8 @@ async def setaudio_cmd(client, msg: Message):
         user_states[msg.from_user.id] = "audio_title"
         return await msg.reply_text(
             "🔊 **Send audio metadata template:**\n\n"
-            "**Placeholders:** `{lang}` `{title}` `{season}` `{ep}`\n\n"
-            "**Default:** `@Kenshin_Anime - [{lang}]`\n\nType `cancel` to abort."
+            "**Placeholders:** `{lang}` `{season}` `{episode}`\n\n"
+            "**Default:** `@KENSHIN_ANIME - [{lang}]`\n\nType `cancel` to abort."
         )
     u    = await get_user(msg.from_user.id)
     meta = dict(u.get("metadata") or {})
@@ -1046,7 +1216,7 @@ async def setsub_cmd(client, msg: Message):
         return await msg.reply_text(
             "📄 **Send subtitle metadata template:**\n\n"
             "**Placeholders:** `{lang}`\n\n"
-            "**Default:** `@Kenshin_Anime - [{lang}]`\n\nType `cancel` to abort."
+            "**Default:** `@KENSHIN_ANIME - [{lang}]`\n\nType `cancel` to abort."
         )
     u    = await get_user(msg.from_user.id)
     meta = dict(u.get("metadata") or {})
@@ -1060,7 +1230,23 @@ async def resetme_cmd(client, msg: Message):
     await users_col.update_one({"_id": msg.from_user.id}, {"$set": DEFAULT_USER})
     await msg.reply_text("♻️ **All settings reset to default!**")
 
-# ─── LEADERBOARD ────────────────────────────────────────
+@app.on_message(filters.command("stats") & filters.private)
+async def stats_cmd(client, msg: Message):
+    await react(msg, CMD_REACTIONS)
+    uid = msg.from_user.id
+    lb  = await leaderboard_col.find_one({"_id": uid}) or {}
+    day = datetime.utcnow().strftime("%Y-%m-%d")
+    wk  = datetime.utcnow().strftime("%Y-W%W")
+    mon = datetime.utcnow().strftime("%Y-%m")
+    await msg.reply_text(
+        f"📊 **Your Rename Stats**\n\n"
+        f"🗓 **Today:** `{(lb.get('daily') or {}).get(day, 0)}`\n"
+        f"📆 **This Week:** `{(lb.get('weekly') or {}).get(wk, 0)}`\n"
+        f"🗓 **This Month:** `{(lb.get('monthly') or {}).get(mon, 0)}`\n"
+        f"🏆 **All Time:** `{lb.get('all_time', 0)}`"
+    )
+
+# ─── LEADERBOARD ─────────────────────────────────────────
 def lb_kb():
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("📅 Today",   callback_data="lb_today"),
@@ -1178,7 +1364,7 @@ async def ongoing_cmd(client, msg: Message):
     await msg.reply_text(
         text,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("⏹ Cancel ALL Tasks (Owner)", callback_data="owner_cancelall")
+            InlineKeyboardButton("⏹ Cancel ALL Tasks", callback_data="owner_cancelall")
         ]])
     )
 
@@ -1207,19 +1393,20 @@ async def allusers_cmd(client, msg: Message):
     await react(msg, CMD_REACTIONS)
     total  = await users_col.count_documents({})
     banned = await users_col.count_documents({"banned": True})
+    prems  = await premium_col.count_documents({})
     active = sum(user_active.values())
     g      = await stats_col.find_one({"_id": "global"}) or {}
     limit  = await get_size_limit()
     await msg.reply_text(
         f"👥 **Bot Statistics**\n\n"
         f"**Total Users:** `{total}`\n"
+        f"**Premium Users:** `{prems}`\n"
         f"**Banned:** `{banned}`\n"
         f"**Active Tasks:** `{active}`\n"
         f"**Total Renames:** `{g.get('total_renames', 0)}`\n"
         f"**File Size Limit:** `{human(limit) if limit else 'Unlimited'}`"
     )
 
-# ─── OWNER: FILE SIZE LIMIT ─────────────────────────────
 @app.on_message(filters.command("setlimit") & filters.private)
 @owner_only
 async def setlimit_cmd(client, msg: Message):
@@ -1228,10 +1415,10 @@ async def setlimit_cmd(client, msg: Message):
     if len(args) < 2:
         cur = await get_size_limit()
         return await msg.reply_text(
-            f"📏 **Set File Size Limit for Normal Users**\n\n"
+            f"📏 **Set File Size Limit (Normal Users)**\n\n"
             f"**Current:** `{human(cur) if cur else 'Unlimited'}`\n\n"
             f"**Usage:** `/setlimit 2GB` or `/setlimit 500MB` or `/setlimit 0` (unlimited)\n\n"
-            f"**Note:** Owner is never affected by this limit."
+            f"**Note:** Owner & Premium users bypass this limit."
         )
     val_str = args[1]
     if val_str == "0":
@@ -1239,9 +1426,9 @@ async def setlimit_cmd(client, msg: Message):
         return await msg.reply_text("✅ **File size limit removed (Unlimited).**")
     val = parse_size(val_str)
     if not val:
-        return await msg.reply_text("❌ Invalid format. Use: `2GB`, `500MB`, `1024KB`")
+        return await msg.reply_text("❌ Invalid. Use: `2GB`, `500MB`, `1024KB`")
     await set_size_limit(val)
-    await msg.reply_text(f"✅ **File size limit set to:** `{human(val)}`\n\nOwner is not affected.")
+    await msg.reply_text(f"✅ **Limit set to:** `{human(val)}`")
 
 @app.on_message(filters.command("getlimit") & filters.private)
 async def getlimit_cmd(client, msg: Message):
@@ -1250,10 +1437,10 @@ async def getlimit_cmd(client, msg: Message):
     await msg.reply_text(
         f"📏 **Current File Size Limit:**\n\n"
         f"👤 **Normal Users:** `{human(limit) if limit else 'Unlimited'}`\n"
-        f"👑 **Owner:** `Unlimited (always)`"
+        f"✨ **Premium Users:** `Unlimited`\n"
+        f"👑 **Owner:** `Unlimited`"
     )
 
-# ─── OWNER: START MESSAGE / IMAGE ───────────────────────
 @app.on_message(filters.command("setstartmsg") & filters.private)
 @owner_only
 async def setstartmsg_cmd(client, msg: Message):
@@ -1273,7 +1460,7 @@ async def setstartimg_cmd(client, msg: Message):
         await set_bot_setting("start_img", msg.reply_to_message.photo.file_id)
         return await msg.reply_text("✅ **Start image updated!**")
     user_states[msg.from_user.id] = "set_start_img"
-    await msg.reply_text("🖼 **Reply to a photo** or **send a photo** now to set as start image.")
+    await msg.reply_text("🖼 **Reply to a photo** or **send a photo** now to set start image.")
 
 @app.on_message(filters.command("info") & filters.private)
 @owner_only
@@ -1287,16 +1474,88 @@ async def info_cmd(client, msg: Message):
     user = await get_user(uid)
     lb   = await leaderboard_col.find_one({"_id": uid}) or {}
     day  = datetime.utcnow().strftime("%Y-%m-%d")
+    prem = await get_premium_info(uid)
+    prem_str = "✅ Yes" if prem else "❌ No"
+    if prem and not prem.get("lifetime"):
+        exp = prem.get("expires")
+        prem_str = f"✅ Yes (expires {exp.strftime('%d %b %Y') if exp else 'N/A'})"
     await msg.reply_text(
         f"👤 **User Info**\n\n"
         f"**ID:** `{uid}`\n"
         f"**Banned:** {'🚫 Yes' if user.get('banned') else '✅ No'}\n"
+        f"**Premium:** {prem_str}\n"
         f"**Format:** `{user.get('rename_format','')}`\n"
         f"**Media:** `{user.get('media_format','video')}`\n"
         f"**Thumbnail:** {'✅ Set' if user.get('thumbnail') else '❌ None'}\n"
         f"**Renames Today:** `{(lb.get('daily') or {}).get(day, 0)}`\n"
         f"**Total Renames:** `{lb.get('all_time', 0)}`"
     )
+
+# ─── PREMIUM MANAGEMENT (OWNER) ──────────────────────────
+@app.on_message(filters.command("addpremium") & filters.private)
+@owner_only
+async def addpremium_cmd(client, msg: Message):
+    await react(msg, CMD_REACTIONS)
+    args = msg.text.split()
+    if len(args) < 2:
+        return await msg.reply_text(
+            "✨ **Grant Premium**\n\n"
+            "**Usage:** `/addpremium <user_id> [days]`\n\n"
+            "**Examples:**\n"
+            "`/addpremium 123456789 30` — 30 days\n"
+            "`/addpremium 123456789 365` — 1 year\n"
+            "`/addpremium 123456789 0` — Lifetime"
+        )
+    uid = int(args[1])
+    days = int(args[2]) if len(args) > 2 else 30
+    if days == 0:
+        await premium_col.update_one(
+            {"_id": uid},
+            {"$set": {"expires": None, "lifetime": True, "granted_by": OWNER_ID, "granted_at": datetime.utcnow()}},
+            upsert=True
+        )
+        await msg.reply_text(f"✨ **Lifetime Premium granted to** `{uid}`!")
+        try:
+            await client.send_message(uid, "✨ **You have been granted Lifetime Premium!**\n\nEnjoy unlimited features on @KENSHIN_ANIME bot!")
+        except Exception:
+            pass
+    else:
+        exp = await set_premium(uid, days)
+        await msg.reply_text(f"✨ **Premium granted to** `{uid}` for **{days} days**!\n🗓 Expires: `{exp.strftime('%d %b %Y')}`")
+        try:
+            await client.send_message(uid, f"✨ **You have been granted {days}-day Premium!**\n🗓 Expires: `{exp.strftime('%d %b %Y')}`\n\nEnjoy unlimited features!")
+        except Exception:
+            pass
+
+@app.on_message(filters.command("removepremium") & filters.private)
+@owner_only
+async def removepremium_cmd(client, msg: Message):
+    await react(msg, CMD_REACTIONS)
+    args = msg.text.split()
+    if len(args) < 2:
+        return await msg.reply_text("**Usage:** `/removepremium <user_id>`")
+    uid = int(args[1])
+    await remove_premium(uid)
+    await msg.reply_text(f"✅ **Premium removed from** `{uid}`")
+
+@app.on_message(filters.command("premiumlist") & filters.private)
+@owner_only
+async def premiumlist_cmd(client, msg: Message):
+    await react(msg, CMD_REACTIONS)
+    prems = await premium_col.find().to_list(50)
+    if not prems:
+        return await msg.reply_text("✅ No premium users.")
+    text = f"✨ **Premium Users ({len(prems)}):**\n\n"
+    for p in prems:
+        exp = p.get("expires")
+        if p.get("lifetime") or exp is None:
+            exp_str = "Lifetime"
+        elif datetime.utcnow() > exp:
+            exp_str = "❌ Expired"
+        else:
+            exp_str = exp.strftime("%d %b %Y")
+        text += f"• `{p['_id']}` — {exp_str}\n"
+    await msg.reply_text(text)
 
 @app.on_callback_query(filters.regex("^noop$"))
 async def noop_cb(client, cq: CallbackQuery):
@@ -1306,5 +1565,5 @@ async def noop_cb(client, cq: CallbackQuery):
 #  RUN
 # ═══════════════════════════════════════════════════════
 if __name__ == "__main__":
-    logger.info("🚀 KenshinRenameBot v4.0 starting...")
+    logger.info("🚀 KenshinRenameBot v5.0 PREMIUM starting...")
     app.run()
