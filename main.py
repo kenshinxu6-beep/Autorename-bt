@@ -674,11 +674,9 @@ async def start_cmd(client, msg: Message):
         await log_new_user(client, uid, msg.from_user.username or "", msg.from_user.first_name or "")
     bs   = await get_bot_settings()
     prem = await is_premium(uid)
-    prem_line = "🌟 You are a **Premium** user!\n\n" if prem else ""
-    welcome_icon = "✨" if prem else "👋"
     text = bs.get("start_msg") or (
-        f"{welcome_icon} **Welcome, {msg.from_user.first_name}!**\n\n"
-        f"{prem_line}"
+        f"{'✨' if prem else '👋'} **Welcome, {msg.from_user.first_name}!**\n\n"
+        f"{'🌟 You are a **Premium** user!\n\n' if prem else ''}"
         f"Send me any **video / audio / document** and I'll:\n"
         f"• ✅ Rename with your custom format\n"
         f"• ✅ Rewrite all metadata fresh (no old tags)\n"
