@@ -25,13 +25,12 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════
 #  ENV
 # ═══════════════════════════════════════════════════════
-API_ID    = 37407868
-API_HASH  = "d7d3bff9f7cf9f3b111129bdbd13a065"
-BOT_TOKEN = "8766627147:AAGqquwD8XkZwf0O1vkop5qkDPSize_g3lo"
-MONGO_URI = "mongodb+srv://kenshinxu1:iammohitgurjar.1@kenshinfileshere.fyvrwjd.mongodb.net/?appName=Kenshinfileshere"
-
-OWNER_ID  = 6728678197
-MAX_WORKERS = 6   # concurrent tasks per user
+API_ID    = int(os.getenv("API_ID", "0"))
+API_HASH  = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+OWNER_ID  = int(os.getenv("OWNER_ID", os.getenv("KENSHIN_ANIME_OWNER", "0")))
+MAX_WORKERS = 8   # concurrent tasks per user
 
 # ── LOCAL BOT API SERVER (for 4GB+ uploads) ──────────────────────────
 # Set LOCAL_BOT_API_URL in env to enable, e.g. http://localhost:8081
@@ -506,8 +505,7 @@ async def download_file(client: Client, msg: Message, path: str, prog_msg: Messa
         if time.time() - last[0] > PROGRESS_INTERVAL:
             last[0] = time.time()
             await fast_progress(cur, tot, prog_msg, "Downloading", start, task_id, fname)
-    # block_size improves throughput for large files
-    await client.download_media(msg, file_name=path, progress=cb, block_size=DOWNLOAD_CHUNK_SIZE)
+    await client.download_media(msg, file_name=path, progress=cb)
 
 async def upload_file(
     client: Client, msg: Message, out_path: str, prog_msg: Message,
