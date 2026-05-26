@@ -1,2267 +1,1025 @@
 """
-KenshinRenameBot v6.0  ◈ PREMIUM
-Owner  : @KENSHIN_ANIME
-Support: @KENSHIN_ANIME_CHAT
-Channel: @Kenshin_Anime
+╔══════════════════════════════════════════════╗
+║       KENSHIN ANIME SEARCH BOT               ║
+║  Built with Pyrogram + MongoDB               ║
+╚══════════════════════════════════════════════╝
 """
 
-import os, re, time, asyncio, aiofiles, logging, io, json, random, shutil
-from datetime import datetime, timedelta
-from collections import defaultdict
-from typing import Optional
-import motor.motor_asyncio
-from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from PIL import Image
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
+import os, json, csv, io, asyncio, logging
+from datetime import datetime
+from pyrogram import Client, filters, enums
+from pyrogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery, ChatMemberUpdated
+)
+from pyrogram.errors import FloodWait, UserNotParticipant
+from motor.motor_asyncio import AsyncIOMotorClient
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ═══════════════════════════════════════════════════════
-#  ENV
-# ═══════════════════════════════════════════════════════
-API_ID    = int(os.getenv("API_ID", "0"))
-API_HASH  = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-OWNER_ID  = int(os.getenv("OWNER_ID", os.getenv("KENSHIN_ANIME_OWNER", "0")))
-MAX_WORKERS = 8   # concurrent tasks per user
-
-# ── LOCAL BOT API SERVER (for 4GB+ uploads) ──────────────────────────
-# Set LOCAL_BOT_API_URL in env to enable, e.g. http://localhost:8081
-# Leave empty to use official Telegram servers (2GB limit)
-LOCAL_BOT_API_URL = os.getenv("LOCAL_BOT_API_URL", "").strip().rstrip("/")
-
-# ── FILE SIZE CONFIG ──────────────────────────────────────────────────
-# With local API: 4GB supported; without: Telegram hard-limits to 2GB
-MAX_FILE_SIZE_LOCAL  = 4 * 1024 ** 3   # 4 GB
-MAX_FILE_SIZE_REMOTE = 2 * 1024 ** 3   # 2 GB
-
-# ── TRANSFER CHUNK SIZE ───────────────────────────────────────────────
-# Larger chunks = faster transfers on good connections
-UPLOAD_CHUNK_SIZE   = int(os.getenv("UPLOAD_CHUNK_SIZE",   str(512 * 1024)))   # 512 KB
-DOWNLOAD_CHUNK_SIZE = int(os.getenv("DOWNLOAD_CHUNK_SIZE", str(512 * 1024)))   # 512 KB
-
-_lc = os.getenv("LOG_CHANNEL", "").strip()
-LOG_CHANNEL = int(_lc) if _lc and _lc.lstrip("-").isdigit() else (_lc if _lc.startswith("@") else 0)
-
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts", ".flv", ".wmv"}
-
-# ═══════════════════════════════════════════════════════
-#  SPEED & CLEANUP CONFIG
-# ═══════════════════════════════════════════════════════
-CLEANUP_DELAY     = 0     # 0 = instant delete after upload
-PROGRESS_INTERVAL = 2.0   # seconds between progress updates
-MAX_GLOBAL_TASKS  = 12    # max concurrent tasks across all users
-
-# ═══════════════════════════════════════════════════════
-#  DATABASE
-# ═══════════════════════════════════════════════════════
-_mc             = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-db              = _mc["KenshinRenameBot"]
-users_col       = db["users"]
-stats_col       = db["stats"]
-leaderboard_col = db["leaderboard"]
-settings_col    = db["bot_settings"]
-premium_col     = db["premium"]
-queue_col       = db["persistent_queue"]   # NEW: persistent queue
-
-DEFAULT_METADATA = {
-    "title":          "@KENSHIN_ANIME",
-    "author":         "@KENSHIN_ANIME",
-    "artist":         "@KENSHIN_ANIME",
-    "audio_title":    "@KENSHIN_ANIME - [{lang}]",
-    "subtitle_title": "@KENSHIN_ANIME - [{lang}]",
-    "video_title":    "@KENSHIN_ANIME",
-}
-
-DEFAULT_USER = {
-    "banned":        False,
-    "rename_format": "[@KENSHIN_ANIME] [S{season}] [Ep.{episode}] ⌯ [{quality}]",
-    "metadata":      DEFAULT_METADATA.copy(),
-    "thumbnail":     None,
-    "caption":       "",
-    "media_format":  "video",
-}
-
-async def get_cleanup_delay() -> int:
-    s = await settings_col.find_one({"_id": "global"})
-    return int((s or {}).get("cleanup_delay", CLEANUP_DELAY))
-
-async def get_size_limit() -> int:
-    s = await settings_col.find_one({"_id": "global"})
-    return int((s or {}).get("file_size_limit", 0))
-
-async def set_size_limit(bytes_val: int):
-    await settings_col.update_one({"_id": "global"}, {"$set": {"file_size_limit": bytes_val}}, upsert=True)
-
-async def get_user(uid: int) -> dict:
-    u = await users_col.find_one({"_id": uid})
-    if not u:
-        u = {"_id": uid, **DEFAULT_USER}
-        await users_col.insert_one(u)
-    needs = {}
-    for k, v in DEFAULT_USER.items():
-        if k not in u:
-            needs[k] = v
-        elif k == "metadata" and isinstance(u.get("metadata"), dict):
-            for mk, mv in DEFAULT_METADATA.items():
-                if mk not in u["metadata"]:
-                    needs[f"metadata.{mk}"] = mv
-    if needs:
-        await users_col.update_one({"_id": uid}, {"$set": needs})
-        u = await users_col.find_one({"_id": uid})
-    return u
-
-async def update_user(uid: int, data: dict):
-    await users_col.update_one({"_id": uid}, {"$set": data}, upsert=True)
-
-async def is_banned(uid: int) -> bool:
-    u = await users_col.find_one({"_id": uid}, {"banned": 1})
-    return bool(u and u.get("banned"))
-
-async def add_rename_stat(uid: int):
-    now  = datetime.utcnow()
-    day  = now.strftime("%Y-%m-%d")
-    week = now.strftime("%Y-W%W")
-    mon  = now.strftime("%Y-%m")
-    await leaderboard_col.update_one(
-        {"_id": uid},
-        {"$inc": {"all_time": 1, f"daily.{day}": 1, f"weekly.{week}": 1, f"monthly.{mon}": 1}},
-        upsert=True,
-    )
-    await stats_col.update_one(
-        {"_id": "global"}, {"$inc": {"total_renames": 1, f"users.{uid}": 1}}, upsert=True
-    )
-
-async def get_bot_settings() -> dict:
-    s = await settings_col.find_one({"_id": "global"})
-    return s or {}
-
-async def set_bot_setting(key: str, val):
-    await settings_col.update_one({"_id": "global"}, {"$set": {key: val}}, upsert=True)
-
-# ─── PREMIUM ─────────────────────────────────────────────
-async def is_premium(uid: int) -> bool:
-    if uid == OWNER_ID:
-        return True
-    p = await premium_col.find_one({"_id": uid})
-    if not p:
-        return False
-    exp = p.get("expires")
-    if exp and datetime.utcnow() > exp:
-        await premium_col.delete_one({"_id": uid})
-        return False
-    return True
-
-async def set_premium(uid: int, days: int):
-    expires = datetime.utcnow() + timedelta(days=days)
-    await premium_col.update_one(
-        {"_id": uid},
-        {"$set": {"expires": expires, "granted_by": OWNER_ID, "granted_at": datetime.utcnow()}},
-        upsert=True
-    )
-    return expires
-
-async def remove_premium(uid: int):
-    await premium_col.delete_one({"_id": uid})
-
-async def get_premium_info(uid: int) -> Optional[dict]:
-    if uid == OWNER_ID:
-        return {"expires": None, "lifetime": True}
-    return await premium_col.find_one({"_id": uid})
-
-# ═══════════════════════════════════════════════════════
-#  UTILS
-# ═══════════════════════════════════════════════════════
-def human(n: float) -> str:
-    for u in ["B", "KB", "MB", "GB"]:
-        if abs(n) < 1024:
-            return f"{n:.1f} {u}"
-        n /= 1024
-    return f"{n:.1f} TB"
-
-def parse_size(s: str) -> int:
-    s = s.strip().upper()
-    m = re.match(r"^(\d+(?:\.\d+)?)\s*(GB|MB|KB|B)?$", s)
-    if not m:
-        return 0
-    val  = float(m.group(1))
-    unit = m.group(2) or "B"
-    mult = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}
-    return int(val * mult[unit])
-
-def progress_bar(done: float, total: float, width: int = 10) -> str:
-    """New styled progress bar: ▰▰▰▰▰▰▰▱▱▱ 70.0%"""
-    pct  = min(done / total, 1.0) if total else 0
-    fill = int(width * pct)
-    bar  = "▰" * fill + "▱" * (width - fill)
-    return f"{bar} {pct*100:.2f}%"
-
-async def fast_progress(current: int, total: int, msg: Message, label: str, start: float, task_id: str, fname: str = ""):
-    if cancel_flags.get(task_id):
-        raise asyncio.CancelledError()
-    elapsed = max(time.time() - start, 0.001)
-    speed   = current / elapsed
-    eta_s   = int((total - current) / speed) if speed > 0 else 0
-    eta_str = f"{eta_s}s" if eta_s < 60 else f"{eta_s//60}m {eta_s%60}s"
-    short   = (fname[:35] + "…") if len(fname) > 35 else fname
-    action  = "ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ" if "Down" in label else "ᴜᴘʟᴏᴀᴅɪɴɢ"
-    try:
-        await msg.edit_text(
-            f"┌• @KENSHIN_ANIME\n"
-            f"├• `{short}`\n"
-            f"├• {action}: {eta_s}s\n"
-            f"├• {progress_bar(current, total)}\n"
-            f"├• {human(current)} of {human(total)}\n"
-            f"├• Sᴘᴇᴇᴅ: {human(speed)}/s\n"
-            f"└• Eᴛᴀ: {eta_str}\n\n"
-            f"Stop → /c_{task_id[:16]} to cancel"
-        )
-    except Exception:
-        pass
-
-# ═══════════════════════════════════════════════════════
-#  FILENAME & METADATA HELPERS
-# ═══════════════════════════════════════════════════════
-def extract_info(name: str, user_obj=None) -> dict:
-    """
-    Extract placeholders from original filename (WITHOUT extension).
-    Handles BOTH formats:
-      A) [@KENSHIN_ANIME] [S01] [Ep.01] ⌯ [2160p]       ← bracket format
-      B) ᴀɴɪᴍᴇ: Title\n⌬ Season: 01\n⌬ Episode: 10 ...  ← caption format
-    """
-    info = {
-        "season":   "01",
-        "ep":       "01",
-        "episode":  "01",
-        "quality":  "",
-        "audio":    "",
-        "title":    "",
-        "filename": "",
-        "username": "",
-    }
-
-    # ── Season ──────────────────────────────────────────
-    # [S01] or S01 or Season: 01 or Season 01
-    m = (re.search(r"\[S(\d{1,2})\]", name, re.I) or
-         re.search(r"Season[:\s]+(\d{1,2})", name, re.I) or
-         re.search(r"(?<![A-Za-z])S(\d{1,2})(?!\d)", name, re.I))
-    if m:
-        info["season"] = m.group(1).zfill(2)
-
-    # ── Episode ─────────────────────────────────────────
-    # [Ep.01] or Ep.01 or E01 or Episode: 10 or EP01
-    m = (re.search(r"\[Ep\.(\d{1,4})\]", name, re.I) or
-         re.search(r"Episode[:\s]+(\d{1,4})", name, re.I) or
-         re.search(r"Ep\.(\d{1,4})", name, re.I) or
-         re.search(r"(?<![A-Za-z])E(\d{1,4})(?!\d)", name, re.I))
-    if m:
-        ep = m.group(1).zfill(2)
-        info["ep"]      = ep
-        info["episode"] = ep
-
-    # ── Quality ─────────────────────────────────────────
-    # [2160p] or Quality: 480p or plain 1080p
-    m = (re.search(r"\[(\d{3,4}p|4K|8K)\]", name, re.I) or
-         re.search(r"Quality[:\s]+(\d{3,4}p|4K|8K)", name, re.I) or
-         re.search(r"(2160p|4320p|1080p|720p|480p|360p|4K|8K)", name, re.I))
-    if m:
-        info["quality"] = m.group(1)
-
-    # ── Audio ────────────────────────────────────────────
-    # [Hindi-Tamil-Telugu-Jap] or Audio: Hindi or plain Hindi
-    m = re.search(
-        r"Audio[:\s]+\[?([A-Za-z]+(?:[- ][A-Za-z]+)*)\]?",
-        name, re.I
-    )
-    if m:
-        info["audio"] = m.group(1).strip()
-    else:
-        m = re.search(
-            r"\[(Hindi|English|Japanese|Tamil|Telugu|Dual|Multi)[^\]]*\]",
-            name, re.I
-        )
-        if m:
-            info["audio"] = m.group(0).strip("[]").strip()
-
-    # ── Title ────────────────────────────────────────────
-    # Try caption format first: ᴀɴɪᴍᴇ: Title or Anime: Title
-    m = re.search(r"(?:ᴀɴɪᴍᴇ|Anime)[:\s]+(.+?)(?:\n|━|$)", name, re.I)
-    if m:
-        info["title"] = m.group(1).strip()
-    else:
-        # Strip all [brackets] and (parens), clean up leftover
-        title = re.sub(r"\[.*?\]|\(.*?\)", "", name)
-        title = re.sub(r"[⌯⌬━\-_.]", " ", title)
-        title = re.sub(r"\s+", " ", title).strip()
-        info["title"] = title if title else name
-
-    if user_obj:
-        info["username"] = (
-            getattr(user_obj, "first_name", "") or
-            getattr(user_obj, "username", "") or ""
-        )
-    return info
-
-def apply_ph(template: str, info: dict) -> str:
-    """Apply placeholders, then remove any unfilled {xxx} tokens."""
-    for k, v in info.items():
-        template = template.replace(f"{{{k}}}", str(v))
-    template = re.sub(r"\{[^}]+\}", "", template)
-    return template.strip()
-
-def build_final_name(fmt: str, info: dict, orig_ext: str) -> tuple:
-    """
-    Returns (final_name_with_ext, base_without_ext).
-    Safe for all filenames including those with ⌯ ━ ⌬ unicode chars.
-    """
-    base = apply_ph(fmt, info)
-    # Remove empty brackets
-    base = re.sub(r"\[\s*\]|\(\s*\)", "", base).strip()
-    # Only remove truly illegal filesystem chars — keep ⌯ ━ ⌬ etc
-    base = re.sub(r'[\\/*?:"<>|]', "_", base).strip()
-    # Strip any accidental extension already in base
-    ext_lower = orig_ext.lower()
-    if base.lower().endswith(ext_lower):
-        base = base[: -len(orig_ext)]
-    base = base.rstrip(". ").strip()
-    return base + orig_ext, base
-
-def detect_lang(s: str) -> str:
-    s_l = s.lower()
-    for lang in ["hindi", "english", "japanese", "tamil", "telugu", "korean",
-                 "french", "german", "spanish", "portuguese", "chinese", "arabic", "russian"]:
-        if lang in s_l:
-            return lang.capitalize()
-    return s.strip() or "Unknown"
-
-# ═══════════════════════════════════════════════════════
-#  FFPROBE / FFMPEG METADATA
-# ═══════════════════════════════════════════════════════
-async def get_media_streams(path: str) -> dict:
-    streams = {"audio": [], "subtitle": [], "video": []}
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        out, _ = await proc.communicate()
-        for s in json.loads(out).get("streams", []):
-            ct = s.get("codec_type", "")
-            if ct not in streams:
-                continue
-            tags  = s.get("tags") or {}
-            title = tags.get("title", "") or tags.get("language", "")
-            lang  = tags.get("language", "")
-            streams[ct].append({"index": s.get("index", 0), "title": title, "lang": lang})
-    except Exception as e:
-        logger.warning(f"ffprobe: {e}")
-    return streams
-
-async def rename_metadata(in_path: str, out_path: str, user: dict, info: dict) -> bool:
-    """
-    FIX: -map_metadata -1 strips ALL old metadata.
-    New metadata injected fresh — no old language words prepended.
-    Audio/sub templates use detect_lang on existing stream lang tag.
-    """
-    meta    = user.get("metadata") or {}
-    g_title = meta.get("title",  DEFAULT_METADATA["title"])
-    g_auth  = meta.get("author", DEFAULT_METADATA["author"])
-    g_art   = meta.get("artist", DEFAULT_METADATA["artist"])
-    a_tpl   = meta.get("audio_title",    DEFAULT_METADATA["audio_title"])
-    s_tpl   = meta.get("subtitle_title", DEFAULT_METADATA["subtitle_title"])
-    v_tpl   = meta.get("video_title",    DEFAULT_METADATA["video_title"])
-
-    strs = await get_media_streams(in_path)
-
-    cmd = [
-        "ffmpeg", "-y", "-i", in_path,
-        "-map", "0", "-c", "copy",
-        "-map_metadata", "-1",                              # wipe all old metadata
-        "-metadata", f"title={apply_ph(g_title, info)}",
-        "-metadata", f"author={apply_ph(g_auth, info)}",
-        "-metadata", f"artist={apply_ph(g_art, info)}",
-        "-metadata", "comment=@KENSHIN_ANIME",
-    ]
-
-    if v_tpl:
-        cmd += ["-metadata:s:v:0", f"title={apply_ph(v_tpl, info)}"]
-
-    for i, t in enumerate(strs["audio"]):
-        raw  = t.get("lang") or t.get("title") or ""
-        lang = detect_lang(raw) if raw else f"Track {i+1}"
-        cmd += [f"-metadata:s:a:{i}", f"title={apply_ph(a_tpl, {**info, 'lang': lang})}"]
-
-    for i, t in enumerate(strs["subtitle"]):
-        raw  = t.get("lang") or t.get("title") or ""
-        lang = detect_lang(raw) if raw else f"Sub {i+1}"
-        cmd += [f"-metadata:s:s:{i}", f"title={apply_ph(s_tpl, {**info, 'lang': lang})}"]
-
-    cmd += [
-        "-threads", "0",       # use all CPU threads
-        out_path,
-    ]
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    _, err = await proc.communicate()
-    if proc.returncode != 0:
-        logger.error(f"FFmpeg metadata error: {err.decode()[-600:]}")
-        return False
-    return True
-
-# ═══════════════════════════════════════════════════════
-#  THUMBNAIL
-# ═══════════════════════════════════════════════════════
-def make_thumb(raw_bytes: bytes, target_w: int = 1280, target_h: int = 720) -> bytes:
-    """
-    Resize thumbnail to match video dimensions (default 1280x720).
-    Maintains aspect ratio, always outputs valid JPEG.
-    """
-    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    ow, oh = img.size
-    target_w = max(target_w, 320)
-    target_h = max(target_h, 180)
-    ratio = min(target_w / ow, target_h / oh)
-    nw = max(int(ow * ratio), 1)
-    nh = max(int(oh * ratio), 1)
-    if (nw, nh) != (ow, oh):
-        img = img.resize((nw, nh), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=95, optimize=True, progressive=True)
-    return buf.getvalue()
-
-
-def make_thumb_from_video_size(raw_bytes: bytes, video_w: int, video_h: int) -> bytes:
-    """Make thumb sized to match the video's actual dimensions."""
-    if not video_w or not video_h:
-        return make_thumb(raw_bytes)
-    return make_thumb(raw_bytes, target_w=video_w, target_h=video_h)
-
-# ═══════════════════════════════════════════════════════
-#  TASK MANAGER (in-memory + per-user semaphore)
-# ═══════════════════════════════════════════════════════
-user_queues:    dict[int, asyncio.Queue]     = defaultdict(asyncio.Queue)
-user_sems:      dict[int, asyncio.Semaphore] = {}
-all_tasks:      dict[str, dict]              = {}
-cancel_flags:   dict[str, bool]              = {}
-queue_workers:  dict[int, asyncio.Task]      = {}
-user_states:    dict[int, str]               = {}
-
-def make_task_id(uid: int, msg_id: int) -> str:
-    return f"{uid}_{msg_id}_{int(time.time())}"
-
-def get_sem(uid: int) -> asyncio.Semaphore:
-    if uid not in user_sems:
-        user_sems[uid] = asyncio.Semaphore(MAX_WORKERS)
-    return user_sems[uid]
-
-# ═══════════════════════════════════════════════════════
-#  LOG CHANNEL
-# ═══════════════════════════════════════════════════════
-async def log_event(client: Client, text: str, photo_path: Optional[str] = None):
-    if not LOG_CHANNEL:
-        return
-    try:
-        if photo_path and os.path.exists(photo_path):
-            await client.send_photo(LOG_CHANNEL, photo_path, caption=text)
-        else:
-            await client.send_message(LOG_CHANNEL, text)
-    except Exception as e:
-        logger.warning(f"Log channel error: {e}")
-
-async def log_rename(client: Client, uid: int, uname: str, orig: str, renamed: str, size: int):
-    await log_event(client,
-        f"#RENAME\n\n"
-        f"👤 **User:** `{uid}` | @{uname or 'unknown'}\n"
-        f"📂 **Original:** `{orig}`\n"
-        f"✅ **Renamed:** `{renamed}`\n"
-        f"📦 **Size:** `{human(size)}`\n"
-        f"🕐 **Time:** `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`"
-    )
-
-async def log_new_user(client: Client, uid: int, uname: str, fname: str):
-    await log_event(client,
-        f"#NEW_USER\n\n"
-        f"👤 **Name:** {fname}\n🆔 **ID:** `{uid}`\n"
-        f"📛 **Username:** @{uname or 'N/A'}\n"
-        f"🕐 **Joined:** `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`"
-    )
-
-# ═══════════════════════════════════════════════════════
-#  DOWNLOAD / UPLOAD
-# ═══════════════════════════════════════════════════════
-async def download_file(client: Client, msg: Message, path: str, prog_msg: Message, task_id: str, fname: str):
-    start = time.time()
-    last  = [0.0]
-    async def cb(cur, tot):
-        if time.time() - last[0] > PROGRESS_INTERVAL:
-            last[0] = time.time()
-            await fast_progress(cur, tot, prog_msg, "Downloading", start, task_id, fname)
-    await client.download_media(msg, file_name=path, progress=cb)
-
-async def upload_file(
-    client: Client, msg: Message, out_path: str, prog_msg: Message,
-    task_id: str, user: dict, caption: str, thumb_path: Optional[str], final_name: str
-):
-    start = time.time()
-    last  = [0.0]
-    async def cb(cur, tot):
-        if time.time() - last[0] > PROGRESS_INTERVAL:
-            last[0] = time.time()
-            await fast_progress(cur, tot, prog_msg, "Uploading", start, task_id, final_name)
-
-    user_mode = user.get("media_format", "video")
-    # Verify thumb file actually exists on disk before passing to Pyrogram
-    thumb = thumb_path if (thumb_path and os.path.exists(thumb_path)) else None
-    if thumb_path and not thumb:
-        logger.warning(f"Thumb file missing at upload time: {thumb_path}")
-
-    if user_mode == "file":
-        await client.send_document(
-            msg.chat.id, out_path,
-            caption=caption, file_name=final_name,
-            thumb=thumb, progress=cb,
-        )
-    else:
-        dur = w = h = 0
-        if msg.video:
-            dur = msg.video.duration or 0
-            w   = msg.video.width or 1280
-            h   = msg.video.height or 720
-        elif msg.document:
-            dur, w, h = 0, 1280, 720
-
-        # If we have a thumb, get its actual dimensions so Telegram renders correctly
-        if thumb:
-            try:
-                with Image.open(thumb) as timg:
-                    tw, th = timg.size
-                    # Use thumb dims only if they're reasonable
-                    if tw > 0 and th > 0:
-                        w, h = tw, th
-            except Exception:
-                pass
-
-        await client.send_video(
-            msg.chat.id, out_path,
-            caption=caption, file_name=final_name,
-            thumb=thumb,
-            duration=dur, width=w, height=h,
-            supports_streaming=True, progress=cb,
-        )
-
-# ═══════════════════════════════════════════════════════
-#  CORE RENAME TASK
-# ═══════════════════════════════════════════════════════
-async def process_rename(client: Client, msg: Message, task_id: str):
-    uid   = msg.from_user.id
-    sem   = get_sem(uid)
-    media = msg.video or msg.document or msg.audio
-    if not media:
-        cancel_flags.pop(task_id, None)
-        all_tasks.pop(task_id, None)
-        return
-
-    orig_name = getattr(media, "file_name", None) or f"file_{int(time.time())}"
-    # FIX: file_size can be None/0 for albums/forwards — try multiple attrs
-    file_size = (
-        getattr(media, "file_size", None) or
-        getattr(msg.video, "file_size", None) or
-        getattr(msg.document, "file_size", None) or
-        getattr(msg.audio, "file_size", None) or
-        0
-    )
-    ext       = os.path.splitext(orig_name)[1].lower() or ".mp4"
-    base_name = os.path.splitext(orig_name)[0]
-
-    user = await get_user(uid)
-
-    # Size check — only block if we actually know the size (> 0)
-    system_max = get_max_file_size()
-    if file_size > 0 and file_size > system_max:
-        cancel_flags.pop(task_id, None)
-        all_tasks.pop(task_id, None)
-        return await msg.reply_text(
-            f"❌ **File too large for this server!**\n\n"
-            f"📦 Your file: `{human(file_size)}`\n"
-            f"📏 Max supported: `{human(system_max)}`"
-        )
-    if uid != OWNER_ID and not await is_premium(uid):
-        limit = await get_size_limit()
-        if limit and file_size > 0 and file_size > limit:
-            cancel_flags.pop(task_id, None)
-            all_tasks.pop(task_id, None)
-            return await msg.reply_text(
-                f"❌ **File too large!**\n\n"
-                f"📦 Your file: `{human(file_size)}`\n"
-                f"📏 Limit: `{human(limit)}`\n\n"
-                f"✨ Get **Premium** for unlimited size!\nContact @KENSHIN_ANIME"
-            )
-
-    info = extract_info(base_name, msg.from_user)
-    fmt  = (user.get("rename_format") or DEFAULT_USER["rename_format"]).strip()
-
-    # ── FIX: Build final name properly, no double extension, no bracket remnants ──
-    final_name, new_base = build_final_name(fmt, info, ext)
-    info["filename"] = new_base   # FIX: {filename} = clean base name without ext
-
-    dl_path    = f"/tmp/dl_{task_id}{ext}"
-    out_path   = f"/tmp/up_{task_id}{ext}"
-    thumb_path = None
-
-    async with sem:   # FIX: semaphore ensures MAX_WORKERS concurrent per user
-        prog_msg = await msg.reply_text(
-            f"⏳ **Processing...**\n`{final_name}`"
-        )
-        try:
-            # Download
-            await prog_msg.edit_text(f"📥 **Downloading...**\n`{final_name}`")
-            await download_file(client, msg, dl_path, prog_msg, task_id, final_name)
-
-            if cancel_flags.get(task_id):
-                raise asyncio.CancelledError()
-
-            # FIX: Verify downloaded file exists and has real content
-            if not os.path.exists(dl_path):
-                raise ValueError(f"Download failed — file not found: {dl_path}")
-            real_dl_size = os.path.getsize(dl_path)
-            if real_dl_size == 0:
-                os.remove(dl_path)
-                raise ValueError("Download failed — file is 0 bytes (Telegram returned empty file)")
-            # Update file_size to actual downloaded size (fixes 0B display in logs)
-            file_size = real_dl_size
-
-            # Metadata
-            await prog_msg.edit_text(f"⚙️ **Applying metadata...**\n`{final_name}`")
-            ok = await rename_metadata(dl_path, out_path, user, info)
-            if not ok or not os.path.exists(out_path):
-                shutil.copy2(dl_path, out_path)
-
-            if cancel_flags.get(task_id):
-                raise asyncio.CancelledError()
-
-            # Thumbnail — always fetch fresh from DB (bulk-safe, works for 10M videos)
-            fresh_user  = await get_user(uid)
-            thumb_raw   = fresh_user.get("thumbnail")
-            thumb_path  = None
-
-            # Get video dimensions for properly-sized thumbnail
-            vid_w = vid_h = 0
-            if msg.video:
-                vid_w = msg.video.width or 1280
-                vid_h = msg.video.height or 720
-            elif msg.document:
-                vid_w, vid_h = 1280, 720
-
-            if thumb_raw:
-                try:
-                    # Handle different storage types from MongoDB (bytes, Binary, bytearray, memoryview)
-                    if isinstance(thumb_raw, (bytes, bytearray)):
-                        thumb_bytes = bytes(thumb_raw)
-                    elif hasattr(thumb_raw, "tobytes"):
-                        thumb_bytes = thumb_raw.tobytes()
-                    elif hasattr(thumb_raw, "read"):
-                        thumb_bytes = thumb_raw.read()
-                    else:
-                        thumb_bytes = bytes(thumb_raw)
-
-                    if len(thumb_bytes) < 100:
-                        raise ValueError(f"Thumb data too small: {len(thumb_bytes)} bytes")
-
-                    # Write thumb resized to video dimensions
-                    thumb_path = f"/tmp/thumb_{task_id}.jpg"
-                    processed  = make_thumb_from_video_size(thumb_bytes, vid_w, vid_h)
-                    with open(thumb_path, "wb") as tf:
-                        tf.write(processed)
-                    logger.info(f"Thumb written: {thumb_path} ({len(processed)} bytes, {vid_w}x{vid_h})")
-                except Exception as te:
-                    logger.warning(f"Thumb error uid={uid}: {te}")
-                    thumb_path = None
-
-            # Caption
-            cap_tpl = fresh_user.get("caption") or ""
-            caption = apply_ph(cap_tpl, info) if cap_tpl else ""
-
-            # Upload — thumb_path must exist during this call
-            await prog_msg.edit_text(f"📤 **Uploading...**\n`{final_name}`")
-            await upload_file(
-                client, msg, out_path, prog_msg, task_id,
-                fresh_user, caption, thumb_path, final_name
-            )
-
-            await prog_msg.delete()
-            await add_rename_stat(uid)
-
-            real_size = os.path.getsize(out_path) if os.path.exists(out_path) else file_size
-            await log_rename(client, uid, msg.from_user.username or "", orig_name, final_name, real_size)
-
-            # ── Cleanup AFTER upload is fully done ──
-            # thumb_path intentionally included — upload already finished above
-            delay = await get_cleanup_delay()
-            asyncio.create_task(_delayed_cleanup(delay, dl_path, out_path, thumb_path))
-
-        except asyncio.CancelledError:
-            try:
-                await prog_msg.edit_text("❌ **Task cancelled.**")
-            except Exception:
-                pass
-            for p in [dl_path, out_path, thumb_path]:
-                if p and os.path.exists(p):
-                    try: os.remove(p)
-                    except Exception: pass
-        except Exception as e:
-            logger.error(f"Task {task_id}: {e}", exc_info=True)
-            try:
-                await prog_msg.edit_text(f"❌ **Error:** `{e}`")
-            except Exception:
-                pass
-            for p in [dl_path, out_path, thumb_path]:
-                if p and os.path.exists(p):
-                    try: os.remove(p)
-                    except Exception: pass
-        finally:
-            cancel_flags.pop(task_id, None)
-            all_tasks.pop(task_id, None)
-            # Remove from persistent queue
-            try:
-                await queue_col.delete_one({"task_id": task_id})
-            except Exception:
-                pass
-
-# ═══════════════════════════════════════════════════════
-#  DELAYED CLEANUP — deletes temp files N seconds after upload
-# ═══════════════════════════════════════════════════════
-async def _delayed_cleanup(delay: int, *paths):
-    """Wait `delay` seconds then silently delete all given file paths.
-    delay = -1 means disabled (keep files). delay = 0 means instant."""
-    if delay < 0:
-        return  # disabled — keep files
-    if delay > 0:
-        await asyncio.sleep(delay)
-    for p in paths:
-        if p and os.path.exists(p):
-            try:
-                os.remove(p)
-                logger.info(f"🗑 Cleaned up: {p}")
-            except Exception as e:
-                logger.warning(f"Cleanup failed {p}: {e}")
-
-# ═══════════════════════════════════════════════════════
-#  QUEUE WORKER (per-user, persistent)
-# ═══════════════════════════════════════════════════════
-_global_sem = asyncio.Semaphore(MAX_GLOBAL_TASKS)  # global concurrent cap
-
-async def queue_worker(client: Client, uid: int):
-    q = user_queues[uid]
-    while True:
-        msg, task_id = await q.get()
-        # FIX: wait for global slot before spawning new task
-        # This prevents 9 files all starting simultaneously and starving each other
-        await _global_sem.acquire()
-        async def _run(m, tid):
-            try:
-                await process_rename(client, m, tid)
-            finally:
-                _global_sem.release()
-        asyncio.create_task(_run(msg, task_id))
-        q.task_done()
-        await asyncio.sleep(0.05)
-
-async def enqueue(client: Client, msg: Message):
-    uid = msg.from_user.id
-    if await is_banned(uid):
-        return await msg.reply_text("🚫 You are banned.")
-
-    media   = msg.video or msg.document or msg.audio
-    fname   = getattr(media, "file_name", "?") or "?"
-    task_id = make_task_id(uid, msg.id)
-
-    all_tasks[task_id]    = {"uid": uid, "file": fname, "time": time.time()}
-    cancel_flags[task_id] = False
-
-    # Persist to MongoDB so queue survives restart
-    try:
-        await queue_col.insert_one({
-            "task_id":  task_id,
-            "uid":      uid,
-            "chat_id":  msg.chat.id,
-            "msg_id":   msg.id,
-            "fname":    fname,
-            "queued_at": datetime.utcnow(),
-        })
-    except Exception:
-        pass
-
-    if uid not in queue_workers or queue_workers[uid].done():
-        queue_workers[uid] = asyncio.create_task(queue_worker(client, uid))
-
-    await user_queues[uid].put((msg, task_id))
-
-    pos   = user_queues[uid].qsize()
-    prem  = await is_premium(uid)
-    badge = " ✨" if prem else ""
-    await msg.reply_text(
-        f"✅ **Added to queue!**{badge}\n"
-        f"**Position:** `{pos}`\n"
-        f"**File:** `{fname[:40]}`",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{task_id}")
-        ]])
-    )
-
-# ═══════════════════════════════════════════════════════
-#  BOT INIT
-# ═══════════════════════════════════════════════════════
-# ── Build client kwargs — inject local API if configured ──
-_client_kwargs: dict = dict(
+# ── ENV ──────────────────────────────────────────────────────────────────────
+BOT_TOKEN   = os.environ["BOT_TOKEN"]
+MONGO_URI   = os.environ["MONGO_URI"]
+ORIGINAL_OWNER_ID = 6728678197   # your Telegram user-id
+API_ID      = int(os.environ["API_ID"])
+API_HASH    = os.environ["API_HASH"]
+
+# ── MongoDB ──────────────────────────────────────────────────────────────────
+mongo       = AsyncIOMotorClient(MONGO_URI)
+db          = mongo["kenshin_anime_bot"]
+anime_col   = db["animes"]
+users_col   = db["users"]
+staff_col   = db["staff"]          # {_id: user_id, role: "owner"|"admin"}
+settings_col= db["settings"]
+
+# ── Pyrogram Client ──────────────────────────────────────────────────────────
+app = Client(
+    "kenshin_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=64,                       # more parallel Pyrogram workers
-    max_concurrent_transmissions=8,   # more simultaneous streams
 )
-if LOCAL_BOT_API_URL:
-    # Pyrogram accepts a custom base_url via the `base_url` param in newer versions,
-    # but the most reliable way is PYROGRAM_TDLIB_SERVER env override OR patching session.
-    # We use the supported approach: pass `base_url` kwarg (pyrogram >=2.0.106).
-    try:
-        _client_kwargs["base_url"] = LOCAL_BOT_API_URL + "/bot{token}/"
-        logger.info(f"🚀 Local Bot API: {LOCAL_BOT_API_URL} (4GB uploads enabled)")
-    except Exception as _be:
-        logger.warning(f"Local API URL set failed: {_be}")
 
-app = Client("KenshinRenameBot", **_client_kwargs)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+BAKA_MSG = "ʙᴀᴋᴀ ʏᴏᴜʀ ɴᴏᴛ ᴍʏ sᴇɴᴘᴀɪ  !!!"
 
-def get_max_file_size() -> int:
-    return MAX_FILE_SIZE_LOCAL if LOCAL_BOT_API_URL else MAX_FILE_SIZE_REMOTE
+async def get_setting(key: str, default=None):
+    doc = await settings_col.find_one({"_id": key})
+    return doc["value"] if doc else default
 
-def start_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
-         InlineKeyboardButton("❓ Help",     callback_data="help")],
-        [InlineKeyboardButton("✨ Premium",  callback_data="premium_info"),
-         InlineKeyboardButton("📊 Stats",   callback_data="my_stats")],
-        [InlineKeyboardButton("👑 Owner",   url="https://t.me/KENSHIN_ANIME"),
-         InlineKeyboardButton("💬 Support", url="https://t.me/KENSHIN_ANIME_CHAT")],
-    ])
+async def set_setting(key: str, value):
+    await settings_col.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
 
-# ═══════════════════════════════════════════════════════
-#  OWNER DECORATOR
-# ═══════════════════════════════════════════════════════
-def owner_only(func):
-    async def wrapper(client, msg: Message):
-        if msg.from_user.id != OWNER_ID:
-            return await msg.reply_text("🚫 **Owner only!**")
-        return await func(client, msg)
-    wrapper.__name__ = func.__name__
-    return wrapper
-
-# ═══════════════════════════════════════════════════════
-#  START
-# ═══════════════════════════════════════════════════════
-@app.on_message(filters.command("start") & filters.private)
-async def start_cmd(client, msg: Message):
-    uid = msg.from_user.id
-    if await is_banned(uid):
-        return await msg.reply_text("🚫 You are banned.")
-    is_new = not bool(await users_col.find_one({"_id": uid}))
-    await get_user(uid)
-    if is_new:
-        await log_new_user(client, uid, msg.from_user.username or "", msg.from_user.first_name or "")
-    bs   = await get_bot_settings()
-    prem = await is_premium(uid)
-    prem_line = "🌟 You are a **Premium** user!\n\n" if prem else ""
-    welcome_icon = "✨" if prem else "👋"
-    text = bs.get("start_msg") or (
-        f"{welcome_icon} **Welcome, {msg.from_user.first_name}!**\n\n"
-        f"{prem_line}"
-        f"Send me any **video / audio / document** and I'll:\n"
-        f"• ✅ Rename with your custom format\n"
-        f"• ✅ Rewrite all metadata fresh (no old tags)\n"
-        f"• ✅ Apply HD thumbnail & caption\n"
-        f"• ✅ Handle bulk files without breaking\n\n"
-        f"Tap ⚙️ **Settings** to configure!"
+async def register_user(user):
+    await users_col.update_one(
+        {"_id": user.id},
+        {"$set": {"username": user.username, "first_name": user.first_name, "last_seen": datetime.utcnow()}},
+        upsert=True
     )
-    img = bs.get("start_img")
-    if img:
+
+async def is_original_owner(user_id: int) -> bool:
+    return user_id == ORIGINAL_OWNER_ID
+
+async def is_owner(user_id: int) -> bool:
+    if await is_original_owner(user_id):
+        return True
+    doc = await staff_col.find_one({"_id": user_id, "role": "owner"})
+    return doc is not None
+
+async def is_admin(user_id: int) -> bool:
+    if await is_owner(user_id):
+        return True
+    doc = await staff_col.find_one({"_id": user_id, "role": "admin"})
+    return doc is not None
+
+async def get_all_staff_ids() -> list:
+    ids = [ORIGINAL_OWNER_ID]
+    async for doc in staff_col.find({}):
+        ids.append(doc["_id"])
+    return list(set(ids))
+
+def build_anime_caption(anime: dict, channel_name: str) -> str:
+    genres = ", ".join(anime.get("genres", [])) or "N/A"
+    aliases = ", ".join(anime.get("aliases", [])) or "N/A"
+    return (
+        f"🎌 **{anime['name']}**\n\n"
+        f"📖 **Type:** {anime.get('type','N/A')}\n"
+        f"⭐ **Rating:** {anime.get('rating','N/A')}\n"
+        f"📺 **Episodes:** {anime.get('episodes','N/A')}\n"
+        f"🎭 **Genres:** {genres}\n"
+        f"🔤 **Aliases:** {aliases}\n"
+        f"📝 **Status:** {anime.get('status','N/A')}\n\n"
+        f"📜 {anime.get('description','No description available.')}\n\n"
+        f"**POWERED BY:** {channel_name}"
+    )
+
+async def send_anime_result(message: Message, anime: dict):
+    channel_name = await get_setting("channel_name", "@YourChannel")
+    watch_url    = anime.get("watch_url", "https://t.me/")
+    caption      = build_anime_caption(anime, channel_name)
+    keyboard     = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Watch Now", url=watch_url)]])
+    image_id     = anime.get("image_file_id")
+    try:
+        if image_id:
+            await message.reply_photo(photo=image_id, caption=caption, reply_markup=keyboard)
+        else:
+            await message.reply_text(caption, reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"send_anime_result error: {e}")
+        await message.reply_text(caption, reply_markup=keyboard)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /start
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("start") & filters.private)
+async def cmd_start(_, message: Message):
+    await register_user(message.from_user)
+    welcome = await get_setting("welcome_message",
+        "👋 **Welcome to Kenshin Anime Search Bot!**\n\n"
+        "🎌 Search for any anime using /search <name>\n"
+        "📋 See all commands with /help"
+    )
+    # try sending with media pool
+    media_pool = await get_setting("media_pool", [])
+    if media_pool:
+        import random
+        media = random.choice(media_pool)
         try:
-            await msg.reply_photo(img, caption=text, reply_markup=start_kb())
+            if media["type"] == "photo":
+                await message.reply_photo(photo=media["file_id"], caption=welcome)
+            elif media["type"] == "video":
+                await message.reply_video(video=media["file_id"], caption=welcome)
             return
         except Exception:
             pass
-    await msg.reply_text(text, reply_markup=start_kb())
-
-@app.on_callback_query(filters.regex("^back_start$"))
-async def back_start_cb(client, cq: CallbackQuery):
-    await cq.message.delete()
-    await start_cmd(client, cq.message)
-
-# ═══════════════════════════════════════════════════════
-#  MEDIA HANDLER
-# ═══════════════════════════════════════════════════════
-@app.on_message(filters.private & (filters.video | filters.document | filters.audio))
-async def media_handler(client, msg: Message):
-    uid = msg.from_user.id
-
-    # Sort buffer: if user is in sort mode, collect files instead of renaming
-    if sort_modes.get(uid) == "collecting":
-        media = msg.video or msg.document or msg.audio
-        fname = getattr(media, "file_name", None) or f"file_{msg.id}"
-        base  = os.path.splitext(fname)[0]
-        info  = extract_info(base)
-        if uid not in sort_buffers:
-            sort_buffers[uid] = []
-        sort_buffers[uid].append({"name": fname, "msg_id": msg.id, "info": info})
-        count = len(sort_buffers[uid])
-        await msg.reply_text(
-            f"📂 **Added to sort buffer!** ({count} files total)\n`{fname[:50]}`\n\nSend more files or `/sort done` to see sorted order.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📊 View Buffer", callback_data=f"sortview_{uid}"),
-                InlineKeyboardButton("✅ Finalize",    callback_data=f"sortdone_{uid}"),
-            ]])
-        )
-        return
-
-    await enqueue(client, msg)
-
-# ═══════════════════════════════════════════════════════
-#  PHOTO / STICKER
-# ═══════════════════════════════════════════════════════
-@app.on_message(filters.private & (filters.sticker | filters.animation))
-async def sticker_handler(client, msg: Message):
-    await msg.reply_text(random.choice([
-        "😂 Bhai sticker bheja, video bhej!",
-        "🤣 Sticker se rename hoga kya?",
-        "😎 Nice sticker! Ab file bhej.",
-        "💀 Sticker dekh ke mujhe bhi hassi aa gayi",
-    ]))
-
-@app.on_message(filters.private & filters.photo)
-async def photo_handler(client, msg: Message):
-    uid   = msg.from_user.id
-    state = user_states.get(uid)
-    if state == "set_thumb":
-        raw_buf = await client.download_media(msg.photo, in_memory=True)
-        raw_bytes = bytes(raw_buf.getbuffer())
-        data = make_thumb(raw_bytes)
-        await update_user(uid, {"thumbnail": data})
-        user_states.pop(uid, None)
-        try:
-            await msg.reply_photo(
-                io.BytesIO(data),
-                caption="✅ **Thumbnail saved! (HD)**\n\nIt will appear on all your uploads.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")
-                ]])
-            )
-        except Exception:
-            await msg.reply_text(
-                "✅ **Thumbnail saved! (HD)**\n\nIt will appear on all your uploads.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")
-                ]])
-            )
-    elif state == "set_start_img" and uid == OWNER_ID:
-        await set_bot_setting("start_img", msg.photo.file_id)
-        user_states.pop(uid, None)
-        await msg.reply_text("✅ **Global start image updated!**")
+    # fallback text
+    start_img = await get_setting("start_banner", None)
+    if start_img:
+        await message.reply_photo(photo=start_img, caption=welcome)
     else:
-        await msg.reply_text("📸 Nice pic! Use /setthumb or ⚙️ Settings → 🖼 Set Thumbnail.")
+        await message.reply_text(welcome)
 
-# ═══════════════════════════════════════════════════════
-#  ALL COMMANDS LIST (for filter exclusion)
-# ═══════════════════════════════════════════════════════
-ALL_CMDS = [
-    "start","help","cancel","ban","unban","banlist","broadcast","status","myqueue",
-    "cancelqueue","stats","leaderboard","ongoing","cancelall","setstartmsg","setstartimg",
-    "setmedia","ping","allusers","getthumb","delthumb","resetme","setthumb","setlimit",
-    "getlimit","myid","info","setcaption","setformat","setaudio","setsub","settings",
-    "clearcaption","clearformat","addpremium","removepremium","premiumlist","mypremium",
-    "exportdb","hi","sysinfo","setcleanup",
-]
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /help
+# ═══════════════════════════════════════════════════════════════════════════════
+HELP_TEXT = """
+📋 **KENSHIN ANIME BOT — COMMANDS**
 
-# ═══════════════════════════════════════════════════════
-#  TEXT / STATE HANDLER
-# ═══════════════════════════════════════════════════════
-@app.on_message(filters.private & filters.text & ~filters.command(ALL_CMDS))
-async def text_state_handler(client, msg: Message):
-    uid   = msg.from_user.id
-    state = user_states.get(uid)
-    if not state:
-        await msg.reply_text(random.choice([
-            "🤔 Bhai text bheja? File bhej na!",
-            "😂 Ye bot text nahi padhta, file bhej!",
-            "🫠 Samjha nahi... /help try kar!",
-            "😎 Interesting... ab ek video bhej!",
-            "💀 Error 404: File not found in your message!",
-        ]))
+**👤 User Commands:**
+/start — Start the bot & see welcome
+/help — Show this help menu
+/search <name> — Search anime by name
+/popular — Show most popular animes
+
+**🛡️ Admin Commands:**
+/add_ani — Add a new anime
+/edit_ani — Edit anime details (interactive)
+/delete_ani — Delete an anime
+/add_alias — Add aliases to anime
+/list — List all animes in database
+/stats — Show bot statistics
+/db_export — Export database (JSON/CSV)
+/bulk — Bulk import animes from file
+/broadcast — Broadcast message to all users
+/set_start_img — Change start banner image (legacy)
+/set_start_msg — Change welcome message
+/add_media — Add image/video to start media pool
+/list_media — List all media in start pool
+/remove_media — Remove media from pool by index
+/set_channel — Set powered-by channel name
+/cancel — Cancel any ongoing operation
+/report — Report an issue
+
+**👑 Owner Commands:**
+/add_admin — Add an admin
+/remove_admin — Remove an admin
+/addowner — Add an owner (original owner only)
+/removeowner — Remove an owner (original owner only)
+/copy — Copy this bot with a new token (original owner only)
+"""
+
+@app.on_message(filters.command("help"))
+async def cmd_help(_, message: Message):
+    await register_user(message.from_user)
+    await message.reply_text(HELP_TEXT)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /search
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("search"))
+async def cmd_search(_, message: Message):
+    await register_user(message.from_user)
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        await message.reply_text("❌ Usage: `/search <anime name>`", parse_mode=enums.ParseMode.MARKDOWN)
         return
+    query = args[1].strip().lower()
+    anime = await anime_col.find_one({
+        "$or": [
+            {"name_lower": {"$regex": query, "$options": "i"}},
+            {"aliases_lower": {"$regex": query, "$options": "i"}}
+        ]
+    })
+    if anime:
+        await send_anime_result(message, anime)
+    # No reply if no match (as requested)
 
-    text = msg.text.strip()
-    if text.lower() in ["/cancel", "cancel"]:
-        user_states.pop(uid, None)
-        return await msg.reply_text("❌ Cancelled.")
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Inline / keyword search in groups (no command needed)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.group & ~filters.command([]) & filters.text)
+async def group_keyword_search(_, message: Message):
+    text = message.text.strip().lower()
+    if len(text) < 3:
+        return
+    anime = await anime_col.find_one({
+        "$or": [
+            {"name_lower": {"$regex": text, "$options": "i"}},
+            {"aliases_lower": {"$regex": text, "$options": "i"}}
+        ]
+    })
+    if anime:
+        await send_anime_result(message, anime)
 
-    STATE_MAP = {
-        "rename_format":  "rename_format",
-        "audio_title":    "metadata.audio_title",
-        "subtitle_title": "metadata.subtitle_title",
-        "video_title":    "metadata.video_title",
-        "meta_title":     "metadata.title",
-        "caption":        "caption",
-        "start_msg":      None,
-    }
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /popular
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("popular"))
+async def cmd_popular(_, message: Message):
+    await register_user(message.from_user)
+    animes = await anime_col.find({}).sort("rating", -1).limit(10).to_list(10)
+    if not animes:
+        await message.reply_text("📭 No animes in database yet!")
+        return
+    text = "🌟 **Most Popular Animes:**\n\n"
+    for i, a in enumerate(animes, 1):
+        text += f"{i}. **{a['name']}** — ⭐ {a.get('rating','N/A')}\n"
+    await message.reply_text(text)
 
-    if state == "start_msg" and uid == OWNER_ID:
-        await set_bot_setting("start_msg", text)
-        user_states.pop(uid, None)
-        return await msg.reply_text("✅ **Global start message updated!**")
-
-    if state == "meta_author":
-        u    = await get_user(uid)
-        meta = dict(u.get("metadata") or {})
-        meta["author"] = text
-        meta["artist"] = text
-        await update_user(uid, {"metadata": meta})
-        user_states.pop(uid, None)
-        return await msg.reply_text(
-            f"✅ **Author & Artist set to:** `{text}`",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")
-            ]])
-        )
-
-    if state in STATE_MAP and STATE_MAP[state]:
-        db_key = STATE_MAP[state]
-        if "." in db_key:
-            k1, k2 = db_key.split(".", 1)
-            u   = await get_user(uid)
-            sub = dict(u.get(k1) or {})
-            sub[k2] = text
-            await update_user(uid, {k1: sub})
-        else:
-            await update_user(uid, {db_key: text})
-        user_states.pop(uid, None)
-        return await msg.reply_text(
-            f"✅ **Saved!**\n`{text}`",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")
-            ]])
-        )
-
-# ═══════════════════════════════════════════════════════
-#  SETTINGS MENU
-# ═══════════════════════════════════════════════════════
-@app.on_callback_query(filters.regex("^settings$"))
-@app.on_message(filters.command("settings") & filters.private)
-async def settings_menu(client, update):
-    is_cb = isinstance(update, CallbackQuery)
-    uid   = update.from_user.id
-    user  = await get_user(uid)
-    fmt   = user.get("rename_format") or ""
-    fmt_d = (fmt[:30] + "…") if len(fmt) > 30 else fmt
-    mf    = (user.get("media_format") or "video").upper()
-    cap   = user.get("caption") or ""
-    cap_d = (cap[:25] + "…") if len(cap) > 25 else (cap or "❌ Empty")
-    meta  = user.get("metadata") or {}
-    thumb = "✅ Set" if user.get("thumbnail") else "❌ None"
-    prem  = await is_premium(uid)
-    limit = await get_size_limit()
-    lim_d = human(limit) if limit else "Unlimited"
-
-    meta_title    = meta.get("title", "@KENSHIN_ANIME")[:22]
-    meta_audio    = meta.get("audio_title", "")[:22]
-    meta_sub      = meta.get("subtitle_title", "")[:22]
-    prem_badge    = "✨ Premium" if prem else ""
-    banned_str    = "🚫 Yes" if user.get("banned") else "✅ No"
-    thumb_str     = "✅ Set" if user.get("thumbnail") else "❌ None"
-    lim_str       = human(limit) if limit else "Unlimited"
-
-    text = (
-        f"⚙️ **Settings** {prem_badge}\n\n"
-        f"📝 **Format:** `{fmt_d}`\n"
-        f"🎬 **Send As:** `{mf}`\n"
-        f"🖼 **Thumbnail:** {thumb_str}\n"
-        f"📋 **Caption:** `{cap_d}`\n"
-        f"🔤 **Global Title:** `{meta_title}`\n"
-        f"🔊 **Audio Meta:** `{meta_audio}`\n"
-        f"📄 **Sub Meta:** `{meta_sub}`\n"
-        f"📏 **Size Limit:** `{lim_str}`\n\n"
-        f"Tap any button to change:"
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /report
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("report"))
+async def cmd_report(_, message: Message):
+    await register_user(message.from_user)
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        await message.reply_text("❌ Usage: `/report <message>`")
+        return
+    report_text = args[1]
+    user = message.from_user
+    staff_ids = await get_all_staff_ids()
+    notify = (
+        f"🚨 **New Report**\n\n"
+        f"👤 From: {user.first_name} (@{user.username or 'N/A'}) [ID: `{user.id}`]\n"
+        f"📝 Message: {report_text}"
     )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📝 Rename Format", callback_data="s_rename_format"),
-         InlineKeyboardButton("🎬 Send As",       callback_data="s_media_type")],
-        [InlineKeyboardButton("🖼 Set Thumbnail", callback_data="s_thumb"),
-         InlineKeyboardButton("🗑 Del Thumb",     callback_data="s_delthumb")],
-        [InlineKeyboardButton("📋 Caption",       callback_data="s_caption"),
-         InlineKeyboardButton("🧹 Clear Caption", callback_data="s_clearcap")],
-        [InlineKeyboardButton("🔤 Global Title",  callback_data="s_meta_title"),
-         InlineKeyboardButton("✍️ Author/Artist", callback_data="s_meta_author")],
-        [InlineKeyboardButton("🔊 Audio Meta",    callback_data="s_audio_title"),
-         InlineKeyboardButton("📄 Sub Meta",      callback_data="s_subtitle_title")],
-        [InlineKeyboardButton("🎞 Video Title",   callback_data="s_video_title"),
-         InlineKeyboardButton("♻️ Reset All",     callback_data="s_reset")],
-        [InlineKeyboardButton("✨ My Premium",    callback_data="premium_info"),
-         InlineKeyboardButton("🔙 Back",          callback_data="back_start")],
-    ])
-    if is_cb:
+    for sid in staff_ids:
         try:
-            await update.message.edit_text(text, reply_markup=kb)
+            await app.send_message(sid, notify)
         except Exception:
             pass
-    else:
-        await update.reply_text(text, reply_markup=kb)
+    await message.reply_text("✅ Your report has been sent to the admins!")
 
-SETTING_PROMPTS: dict = {
-    "s_rename_format": ("rename_format",
-        "📝 **Set Rename Format**\n\n"
-        "**Placeholders:** `{filename}` `{title}` `{season}` `{ep}` `{episode}` `{quality}` `{audio}` `{username}`\n\n"
-        "**Default:** `[@KENSHIN_ANIME] [S{season}] [Ep.{episode}] ⌯ [{quality}]`\n\nSend format or type `cancel`"),
-    "s_audio_title": ("audio_title",
-        "🔊 **Set Audio Track Title**\n\n"
-        "**Placeholders:** `{lang}` `{season}` `{episode}`\n\n"
-        "**Default:** `@KENSHIN_ANIME - [{lang}]`\n\nSend format or type `cancel`"),
-    "s_subtitle_title": ("subtitle_title",
-        "📄 **Set Subtitle Track Title**\n\n"
-        "**Placeholders:** `{lang}`\n\n"
-        "**Default:** `@KENSHIN_ANIME - [{lang}]`\n\nSend or type `cancel`"),
-    "s_video_title": ("video_title",
-        "🎞 **Set Video Stream Title**\n\n"
-        "**Default:** `@KENSHIN_ANIME`\n\nSend or type `cancel`"),
-    "s_caption": ("caption",
-        "📋 **Set Upload Caption**\n\n"
-        "**Placeholders:** `{filename}` `{title}` `{season}` `{ep}` `{episode}` `{quality}` `{audio}` `{username}`\n\nSend caption or type `cancel`"),
-    "s_meta_title": ("meta_title",
-        "🔤 **Set Global File Title**\n\n"
-        "**Default:** `@KENSHIN_ANIME`\n\nSend value or type `cancel`"),
-    "s_meta_author": ("meta_author",
-        "✍️ **Set Author & Artist**\n\n"
-        "Sets both `author` and `artist` tags.\n\n"
-        "**Default:** `@KENSHIN_ANIME`\n\nSend value or type `cancel`"),
-}
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STATE MACHINE for multi-step commands
+# ═══════════════════════════════════════════════════════════════════════════════
+# user_id -> {"step": ..., "data": {...}}
+pending_states: dict = {}
 
-@app.on_callback_query(filters.regex("^s_(rename_format|audio_title|subtitle_title|video_title|caption|meta_title|meta_author)$"))
-async def setting_prompt_cb(client, cq: CallbackQuery):
-    uid              = cq.from_user.id
-    state, prompt    = SETTING_PROMPTS[cq.data]
-    user_states[uid] = state
-    await cq.message.edit_text(prompt)
+def get_state(user_id):
+    return pending_states.get(user_id)
 
-@app.on_callback_query(filters.regex("^s_clearcap$"))
-async def s_clearcap(client, cq: CallbackQuery):
-    await update_user(cq.from_user.id, {"caption": ""})
-    await cq.answer("🧹 Caption cleared!", show_alert=True)
-    await settings_menu(client, cq)
+def set_state(user_id, step, data=None):
+    pending_states[user_id] = {"step": step, "data": data or {}}
 
-@app.on_callback_query(filters.regex("^s_delthumb$"))
-async def s_delthumb_cb(client, cq: CallbackQuery):
-    await update_user(cq.from_user.id, {"thumbnail": None})
-    await cq.answer("🗑 Thumbnail deleted!", show_alert=True)
-    await settings_menu(client, cq)
+def clear_state(user_id):
+    pending_states.pop(user_id, None)
 
-@app.on_callback_query(filters.regex("^s_thumb$"))
-async def s_thumb_cb(client, cq: CallbackQuery):
-    user_states[cq.from_user.id] = "set_thumb"
-    await cq.message.edit_text("🖼 **Send a photo** to set as your HD thumbnail.\nType `cancel` to abort.")
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /cancel
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("cancel"))
+async def cmd_cancel(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    clear_state(message.from_user.id)
+    await message.reply_text("❌ Operation cancelled.")
 
-@app.on_callback_query(filters.regex("^s_media_type$"))
-async def s_media_type(client, cq: CallbackQuery):
-    await cq.message.edit_text(
-        "🎬 **How should renamed files be sent?**\n\n"
-        "• **Video** — inline Telegram player\n"
-        "• **Document** — raw file, any format",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📹 Video",    callback_data="mtype_video"),
-             InlineKeyboardButton("📄 Document", callback_data="mtype_file")],
-            [InlineKeyboardButton("🔙 Back",     callback_data="settings")],
-        ])
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /add_ani  (admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("add_ani"))
+async def cmd_add_ani(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    set_state(message.from_user.id, "add_ani_name")
+    await message.reply_text(
+        "➕ **Add New Anime**\n\nStep 1/8 — Send the **anime name** (or /cancel):"
     )
 
-@app.on_callback_query(filters.regex("^mtype_(video|file)$"))
-async def mtype_cb(client, cq: CallbackQuery):
-    fmt = cq.data.split("_")[1]
-    await update_user(cq.from_user.id, {"media_format": fmt})
-    await cq.answer(f"✅ Send as {fmt.upper()}!", show_alert=True)
-    await settings_menu(client, cq)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /edit_ani  (admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("edit_ani"))
+async def cmd_edit_ani(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    set_state(message.from_user.id, "edit_ani_name")
+    await message.reply_text("✏️ **Edit Anime**\n\nSend the **name** of the anime you want to edit:")
 
-@app.on_callback_query(filters.regex("^s_reset$"))
-async def s_reset_cb(client, cq: CallbackQuery):
-    await users_col.update_one({"_id": cq.from_user.id}, {"$set": DEFAULT_USER})
-    await cq.answer("♻️ All settings reset!", show_alert=True)
-    await settings_menu(client, cq)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /delete_ani  (admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("delete_ani"))
+async def cmd_delete_ani(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    set_state(message.from_user.id, "delete_ani_name")
+    await message.reply_text("🗑️ **Delete Anime**\n\nSend the **name** of the anime to delete:")
 
-# ═══════════════════════════════════════════════════════
-#  CANCEL HANDLERS
-# ═══════════════════════════════════════════════════════
-@app.on_callback_query(filters.regex("^cancel_"))
-async def cancel_task_cb(client, cq: CallbackQuery):
-    tid = cq.data[7:]
-    if tid in cancel_flags and all_tasks.get(tid, {}).get("uid") == cq.from_user.id:
-        cancel_flags[tid] = True
-        await cq.answer("⏹ Cancelling...", show_alert=True)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /add_alias  (admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("add_alias"))
+async def cmd_add_alias(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    set_state(message.from_user.id, "add_alias_name")
+    await message.reply_text("🔤 **Add Alias**\n\nSend the **anime name** to add aliases to:")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /list  (admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("list"))
+async def cmd_list(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    animes = await anime_col.find({}, {"name": 1}).sort("name", 1).to_list(None)
+    if not animes:
+        await message.reply_text("📭 No animes in database.")
+        return
+    lines = [f"{i+1}. {a['name']}" for i, a in enumerate(animes)]
+    # Split into chunks of 50
+    for i in range(0, len(lines), 50):
+        chunk = "\n".join(lines[i:i+50])
+        await message.reply_text(f"📋 **Anime List ({i+1}-{min(i+50, len(lines))}):**\n\n{chunk}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /stats  (admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("stats"))
+async def cmd_stats(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    total_anime = await anime_col.count_documents({})
+    total_users = await users_col.count_documents({})
+    total_admins = await staff_col.count_documents({"role": "admin"})
+    total_owners = await staff_col.count_documents({"role": "owner"})
+    await message.reply_text(
+        f"📊 **Bot Statistics**\n\n"
+        f"🎌 Animes: `{total_anime}`\n"
+        f"👤 Users: `{total_users}`\n"
+        f"🛡️ Admins: `{total_admins}`\n"
+        f"👑 Owners: `{total_owners + 1}` (incl. original)\n"
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /db_export  (admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("db_export"))
+async def cmd_db_export(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    args = message.text.split()
+    fmt = args[1].lower() if len(args) > 1 else "json"
+    animes = await anime_col.find({}, {"_id": 0}).to_list(None)
+    if fmt == "csv":
+        output = io.StringIO()
+        if animes:
+            writer = csv.DictWriter(output, fieldnames=animes[0].keys())
+            writer.writeheader()
+            writer.writerows(animes)
+        bio = io.BytesIO(output.getvalue().encode())
+        bio.name = "anime_export.csv"
+        await message.reply_document(bio, caption="📤 Database export (CSV)")
     else:
-        await cq.answer("❌ Task not found or not yours.", show_alert=True)
+        data = json.dumps(animes, ensure_ascii=False, indent=2)
+        bio = io.BytesIO(data.encode())
+        bio.name = "anime_export.json"
+        await message.reply_document(bio, caption="📤 Database export (JSON)")
 
-@app.on_message(filters.command("cancel") & filters.private)
-async def cancel_cmd(client, msg: Message):
-    args = msg.text.split()
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /bulk  (admin) — accepts .json or .txt file
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("bulk"))
+async def cmd_bulk(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    set_state(message.from_user.id, "bulk_waiting_file")
+    await message.reply_text(
+        "📦 **Bulk Import**\n\n"
+        "Send a `.json` or `.txt` file.\n\n"
+        "**JSON format** — array of objects:\n"
+        "```json\n[{\"name\":\"Naruto\",\"type\":\"Shonen\",\"episodes\":220,"
+        "\"rating\":8.3,\"genres\":[\"Action\"],\"aliases\":[\"ナルト\"],"
+        "\"description\":\"...\",\"watch_url\":\"https://...\",\"status\":\"Completed\"}]\n```\n\n"
+        "**TXT format** — one name per line."
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /broadcast  (admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("broadcast"))
+async def cmd_broadcast(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    set_state(message.from_user.id, "broadcast_msg")
+    await message.reply_text("📢 Send the message you want to broadcast to all users:")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /set_start_img  (admin, legacy)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("set_start_img"))
+async def cmd_set_start_img(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    set_state(message.from_user.id, "set_start_img")
+    await message.reply_text("🖼️ Send the new **start banner image**:")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /set_start_msg  (admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("set_start_msg"))
+async def cmd_set_start_msg(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    set_state(message.from_user.id, "set_start_msg")
+    await message.reply_text("✏️ Send the new **welcome message** text:")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /add_media  (admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("add_media"))
+async def cmd_add_media(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    set_state(message.from_user.id, "add_media")
+    await message.reply_text("🎬 Send the **image or video** to add to the start media pool:")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /list_media  (admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("list_media"))
+async def cmd_list_media(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    pool = await get_setting("media_pool", [])
+    if not pool:
+        await message.reply_text("📭 Media pool is empty.")
+        return
+    lines = [f"{i}. {m['type'].upper()} — `{m['file_id'][:20]}...`" for i, m in enumerate(pool)]
+    await message.reply_text("🎬 **Media Pool:**\n\n" + "\n".join(lines))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /remove_media  (admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("remove_media"))
+async def cmd_remove_media(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    args = message.text.split()
     if len(args) < 2:
-        return await msg.reply_text("Usage: `/cancel <task_id>`")
-    tid = args[1]
-    if tid in cancel_flags and all_tasks.get(tid, {}).get("uid") == msg.from_user.id:
-        cancel_flags[tid] = True
-        await msg.reply_text(f"⏹ **Cancelling task** `{tid}`")
-    else:
-        await msg.reply_text("❌ Task not found or not yours.")
-
-@app.on_message(filters.command("cancelqueue") & filters.private)
-async def cancelqueue_cmd(client, msg: Message):
-    uid = msg.from_user.id
-    count = sum(1 for tid in list(cancel_flags) if all_tasks.get(tid, {}).get("uid") == uid and not cancel_flags.__setitem__(tid, True))
-    # simpler approach:
-    count = 0
-    for tid in list(cancel_flags):
-        if all_tasks.get(tid, {}).get("uid") == uid:
-            cancel_flags[tid] = True
-            count += 1
-    await msg.reply_text(f"⏹ **Cancelled `{count}` tasks.**")
-
-# ═══════════════════════════════════════════════════════
-#  HELP
-# ═══════════════════════════════════════════════════════
-HELP_TEXT = (
-    "❓ **KenshinRenameBot — Help**\n\n"
-    "**📤 How to use:** Send any video / audio / document!\n\n"
-    "**👤 User Commands:**\n"
-    "/settings — Settings panel\n"
-    "/status — Your active tasks\n"
-    "/myqueue — Your queued tasks\n"
-    "/cancelqueue — Cancel all your tasks\n"
-    "/stats — Your rename stats\n"
-    "/leaderboard — Top users\n"
-    "/mypremium — Premium status\n"
-    "/ping — Bot latency\n"
-    "/myid — Your Telegram ID\n"
-    "/hi — Say hello to bot\n"
-    "/resetme — Reset all settings\n\n"
-    "**👑 Owner Commands:**\n"
-    "/sysinfo — VPS CPU/RAM/Disk/Network health\n"
-    "/allusers — Total user stats\n"
-    "/broadcast — Send message to all users\n\n"
-    "**⚙️ Quick Commands:**\n"
-    "/setformat `<format>` — Set rename format\n"
-    "/clearformat — Reset to default format\n"
-    "/setcaption `<text>` — Set upload caption\n"
-    "/clearcaption — Clear caption\n"
-    "/setmedia `video|file` — Send as video or file\n"
-    "/setaudio `<template>` — Audio track title\n"
-    "/setsub `<template>` — Subtitle track title\n"
-    "/setthumb — Set thumbnail\n"
-    "/getthumb — View your thumbnail\n"
-    "/delthumb — Delete thumbnail\n\n"
-    "**📌 Placeholders:**\n"
-    "`{filename}` `{title}` `{season}` `{ep}` `{episode}` `{quality}` `{audio}` `{lang}` `{username}`\n\n"
-    "**Note:** `{ep}` = `{episode}` (both same!)\n\n"
-    "**💬 Support:** @KENSHIN_ANIME_CHAT\n"
-    "**👑 Owner:** @KENSHIN_ANIME"
-)
-
-@app.on_callback_query(filters.regex("^help$"))
-@app.on_message(filters.command("help") & filters.private)
-async def help_cmd(client, update):
-    is_cb = isinstance(update, CallbackQuery)
-    kb    = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_start")]])
-    if is_cb:
-        await update.message.edit_text(HELP_TEXT, reply_markup=kb)
-    else:
-        await update.reply_text(HELP_TEXT, reply_markup=kb)
-
-# ═══════════════════════════════════════════════════════
-#  USER COMMANDS
-# ═══════════════════════════════════════════════════════
-@app.on_message(filters.command("ping") & filters.private)
-async def ping_cmd(client, msg: Message):
-    s  = time.time()
-    m  = await msg.reply_text("🏓 Pinging...")
-    ms = round((time.time() - s) * 1000)
-    tier = "🟢 Fast" if ms < 200 else "🟡 Medium" if ms < 500 else "🔴 Slow"
-    await m.edit_text(f"🏓 **Pong!** `{ms}ms` {tier}")
-
-@app.on_message(filters.command("sysinfo") & filters.private)
-@owner_only
-async def sysinfo_cmd(client, msg: Message):
-    """Show VPS CPU, RAM, Disk, Network and bot health."""
-    m = await msg.reply_text("⏳ Fetching system info...")
-
-    if not HAS_PSUTIL:
-        return await m.edit_text(
-            "❌ `psutil` not installed.\n\nRun: `pip install psutil`"
-        )
-
-    # ── CPU ──────────────────────────────────────────────
-    cpu_pct     = psutil.cpu_percent(interval=1)
-    cpu_count   = psutil.cpu_count(logical=True)
-    cpu_freq    = psutil.cpu_freq()
-    freq_str    = f"{cpu_freq.current:.0f} MHz" if cpu_freq else "N/A"
-    cpu_bar     = progress_bar(cpu_pct, 100, width=10)
-
-    # ── RAM ──────────────────────────────────────────────
-    ram         = psutil.virtual_memory()
-    ram_used    = human(ram.used)
-    ram_total   = human(ram.total)
-    ram_bar     = progress_bar(ram.percent, 100, width=10)
-
-    # ── SWAP ─────────────────────────────────────────────
-    swap        = psutil.swap_memory()
-    swap_str    = f"{human(swap.used)} / {human(swap.total)}" if swap.total else "N/A"
-
-    # ── DISK ─────────────────────────────────────────────
-    disk        = psutil.disk_usage("/")
-    disk_used   = human(disk.used)
-    disk_total  = human(disk.total)
-    disk_free   = human(disk.free)
-    disk_bar    = progress_bar(disk.percent, 100, width=10)
-
-    # ── DISK /tmp specifically ────────────────────────────
+        await message.reply_text("❌ Usage: `/remove_media <index>`"); return
     try:
-        tmp_disk    = psutil.disk_usage("/tmp")
-        tmp_free    = human(tmp_disk.free)
-        tmp_used    = human(tmp_disk.used)
-    except Exception:
-        tmp_free = tmp_used = "N/A"
+        idx = int(args[1])
+        pool = await get_setting("media_pool", [])
+        if idx < 0 or idx >= len(pool):
+            await message.reply_text("❌ Invalid index."); return
+        pool.pop(idx)
+        await set_setting("media_pool", pool)
+        await message.reply_text(f"✅ Media at index {idx} removed.")
+    except ValueError:
+        await message.reply_text("❌ Index must be a number.")
 
-    # ── NETWORK ──────────────────────────────────────────
-    net1        = psutil.net_io_counters()
-    await asyncio.sleep(1)
-    net2        = psutil.net_io_counters()
-    net_up      = human(net2.bytes_sent - net1.bytes_sent) + "/s"
-    net_down    = human(net2.bytes_recv - net1.bytes_recv) + "/s"
-    net_sent    = human(net2.bytes_sent)
-    net_recv    = human(net2.bytes_recv)
-
-    # ── UPTIME ───────────────────────────────────────────
-    boot_time   = datetime.fromtimestamp(psutil.boot_time())
-    uptime_secs = int((datetime.now() - boot_time).total_seconds())
-    uptime_str  = (
-        f"{uptime_secs // 86400}d "
-        f"{(uptime_secs % 86400) // 3600}h "
-        f"{(uptime_secs % 3600) // 60}m"
-    )
-
-    # ── BOT HEALTH ───────────────────────────────────────
-    active_tasks   = len(all_tasks)
-    queued_total   = sum(q.qsize() for q in user_queues.values())
-    proc           = psutil.Process(os.getpid())
-    bot_ram        = human(proc.memory_info().rss)
-    bot_cpu        = proc.cpu_percent(interval=0.2)
-    tmp_files      = len([f for f in os.listdir("/tmp") if f.startswith(("dl_", "up_", "thumb_"))])
-
-    # ── EMOJI HEALTH INDICATOR ───────────────────────────
-    def health_icon(pct):
-        if pct < 60:  return "🟢"
-        if pct < 85:  return "🟡"
-        return "🔴"
-
-    cleanup_delay_val = await get_cleanup_delay()
-    text = (
-        f"🖥 **System Info — KenshinRenameBot**\n\n"
-
-        f"━━━ 🔲 CPU ━━━\n"
-        f"{health_icon(cpu_pct)} **Usage:** `{cpu_pct:.1f}%`  {cpu_bar}\n"
-        f"⚙️ **Cores:** `{cpu_count}`  🔁 **Freq:** `{freq_str}`\n\n"
-
-        f"━━━ 🧠 RAM ━━━\n"
-        f"{health_icon(ram.percent)} **Used:** `{ram_used} / {ram_total}` ({ram.percent:.1f}%)  {ram_bar}\n"
-        f"💾 **Swap:** `{swap_str}`\n\n"
-
-        f"━━━ 💽 DISK ━━━\n"
-        f"{health_icon(disk.percent)} **Root:** `{disk_used} / {disk_total}` ({disk.percent:.1f}%)  {disk_bar}\n"
-        f"🆓 **Free:** `{disk_free}`\n"
-        f"📁 **/tmp Used:** `{tmp_used}`  🆓 Free: `{tmp_free}`\n\n"
-
-        f"━━━ 🌐 NETWORK ━━━\n"
-        f"⬆️ **Upload now:** `{net_up}`\n"
-        f"⬇️ **Download now:** `{net_down}`\n"
-        f"📤 **Total Sent:** `{net_sent}`\n"
-        f"📥 **Total Recv:** `{net_recv}`\n\n"
-
-        f"━━━ 🤖 BOT HEALTH ━━━\n"
-        f"🔄 **Active Tasks:** `{active_tasks}`\n"
-        f"📋 **Queued Tasks:** `{queued_total}`\n"
-        f"💾 **Bot RAM:** `{bot_ram}`\n"
-        f"🔲 **Bot CPU:** `{bot_cpu:.1f}%`\n"
-        f"🗂 **Temp Files:** `{tmp_files}` in /tmp\n"
-        f"⏰ **Uptime:** `{uptime_str}`\n\n"
-
-        f"━━━ ⚡ SPEED CONFIG ━━━\n"
-        f"🧵 **Workers:** `64`  📡 **Streams:** `8`\n"
-        f"🗑 **Auto Cleanup:** `{cleanup_delay_val}s` after upload\n"
-        f"📊 **Progress Interval:** `{PROGRESS_INTERVAL}s`\n"
-        f"🌐 **Local Bot API:** `{'✅ ' + LOCAL_BOT_API_URL if LOCAL_BOT_API_URL else '❌ Not set (2GB limit)'}` \n"
-        f"📦 **Max File Size:** `{human(get_max_file_size())}`\n"
-    )
-
-    await m.edit_text(text)
-
-# ═══════════════════════════════════════════════════════
-#  SET CLEANUP DELAY (Owner only)
-# ═══════════════════════════════════════════════════════
-@app.on_message(filters.command("setcleanup") & filters.private)
-@owner_only
-async def setcleanup_cmd(client, msg: Message):
-    """
-    /setcleanup          → show current delay
-    /setcleanup 0        → instant delete (0 sec)
-    /setcleanup 30       → delete 30 sec after upload
-    /setcleanup 120      → delete 2 minutes after upload
-    /setcleanup off      → disable auto-delete (keep files)
-    """
-    args = msg.text.split()
-    cur  = await get_cleanup_delay()
-    cur_str = "Disabled (files kept)" if cur < 0 else (f"`{cur}s`" if cur > 0 else "`0s` (instant)")
-
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /set_channel  (admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("set_channel"))
+async def cmd_set_channel(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    args = message.text.split(None, 1)
     if len(args) < 2:
-        return await msg.reply_text(
-            f"🗑 **Auto Cleanup Delay**\n\n"
-            f"**Current:** {cur_str}\n\n"
-            f"**Usage:**\n"
-            f"`/setcleanup 0` — Instant delete after upload\n"
-            f"`/setcleanup 30` — Delete 30 sec after upload\n"
-            f"`/setcleanup 300` — Delete 5 min after upload\n"
-            f"`/setcleanup off` — Disable (keep files)\n\n"
-            f"💡 Tip: `0` = max storage saving, `off` = files stay until restart"
-        )
+        await message.reply_text("❌ Usage: `/set_channel @ChannelName`"); return
+    await set_setting("channel_name", args[1].strip())
+    await message.reply_text(f"✅ Channel name set to `{args[1].strip()}`")
 
-    val = args[1].lower()
-
-    if val == "off":
-        await settings_col.update_one({"_id": "global"}, {"$set": {"cleanup_delay": -1}}, upsert=True)
-        return await msg.reply_text("✅ **Auto cleanup disabled.** Files will be kept until bot restart.")
-
-    if not val.isdigit():
-        return await msg.reply_text("❌ Invalid value. Use a number in seconds, or `off`.")
-
-    secs = int(val)
-    await settings_col.update_one({"_id": "global"}, {"$set": {"cleanup_delay": secs}}, upsert=True)
-
-    if secs == 0:
-        label = "⚡ **Instant** — files deleted immediately after upload!"
-    elif secs < 60:
-        label = f"⏱ **{secs} seconds** after upload"
-    elif secs < 3600:
-        label = f"⏱ **{secs // 60}m {secs % 60}s** after upload"
-    else:
-        label = f"⏱ **{secs // 3600}h {(secs % 3600) // 60}m** after upload"
-
-    await msg.reply_text(f"✅ **Cleanup delay set!**\n\n🗑 {label}")
-
-@app.on_message(filters.command("myid") & filters.private)
-async def myid_cmd(client, msg: Message):
-    await msg.reply_text(f"🪪 **Your Telegram ID:** `{msg.from_user.id}`")
-
-@app.on_message(filters.command("hi") & filters.private)
-async def hi_cmd(client, msg: Message):
-    uid   = msg.from_user.id
-    fname = msg.from_user.first_name or "bhai"
-    prem  = await is_premium(uid)
-    badge = " ✨ Premium" if prem else ""
-    greet = random.choice([
-        f"Kem cho {fname}! 🙏",
-        f"Kya haal hai {fname}! 😎",
-        f"Aayo aayo {fname}! 🎉",
-        f"Yo {fname}! Kaisa chal raha hai? 🤙",
-        f"Hello hello {fname}! Sab badhiya? 😄",
-    ])
-    await msg.reply_text(
-        f"👋 **{greet}**{badge}\n\n"
-        f"Main hoon **KenshinRenameBot** — tera personal rename machine! 🚀\n\n"
-        f"File bhej aur main rename karke, metadata laga ke, thumbnail daal ke bhej dunga! 🔥\n\n"
-        f"📎 /help — Sab commands dekh\n"
-        f"⚙️ /settings — Apna setup kar"
-    )
-
-@app.on_message(filters.command("status") & filters.private)
-async def status_cmd(client, msg: Message):
-    uid    = msg.from_user.id
-    tasks  = [(tid, t) for tid, t in all_tasks.items() if t["uid"] == uid]
-    text   = f"📊 **Your Status**\n\n**Active:** `{len(tasks)}/{MAX_WORKERS}`\n\n"
-    for tid, t in tasks:
-        elapsed = int(time.time() - t["time"])
-        text   += f"• `{t['file'][:28]}`\n  ⏱ `{elapsed}s` | ID: `{tid}`\n\n"
-    if not tasks:
-        text += "✅ No active tasks right now!"
-    await msg.reply_text(text)
-
-@app.on_message(filters.command("myqueue") & filters.private)
-async def myqueue_cmd(client, msg: Message):
-    uid   = msg.from_user.id
-    tasks = [(tid, t) for tid, t in all_tasks.items() if t["uid"] == uid]
-    if not tasks:
-        return await msg.reply_text("✅ No tasks in queue.")
-    text = f"📋 **Your Queue ({len(tasks)} tasks)**\n\n"
-    for tid, t in tasks:
-        elapsed = int(time.time() - t["time"])
-        text   += f"• `{t['file'][:28]}`\n  ⏱ `{elapsed}s` | ID: `{tid}`\n\n"
-    await msg.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🗑 Cancel ALL My Tasks", callback_data=f"cancelqueue_{uid}")
-        ]])
-    )
-
-@app.on_callback_query(filters.regex(r"^cancelqueue_"))
-async def cancelqueue_cb(client, cq: CallbackQuery):
-    uid = int(cq.data.split("_")[1])
-    if cq.from_user.id != uid and cq.from_user.id != OWNER_ID:
-        return await cq.answer("❌ Not yours.", show_alert=True)
-    count = 0
-    for tid in list(cancel_flags):
-        if all_tasks.get(tid, {}).get("uid") == uid:
-            cancel_flags[tid] = True
-            count += 1
-    await cq.answer(f"⏹ Cancelled {count} tasks!", show_alert=True)
-
-# ═══════════════════════════════════════════════════════
-#  SORT / SEQUENCE FEATURE
-#  /sort — user sends multiple files, bot sorts them by
-#          season > episode > chapter > quality > filename
-#  /sortsend — same but auto-sends sorted list as forward plan
-# ═══════════════════════════════════════════════════════
-
-# Per-user sort buffer: {uid: [{"name": str, "msg_id": int, "info": dict}]}
-sort_buffers: dict[int, list] = {}
-sort_modes:   dict[int, str]  = {}   # uid -> "collecting" | "done"
-
-def sort_key(item: dict) -> tuple:
-    """Sort by: season → episode → chapter → quality → filename"""
-    info = item.get("info", {})
-    try:
-        s = int(info.get("season",  "99") or 99)
-    except Exception:
-        s = 99
-    try:
-        e = int(info.get("episode", "9999") or 9999)
-    except Exception:
-        e = 9999
-    # chapter: look for Ch.XX or Chapter XX in name
-    ch_m = re.search(r"(?:ch(?:apter)?[.:\s]*)(\d+)", item["name"], re.I)
-    ch = int(ch_m.group(1)) if ch_m else 9999
-    # quality: 2160>1080>720>480>360 — higher = better (sort asc so lower first = worse quality first? no, let's sort desc quality)
-    q_map = {"2160p": 1, "4k": 1, "1080p": 2, "720p": 3, "480p": 4, "360p": 5, "240p": 6}
-    q = q_map.get(info.get("quality", "").lower(), 9)
-    return (s, e, ch, q, item["name"].lower())
-
-def format_sort_preview(items: list) -> str:
-    lines = []
-    for i, it in enumerate(items, 1):
-        info = it["info"]
-        s    = info.get("season", "??")
-        e    = info.get("episode", "??")
-        q    = info.get("quality", "")
-        name = it["name"][:45]
-        ch_m = re.search(r"(?:ch(?:apter)?[.:\s]*)(\d+)", it["name"], re.I)
-        ch   = f" Ch.{ch_m.group(1)}" if ch_m else ""
-        q_tag = f" [{q}]" if q else ""
-        lines.append(f"`{i:>2}.` S{s}E{e}{ch}{q_tag} — `{name}`")
-    return "\n".join(lines)
-
-
-@app.on_message(filters.command("sort") & filters.private)
-async def sort_cmd(client, msg: Message):
-    uid = msg.from_user.id
-    args = msg.text.split(None, 1)
-
-    # /sort clear
-    if len(args) > 1 and args[1].strip().lower() == "clear":
-        sort_buffers.pop(uid, None)
-        sort_modes.pop(uid, None)
-        return await msg.reply_text("🗑 **Sort buffer cleared!**")
-
-    # /sort done  — finalize and show sorted order
-    if len(args) > 1 and args[1].strip().lower() == "done":
-        items = sort_buffers.get(uid, [])
-        if not items:
-            return await msg.reply_text("❌ No files in sort buffer! Send files first, then /sort done")
-        items.sort(key=sort_key)
-        preview = format_sort_preview(items)
-        sort_modes[uid] = "done"
-        return await msg.reply_text(
-            f"✅ **Sorted {len(items)} files!**\n\n"
-            f"**Sequence (Season → Episode → Chapter → Quality):**\n\n"
-            f"{preview}\n\n"
-            f"📤 Forward these files to this bot **in this order** to rename them in sequence!\n"
-            f"Or use /sortsend to get the sorted filenames list.\n\n"
-            f"Use /sort clear to start over.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🗑 Clear Buffer", callback_data=f"sortclear_{uid}"),
-                InlineKeyboardButton("📋 Copy Names",   callback_data=f"sortnames_{uid}"),
-            ]])
-        )
-
-    # /sort — show instructions or current buffer
-    items = sort_buffers.get(uid, [])
-    if items:
-        items.sort(key=sort_key)
-        preview = format_sort_preview(items)
-        await msg.reply_text(
-            f"📂 **Sort Buffer — {len(items)} files**\n\n"
-            f"{preview}\n\n"
-            f"Send more files to add, or:\n"
-            f"• `/sort done` — finalize & show sorted order\n"
-            f"• `/sort clear` — clear buffer",
-        )
-    else:
-        sort_modes[uid] = "collecting"
-        await msg.reply_text(
-            "📂 **Sort Mode Activated!**\n\n"
-            "Send me your video/file messages one by one (or forward them).\n"
-            "I'll parse their episode/season/chapter info and sort them in sequence.\n\n"
-            "**Supported formats:**\n"
-            "• `S01E05`, `[S01] [Ep.05]`\n"
-            "• `Chapter 12`, `Ch.12`\n"
-            "• `1080p`, `720p`, `4K`\n\n"
-            "When done adding files: `/sort done`\n"
-            "To view current buffer: `/sort`\n"
-            "To clear: `/sort clear`"
-        )
-
-
-@app.on_message(filters.command("sortsend") & filters.private)
-async def sortsend_cmd(client, msg: Message):
-    uid   = msg.from_user.id
-    items = sort_buffers.get(uid, [])
-    if not items:
-        return await msg.reply_text("❌ Sort buffer is empty! Send files and use /sort first.")
-    items.sort(key=sort_key)
-    # Build plain text list of filenames in order
-    names = "\n".join(f"{i}. {it['name']}" for i, it in enumerate(items, 1))
-    await msg.reply_text(
-        f"📋 **Sorted Filenames ({len(items)} files):**\n\n`{names}`\n\n"
-        f"These files should be sent/processed in this order!",
-    )
-
-
-@app.on_callback_query(filters.regex(r"^sortclear_"))
-async def sortclear_cb(client, cq: CallbackQuery):
-    uid = int(cq.data.split("_")[1])
-    if cq.from_user.id != uid:
-        return await cq.answer("❌ Not yours.", show_alert=True)
-    sort_buffers.pop(uid, None)
-    sort_modes.pop(uid, None)
-    await cq.answer("🗑 Buffer cleared!", show_alert=True)
-    try:
-        await cq.message.edit_text("🗑 **Sort buffer cleared!** Send /sort to start again.")
-    except Exception:
-        pass
-
-
-@app.on_callback_query(filters.regex(r"^sortnames_"))
-async def sortnames_cb(client, cq: CallbackQuery):
-    uid   = int(cq.data.split("_")[1])
-    items = sort_buffers.get(uid, [])
-    if not items:
-        return await cq.answer("❌ Buffer empty!", show_alert=True)
-    items.sort(key=sort_key)
-    names = "\n".join(f"{i}. {it['name']}" for i, it in enumerate(items, 1))
-    await cq.answer("✅ Names ready!", show_alert=False)
-    await cq.message.reply_text(f"📋 **Sorted Names:**\n\n`{names}`")
-
-
-
-# ─── THUMBNAIL ───────────────────────────────────────────
-@app.on_message(filters.command("setthumb") & filters.private)
-async def setthumb_cmd(client, msg: Message):
-    uid = msg.from_user.id
-    if msg.reply_to_message and msg.reply_to_message.photo:
-        raw_buf = await client.download_media(msg.reply_to_message.photo, in_memory=True)
-        raw_bytes = bytes(raw_buf.getbuffer())
-        data = make_thumb(raw_bytes)
-        await update_user(uid, {"thumbnail": data})
-        try:
-            return await msg.reply_photo(io.BytesIO(data), caption="✅ **Thumbnail saved! (HD)**")
-        except Exception:
-            return await msg.reply_text("✅ **Thumbnail saved! (HD)**")
-    user_states[uid] = "set_thumb"
-    await msg.reply_text("🖼 **Send a photo** to set as HD thumbnail.\nType `cancel` to abort.")
-
-@app.on_message(filters.command("getthumb") & filters.private)
-async def getthumb_cmd(client, msg: Message):
-    user = await get_user(msg.from_user.id)
-    tb   = user.get("thumbnail")
-    if not tb:
-        return await msg.reply_text("❌ No thumbnail saved.")
-    await msg.reply_photo(io.BytesIO(tb), caption="🖼 Your saved thumbnail (HD)")
-
-@app.on_message(filters.command("delthumb") & filters.private)
-async def delthumb_cmd(client, msg: Message):
-    await update_user(msg.from_user.id, {"thumbnail": None})
-    await msg.reply_text("🗑 **Thumbnail deleted!**")
-
-# ─── FORMAT / CAPTION ────────────────────────────────────
-@app.on_message(filters.command("setformat") & filters.private)
-async def setformat_cmd(client, msg: Message):
-    args = msg.text.split(None, 1)
-    if len(args) < 2:
-        user_states[msg.from_user.id] = "rename_format"
-        return await msg.reply_text(
-            "📝 **Send your rename format:**\n\n"
-            "**Placeholders:** `{filename}` `{title}` `{season}` `{ep}` `{episode}` `{quality}` `{audio}` `{username}`\n\n"
-            "**Default:** `[@KENSHIN_ANIME] [S{season}] [Ep.{episode}] ⌯ [{quality}]`\n\nType `cancel` to abort."
-        )
-    await update_user(msg.from_user.id, {"rename_format": args[1]})
-    await msg.reply_text(f"✅ **Format set:**\n`{args[1]}`")
-
-@app.on_message(filters.command("clearformat") & filters.private)
-async def clearformat_cmd(client, msg: Message):
-    await update_user(msg.from_user.id, {"rename_format": DEFAULT_USER["rename_format"]})
-    default_fmt = DEFAULT_USER["rename_format"]
-    await msg.reply_text(f"✅ **Format reset:**\n`{default_fmt}`")
-
-@app.on_message(filters.command("setcaption") & filters.private)
-async def setcaption_cmd(client, msg: Message):
-    args = msg.text.split(None, 1)
-    if len(args) < 2:
-        user_states[msg.from_user.id] = "caption"
-        return await msg.reply_text(
-            "📋 **Send your caption:**\n\n"
-            "**Placeholders:** `{filename}` `{title}` `{season}` `{ep}` `{episode}` `{quality}` `{audio}` `{username}`\n\nType `cancel` to abort."
-        )
-    await update_user(msg.from_user.id, {"caption": args[1]})
-    await msg.reply_text(f"✅ **Caption set:**\n`{args[1]}`")
-
-@app.on_message(filters.command("clearcaption") & filters.private)
-async def clearcaption_cmd(client, msg: Message):
-    await update_user(msg.from_user.id, {"caption": ""})
-    await msg.reply_text("🧹 **Caption cleared!**")
-
-@app.on_message(filters.command("setmedia") & filters.private)
-async def setmedia_cmd(client, msg: Message):
-    args = msg.text.split()
-    if len(args) < 2 or args[1] not in ["video", "file"]:
-        return await msg.reply_text("❗ `/setmedia video` or `/setmedia file`")
-    await update_user(msg.from_user.id, {"media_format": args[1]})
-    await msg.reply_text(f"✅ Send as **{args[1].upper()}**.")
-
-@app.on_message(filters.command("setaudio") & filters.private)
-async def setaudio_cmd(client, msg: Message):
-    args = msg.text.split(None, 1)
-    if len(args) < 2:
-        user_states[msg.from_user.id] = "audio_title"
-        return await msg.reply_text(
-            "🔊 **Send audio metadata template:**\n\n"
-            "**Placeholders:** `{lang}` `{season}` `{episode}`\n\n"
-            "**Default:** `@KENSHIN_ANIME - [{lang}]`\n\nType `cancel` to abort."
-        )
-    u    = await get_user(msg.from_user.id)
-    meta = dict(u.get("metadata") or {})
-    meta["audio_title"] = args[1]
-    await update_user(msg.from_user.id, {"metadata": meta})
-    await msg.reply_text(f"✅ **Audio meta:** `{args[1]}`")
-
-@app.on_message(filters.command("setsub") & filters.private)
-async def setsub_cmd(client, msg: Message):
-    args = msg.text.split(None, 1)
-    if len(args) < 2:
-        user_states[msg.from_user.id] = "subtitle_title"
-        return await msg.reply_text(
-            "📄 **Send subtitle metadata template:**\n\n"
-            "**Placeholders:** `{lang}`\n\n"
-            "**Default:** `@KENSHIN_ANIME - [{lang}]`\n\nType `cancel` to abort."
-        )
-    u    = await get_user(msg.from_user.id)
-    meta = dict(u.get("metadata") or {})
-    meta["subtitle_title"] = args[1]
-    await update_user(msg.from_user.id, {"metadata": meta})
-    await msg.reply_text(f"✅ **Subtitle meta:** `{args[1]}`")
-
-@app.on_message(filters.command("resetme") & filters.private)
-async def resetme_cmd(client, msg: Message):
-    await users_col.update_one({"_id": msg.from_user.id}, {"$set": DEFAULT_USER})
-    await msg.reply_text("♻️ **All settings reset to default!**")
-
-@app.on_message(filters.command("stats") & filters.private)
-async def stats_cmd(client, msg: Message):
-    uid = msg.from_user.id
-    lb  = await leaderboard_col.find_one({"_id": uid}) or {}
-    now = datetime.utcnow()
-    day_key   = now.strftime("%Y-%m-%d")
-    week_key  = now.strftime("%Y-W%W")
-    month_key = now.strftime("%Y-%m")
-    daily_count   = (lb.get("daily") or {}).get(day_key, 0)
-    weekly_count  = (lb.get("weekly") or {}).get(week_key, 0)
-    monthly_count = (lb.get("monthly") or {}).get(month_key, 0)
-    all_count     = lb.get("all_time", 0)
-    await msg.reply_text(
-        f"📊 **Your Rename Stats**\n\n"
-        f"🗓 **Today:** `{daily_count}`\n"
-        f"📆 **This Week:** `{weekly_count}`\n"
-        f"🗓 **This Month:** `{monthly_count}`\n"
-        f"🏆 **All Time:** `{all_count}`"
-    )
-
-# ─── LEADERBOARD ─────────────────────────────────────────
-def lb_kb():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📅 Today",   callback_data="lb_today"),
-        InlineKeyboardButton("📆 Weekly",  callback_data="lb_weekly"),
-        InlineKeyboardButton("🗓 Monthly", callback_data="lb_monthly"),
-        InlineKeyboardButton("🏆 All",     callback_data="lb_all"),
-    ]])
-
-async def build_lb(client, period: str) -> str:
-    now = datetime.utcnow()
-    key_map = {
-        "today":   f"daily.{now.strftime('%Y-%m-%d')}",
-        "weekly":  f"weekly.{now.strftime('%Y-W%W')}",
-        "monthly": f"monthly.{now.strftime('%Y-%m')}",
-        "all":     "all_time",
-    }
-    key  = key_map.get(period, "all_time")
-    top  = await leaderboard_col.find().sort(key, -1).limit(10).to_list(10)
-    medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-    text   = f"🏆 **Leaderboard — {period.upper()}**\n\n"
-    if not top:
-        return text + "📊 No data yet!"
-    for i, row in enumerate(top):
-        try:
-            u    = await client.get_users(row["_id"])
-            name = u.first_name[:20]
-        except Exception:
-            name = str(row["_id"])
-        val = row
-        for part in key.split("."):
-            val = val.get(part, 0) if isinstance(val, dict) else val
-        count = int(val) if isinstance(val, (int, float)) else 0
-        text += f"{medals[i]} **{name}** — `{count}` renames\n"
-    return text
-
-@app.on_message(filters.command("leaderboard") & filters.private)
-async def leaderboard_cmd(client, msg: Message):
-    args   = msg.text.split()
-    period = args[1] if len(args) > 1 and args[1] in ["today","weekly","monthly","all"] else "all"
-    await msg.reply_text(await build_lb(client, period), reply_markup=lb_kb())
-
-@app.on_callback_query(filters.regex("^lb_(today|weekly|monthly|all)$"))
-async def lb_cb(client, cq: CallbackQuery):
-    await cq.message.edit_text(await build_lb(client, cq.data[3:]), reply_markup=lb_kb())
-
-# ═══════════════════════════════════════════════════════
-#  PREMIUM INFO
-# ═══════════════════════════════════════════════════════
-@app.on_callback_query(filters.regex("^premium_info$"))
-@app.on_message(filters.command("mypremium") & filters.private)
-async def premium_info_cmd(client, update):
-    is_cb = isinstance(update, CallbackQuery)
-    uid   = update.from_user.id
-    p     = await get_premium_info(uid)
-    if uid == OWNER_ID:
-        text = "👑 **You are the Owner — Lifetime Premium!**"
-    elif p:
-        exp     = p.get("expires")
-        exp_str = exp.strftime("%d %b %Y") if exp else "Lifetime"
-        text = (
-            f"✨ **You have Premium!**\n\n"
-            f"🗓 **Expires:** `{exp_str}`\n\n"
-            f"• ♾ No file size limit\n"
-            f"• ⚡ Priority processing\n"
-            f"• 🎬 All features unlocked"
-        )
-    else:
-        text = (
-            f"✨ **Premium Benefits**\n\n"
-            f"• ♾ **No file size limit**\n"
-            f"• ⚡ Priority queue\n"
-            f"• 🎬 All features unlocked\n\n"
-            f"Contact **@KENSHIN_ANIME** to get Premium!"
-        )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_start")]])
-    if is_cb:
-        try:
-            await update.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            pass
-    else:
-        await update.reply_text(text, reply_markup=kb)
-
-@app.on_callback_query(filters.regex("^my_stats$"))
-async def my_stats_cb(client, cq: CallbackQuery):
-    uid = cq.from_user.id
-    lb  = await leaderboard_col.find_one({"_id": uid}) or {}
-    day        = datetime.utcnow().strftime("%Y-%m-%d")
-    today_cnt  = (lb.get("daily") or {}).get(day, 0)
-    all_cnt    = lb.get("all_time", 0)
-    await cq.answer()
-    await cq.message.edit_text(
-        f"📊 **Your Stats**\n\n"
-        f"🗓 **Today:** `{today_cnt}`\n"
-        f"🏆 **All Time:** `{all_cnt}`",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_start")]])
-    )
-
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 #  OWNER COMMANDS
-# ═══════════════════════════════════════════════════════
-@app.on_message(filters.command("ban") & filters.private)
-@owner_only
-async def ban_cmd(client, msg: Message):
-    target = msg.reply_to_message.from_user.id if msg.reply_to_message else None
-    if not target:
-        args = msg.text.split()
-        if len(args) < 2:
-            return await msg.reply_text("Reply to user or give ID.")
-        target = int(args[1])
-    await update_user(target, {"banned": True})
-    await msg.reply_text(f"🚫 **Banned** `{target}`")
+# ═══════════════════════════════════════════════════════════════════════════════
 
-@app.on_message(filters.command("unban") & filters.private)
-@owner_only
-async def unban_cmd(client, msg: Message):
-    args = msg.text.split()
-    if len(args) < 2:
-        return await msg.reply_text("Give user ID.")
-    await update_user(int(args[1]), {"banned": False})
-    await msg.reply_text(f"✅ **Unbanned** `{args[1]}`")
-
-@app.on_message(filters.command("banlist") & filters.private)
-@owner_only
-async def banlist_cmd(client, msg: Message):
-    banned = await users_col.find({"banned": True}).to_list(100)
-    if not banned:
-        return await msg.reply_text("✅ No banned users.")
-    await msg.reply_text("🚫 **Banned:**\n" + "\n".join(f"• `{u['_id']}`" for u in banned))
-
-@app.on_message(filters.command("broadcast") & filters.private)
-@owner_only
-async def broadcast_cmd(client, msg: Message):
-    if not msg.reply_to_message:
-        return await msg.reply_text("Reply to a message to broadcast.")
-    users = await users_col.find({"banned": {"$ne": True}}).to_list(None)
-    sent = failed = 0
-    prog = await msg.reply_text(f"📡 Broadcasting to **{len(users)}** users...")
-    for u in users:
-        try:
-            await msg.reply_to_message.copy(u["_id"])
-            sent += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)
-    await prog.edit_text(f"✅ **Done!** Sent: `{sent}` | Failed: `{failed}`")
-
-@app.on_message(filters.command("ongoing") & filters.private)
-@owner_only
-async def ongoing_cmd(client, msg: Message):
-    if not all_tasks:
-        return await msg.reply_text("✅ No ongoing tasks.")
-    text = f"🔄 **All Tasks ({len(all_tasks)}):**\n\n"
-    for tid, t in all_tasks.items():
-        elapsed = int(time.time() - t["time"])
-        text   += f"• `{t['uid']}` | `{t['file'][:22]}` | `{elapsed}s`\n  ID: `{tid}`\n\n"
-    await msg.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("⏹ Cancel ALL", callback_data="owner_cancelall")
-        ]])
-    )
-
-@app.on_callback_query(filters.regex("^owner_cancelall$"))
-async def owner_cancelall_cb(client, cq: CallbackQuery):
-    if cq.from_user.id != OWNER_ID:
-        return await cq.answer("🚫 Owner only!", show_alert=True)
-    count = len(cancel_flags)
-    for tid in list(cancel_flags):
-        cancel_flags[tid] = True
-    await cq.answer(f"⏹ Cancelled {count} tasks!", show_alert=True)
-    await cq.message.edit_text(f"⏹ **Cancelled all `{count}` tasks.**")
-
-@app.on_message(filters.command("cancelall") & filters.private)
-@owner_only
-async def cancelall_cmd(client, msg: Message):
-    count = len(cancel_flags)
-    for tid in list(cancel_flags):
-        cancel_flags[tid] = True
-    await msg.reply_text(f"⏹ **Cancelled all `{count}` tasks.**")
-
-@app.on_message(filters.command("allusers") & filters.private)
-@owner_only
-async def allusers_cmd(client, msg: Message):
-    total  = await users_col.count_documents({})
-    banned = await users_col.count_documents({"banned": True})
-    prems  = await premium_col.count_documents({})
-    active = len(all_tasks)
-    g      = await stats_col.find_one({"_id": "global"}) or {}
-    limit  = await get_size_limit()
-    lim_human = human(limit) if limit else "Unlimited"
-    await msg.reply_text(
-        f"👥 **Bot Statistics**\n\n"
-        f"**Total Users:** `{total}`\n"
-        f"**Premium Users:** `{prems}`\n"
-        f"**Banned:** `{banned}`\n"
-        f"**Active Tasks:** `{active}`\n"
-        f"**Total Renames:** `{g.get('total_renames', 0)}`\n"
-        f"**File Size Limit:** `{lim_human}`"
-    )
-
-@app.on_message(filters.command("setlimit") & filters.private)
-@owner_only
-async def setlimit_cmd(client, msg: Message):
-    args = msg.text.split()
-    if len(args) < 2:
-        cur = await get_size_limit()
-        cur_str = human(cur) if cur else "Unlimited"
-        return await msg.reply_text(
-            f"📏 **Set File Size Limit**\n\n"
-            f"**Current:** `{cur_str}`\n\n"
-            f"**Usage:** `/setlimit 2GB` or `/setlimit 0` (unlimited)"
-        )
-    val_str = args[1]
-    if val_str == "0":
-        await set_size_limit(0)
-        return await msg.reply_text("✅ **File size limit removed (Unlimited).**")
-    val = parse_size(val_str)
-    if not val:
-        return await msg.reply_text("❌ Invalid. Use: `2GB`, `500MB`, `1024KB`")
-    await set_size_limit(val)
-    await msg.reply_text(f"✅ **Limit set to:** `{human(val)}`")
-
-@app.on_message(filters.command("getlimit") & filters.private)
-async def getlimit_cmd(client, msg: Message):
-    limit = await get_size_limit()
-    normal_limit = human(limit) if limit else "Unlimited"
-    await msg.reply_text(
-        f"📏 **Current File Size Limit:**\n\n"
-        f"👤 **Normal Users:** `{normal_limit}`\n"
-        f"✨ **Premium Users:** `Unlimited`\n"
-        f"👑 **Owner:** `Unlimited`"
-    )
-
-@app.on_message(filters.command("setstartmsg") & filters.private)
-@owner_only
-async def setstartmsg_cmd(client, msg: Message):
-    args = msg.text.split(None, 1)
-    if len(args) < 2:
-        user_states[msg.from_user.id] = "start_msg"
-        return await msg.reply_text("✏️ **Send your custom start message:**\n\nType `cancel` to abort.")
-    await set_bot_setting("start_msg", args[1])
-    await msg.reply_text("✅ **Start message updated!**")
-
-@app.on_message(filters.command("setstartimg") & filters.private)
-@owner_only
-async def setstartimg_cmd(client, msg: Message):
-    if msg.reply_to_message and msg.reply_to_message.photo:
-        await set_bot_setting("start_img", msg.reply_to_message.photo.file_id)
-        return await msg.reply_text("✅ **Start image updated!**")
-    user_states[msg.from_user.id] = "set_start_img"
-    await msg.reply_text("🖼 **Reply to a photo** or **send a photo** to set start image.")
-
-@app.on_message(filters.command("info") & filters.private)
-@owner_only
-async def info_cmd(client, msg: Message):
-    target = msg.reply_to_message.from_user if msg.reply_to_message else None
-    args   = msg.text.split()
-    if not target and len(args) < 2:
-        return await msg.reply_text("Reply to user or give ID.")
-    uid  = target.id if target else int(args[1])
-    user = await get_user(uid)
-    lb   = await leaderboard_col.find_one({"_id": uid}) or {}
-    prem = await get_premium_info(uid)
-    prem_str = "✅ Yes" if prem else "❌ No"
-    if prem and not prem.get("lifetime"):
-        exp = prem.get("expires")
-        prem_str = f"✅ Yes (expires {exp.strftime('%d %b %Y') if exp else 'N/A'})"
-    rename_fmt  = user.get("rename_format", "")
-    media_fmt   = user.get("media_format", "video")
-    has_thumb   = "✅ Set" if user.get("thumbnail") else "❌ None"
-    is_banned_s = "🚫 Yes" if user.get("banned") else "✅ No"
-    total_ren   = lb.get("all_time", 0)
-    await msg.reply_text(
-        f"👤 **User Info**\n\n"
-        f"**ID:** `{uid}`\n"
-        f"**Banned:** {is_banned_s}\n"
-        f"**Premium:** {prem_str}\n"
-        f"**Format:** `{rename_fmt}`\n"
-        f"**Media:** `{media_fmt}`\n"
-        f"**Thumbnail:** {has_thumb}\n"
-        f"**Total Renames:** `{total_ren}`"
-    )
-
-# ─── PREMIUM MANAGEMENT ──────────────────────────────────
-@app.on_message(filters.command("addpremium") & filters.private)
-@owner_only
-async def addpremium_cmd(client, msg: Message):
-    args = msg.text.split()
-    if len(args) < 2:
-        return await msg.reply_text(
-            "✨ **Grant Premium**\n\n"
-            "**Usage:** `/addpremium <user_id> [days]`\n\n"
-            "`/addpremium 123456789 30` — 30 days\n"
-            "`/addpremium 123456789 0` — Lifetime"
-        )
-    uid  = int(args[1])
-    days = int(args[2]) if len(args) > 2 else 30
-    if days == 0:
-        await premium_col.update_one(
-            {"_id": uid},
-            {"$set": {"expires": None, "lifetime": True, "granted_by": OWNER_ID, "granted_at": datetime.utcnow()}},
-            upsert=True
-        )
-        await msg.reply_text(f"✨ **Lifetime Premium granted to** `{uid}`!")
-        try:
-            await client.send_message(uid, "✨ **You have been granted Lifetime Premium!**")
-        except Exception:
-            pass
+@app.on_message(filters.command("add_admin"))
+async def cmd_add_admin(_, message: Message):
+    if not await is_owner(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    target = None
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user
     else:
-        exp = await set_premium(uid, days)
-        await msg.reply_text(f"✨ **Premium granted to** `{uid}` for **{days} days**!\n🗓 Expires: `{exp.strftime('%d %b %Y')}`")
+        args = message.text.split()
+        if len(args) < 2:
+            await message.reply_text("❌ Reply to a user or use `/add_admin <user_id>`"); return
         try:
-            await client.send_message(uid, f"✨ **You have been granted {days}-day Premium!**\n🗓 Expires: `{exp.strftime('%d %b %Y')}`")
+            uid = int(args[1])
+            target_info = await app.get_users(uid)
+            target = target_info
         except Exception:
-            pass
+            await message.reply_text("❌ User not found."); return
+    await staff_col.update_one({"_id": target.id}, {"$set": {"role": "admin", "name": target.first_name}}, upsert=True)
+    await message.reply_text(f"✅ **{target.first_name}** is now an admin!")
 
-@app.on_message(filters.command("removepremium") & filters.private)
-@owner_only
-async def removepremium_cmd(client, msg: Message):
-    args = msg.text.split()
+@app.on_message(filters.command("remove_admin"))
+async def cmd_remove_admin(_, message: Message):
+    if not await is_owner(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    target = None
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user
+    else:
+        args = message.text.split()
+        if len(args) < 2:
+            await message.reply_text("❌ Reply to a user or use `/remove_admin <user_id>`"); return
+        try:
+            uid = int(args[1])
+            target_info = await app.get_users(uid)
+            target = target_info
+        except Exception:
+            await message.reply_text("❌ User not found."); return
+    result = await staff_col.delete_one({"_id": target.id, "role": "admin"})
+    if result.deleted_count:
+        await message.reply_text(f"✅ **{target.first_name}** removed from admins.")
+    else:
+        await message.reply_text("❌ That user is not an admin.")
+
+@app.on_message(filters.command("addowner"))
+async def cmd_add_owner(_, message: Message):
+    if not await is_original_owner(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    target = None
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user
+    else:
+        args = message.text.split()
+        if len(args) < 2:
+            await message.reply_text("❌ Reply to a user or use `/addowner <user_id>`"); return
+        try:
+            uid = int(args[1])
+            target_info = await app.get_users(uid)
+            target = target_info
+        except Exception:
+            await message.reply_text("❌ User not found."); return
+    await staff_col.update_one({"_id": target.id}, {"$set": {"role": "owner", "name": target.first_name}}, upsert=True)
+    await message.reply_text(f"✅ **{target.first_name}** is now an owner!")
+
+@app.on_message(filters.command("removeowner"))
+async def cmd_remove_owner(_, message: Message):
+    if not await is_original_owner(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    target = None
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user
+    else:
+        args = message.text.split()
+        if len(args) < 2:
+            await message.reply_text("❌ Reply to a user or use `/removeowner <user_id>`"); return
+        try:
+            uid = int(args[1])
+            target_info = await app.get_users(uid)
+            target = target_info
+        except Exception:
+            await message.reply_text("❌ User not found."); return
+    if target.id == ORIGINAL_OWNER_ID:
+        await message.reply_text("❌ Cannot remove the original owner!"); return
+    result = await staff_col.delete_one({"_id": target.id, "role": "owner"})
+    if result.deleted_count:
+        await message.reply_text(f"✅ **{target.first_name}** removed from owners.")
+    else:
+        await message.reply_text("❌ That user is not an added owner.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /copy  — original owner only — spawn identical bot with new token
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("copy"))
+async def cmd_copy(_, message: Message):
+    if not await is_original_owner(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    args = message.text.split(None, 1)
     if len(args) < 2:
-        return await msg.reply_text("**Usage:** `/removepremium <user_id>`")
-    await remove_premium(int(args[1]))
-    await msg.reply_text(f"✅ **Premium removed from** `{args[1]}`")
-
-@app.on_message(filters.command("premiumlist") & filters.private)
-@owner_only
-async def premiumlist_cmd(client, msg: Message):
-    prems = await premium_col.find().to_list(50)
-    if not prems:
-        return await msg.reply_text("✅ No premium users.")
-    text = f"✨ **Premium Users ({len(prems)}):**\n\n"
-    for p in prems:
-        exp = p.get("expires")
-        exp_str = "Lifetime" if p.get("lifetime") or exp is None else (
-            "❌ Expired" if datetime.utcnow() > exp else exp.strftime("%d %b %Y")
+        await message.reply_text(
+            "🤖 **Copy Bot**\n\n"
+            "Usage: `/copy <NEW_BOT_TOKEN>`\n\n"
+            "This will create an identical bot with a **separate database**.\n"
+            "Make sure to set `MONGO_URI` for the new instance separately.\n"
+            "Deploy the same code with the new token as `BOT_TOKEN` env variable."
         )
-        text += f"• `{p['_id']}` — {exp_str}\n"
-    await msg.reply_text(text)
+        return
+    new_token = args[1].strip()
+    # Validate token format
+    parts = new_token.split(":")
+    if len(parts) != 2 or not parts[0].isdigit():
+        await message.reply_text("❌ Invalid bot token format."); return
+    # Save copy request to DB for reference
+    await db["copy_requests"].insert_one({
+        "requested_by": message.from_user.id,
+        "new_token_preview": f"{parts[0]}:***",
+        "timestamp": datetime.utcnow()
+    })
+    await message.reply_text(
+        f"✅ **Copy Instructions:**\n\n"
+        f"1️⃣ Deploy the same bot code on a new server/Railway project\n"
+        f"2️⃣ Set these environment variables:\n"
+        f"   • `BOT_TOKEN` = `{parts[0]}:***` (your new token)\n"
+        f"   • `MONGO_URI` = (a NEW MongoDB URI for separate DB)\n"
+        f"   • `API_ID` = same as current\n"
+        f"   • `API_HASH` = same as current\n"
+        f"   • `ORIGINAL_OWNER_ID` = your Telegram ID\n\n"
+        f"3️⃣ The new bot will have its own completely separate database! 🎉\n\n"
+        f"⚠️ Keep your token safe and don't share it!"
+    )
 
-# ═══════════════════════════════════════════════════════
-#  EXPORT DB (Owner only) — exports users to JSON/TXT
-# ═══════════════════════════════════════════════════════
-@app.on_message(filters.command("exportdb") & filters.private)
-@owner_only
-async def exportdb_cmd(client, msg: Message):
-    args = msg.text.split()
-    fmt  = args[1].lower() if len(args) > 1 else "json"
-    if fmt not in ["json", "txt"]:
-        return await msg.reply_text("Usage: `/exportdb json` or `/exportdb txt`")
-
-    await msg.reply_text("⏳ **Exporting database...**")
-    users = await users_col.find({}, {"_id": 1, "banned": 1, "rename_format": 1, "media_format": 1, "caption": 1}).to_list(None)
-    prems = await premium_col.find().to_list(None)
-    stats = await stats_col.find_one({"_id": "global"}) or {}
-
-    # Convert ObjectIds / datetime for JSON serialization
-    def clean(obj):
-        if isinstance(obj, dict):
-            return {k: clean(v) for k, v in obj.items() if k != "thumbnail"}
-        if isinstance(obj, list):
-            return [clean(i) for i in obj]
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        return obj
-
-    export_data = {
-        "exported_at": datetime.utcnow().isoformat(),
-        "total_users":  len(users),
-        "total_renames": stats.get("total_renames", 0),
-        "users":  [clean(u) for u in users],
-        "premium": [clean(p) for p in prems],
-    }
-
-    path = f"/tmp/db_export_{int(time.time())}.{fmt}"
+# ═══════════════════════════════════════════════════════════════════════════════
+#  WELCOME / GOODBYE in groups
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_chat_member_updated()
+async def member_update(_, update: ChatMemberUpdated):
     try:
-        if fmt == "json":
-            async with aiofiles.open(path, "w") as f:
-                await f.write(json.dumps(export_data, indent=2, ensure_ascii=False))
-        else:
-            lines = [
-                f"KenshinRenameBot DB Export — {export_data['exported_at']}",
-                f"Total Users: {export_data['total_users']}",
-                f"Total Renames: {export_data['total_renames']}",
-                "", "=== USERS ===",
-            ]
-            for u in export_data["users"]:
-                lines.append(f"ID: {u['_id']} | Banned: {u.get('banned', False)} | Format: {u.get('rename_format','')[:40]}")
-            lines += ["", "=== PREMIUM ==="]
-            for p in export_data["premium"]:
-                lines.append(f"ID: {p['_id']} | Expires: {p.get('expires','Lifetime')}")
-            async with aiofiles.open(path, "w") as f:
-                await f.write("\n".join(lines))
+        if update.new_chat_member and update.new_chat_member.status in (
+            enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR
+        ):
+            if not update.old_chat_member or update.old_chat_member.status in (
+                enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED
+            ):
+                # User joined
+                welcome_tmpl = await get_setting(
+                    "group_welcome",
+                    "👋 Welcome {name} to {chat}!\n🎌 Use /search <anime> to find animes!"
+                )
+                user = update.new_chat_member.user
+                text = welcome_tmpl.replace("{name}", f"**{user.first_name}**") \
+                                   .replace("{chat}", f"**{update.chat.title}**") \
+                                   .replace("{mention}", user.mention)
+                await app.send_message(update.chat.id, text)
 
-        await client.send_document(msg.chat.id, path, caption=f"📦 **DB Export** — {len(users)} users\n`{os.path.basename(path)}`")
+        elif update.old_chat_member and update.old_chat_member.status in (
+            enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR
+        ):
+            if update.new_chat_member and update.new_chat_member.status in (
+                enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED
+            ):
+                # User left
+                goodbye_tmpl = await get_setting(
+                    "group_goodbye",
+                    "👋 {name} has left {chat}. Sayonara! 🎌"
+                )
+                user = update.old_chat_member.user
+                text = goodbye_tmpl.replace("{name}", f"**{user.first_name}**") \
+                                   .replace("{chat}", f"**{update.chat.title}**") \
+                                   .replace("{mention}", user.mention)
+                await app.send_message(update.chat.id, text)
     except Exception as e:
-        await msg.reply_text(f"❌ Export failed: `{e}`")
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
+        logger.error(f"member_update error: {e}")
 
-# ═══════════════════════════════════════════════════════
-#  NOOP / FALLBACK CB
-# ═══════════════════════════════════════════════════════
-@app.on_callback_query(filters.regex("^noop$"))
-async def noop_cb(client, cq: CallbackQuery):
-    await cq.answer("🔧 Coming soon!", show_alert=True)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /set_welcome & /set_goodbye  (group welcome/goodbye edit)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(filters.command("set_welcome"))
+async def cmd_set_welcome(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        await message.reply_text(
+            "❌ Usage: `/set_welcome <text>`\n\n"
+            "Variables: `{name}` `{chat}` `{mention}`"
+        ); return
+    await set_setting("group_welcome", args[1])
+    await message.reply_text("✅ Group welcome message updated!")
 
-# ═══════════════════════════════════════════════════════
-#  RUN
-# ═══════════════════════════════════════════════════════
+@app.on_message(filters.command("set_goodbye"))
+async def cmd_set_goodbye(_, message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.reply_text(BAKA_MSG); return
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        await message.reply_text(
+            "❌ Usage: `/set_goodbye <text>`\n\n"
+            "Variables: `{name}` `{chat}` `{mention}`"
+        ); return
+    await set_setting("group_goodbye", args[1])
+    await message.reply_text("✅ Group goodbye message updated!")
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STATE HANDLER — catches all non-command messages for multi-step flows
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_message(~filters.command([]) & (filters.private | filters.group))
+async def state_handler(_, message: Message):
+    uid = message.from_user.id
+    state = get_state(uid)
+    if not state:
+        return
 
-@app.on_callback_query(filters.regex(r"^sortview_"))
-async def sortview_cb(client, cq: CallbackQuery):
-    uid   = int(cq.data.split("_")[1])
-    if cq.from_user.id != uid:
-        return await cq.answer("❌ Not yours.", show_alert=True)
-    items = sort_buffers.get(uid, [])
-    if not items:
-        return await cq.answer("❌ Buffer empty!", show_alert=True)
-    items.sort(key=sort_key)
-    preview = format_sort_preview(items)
-    await cq.answer()
-    await cq.message.reply_text(
-        f"📂 **Sort Buffer — {len(items)} files (sorted):**\n\n{preview}\n\n"
-        f"Use `/sort done` to finalize or send more files.",
-    )
+    step = state["step"]
+    data = state["data"]
 
+    # ── ADD ANIME FLOW ────────────────────────────────────────────────────────
+    if step == "add_ani_name":
+        data["name"] = message.text.strip()
+        set_state(uid, "add_ani_type", data)
+        await message.reply_text("Step 2/8 — **Type** (e.g. Shonen, Seinen, Movie):")
 
-@app.on_callback_query(filters.regex(r"^sortdone_"))
-async def sortdone_cb(client, cq: CallbackQuery):
-    uid = int(cq.data.split("_")[1])
-    if cq.from_user.id != uid:
-        return await cq.answer("❌ Not yours.", show_alert=True)
-    items = sort_buffers.get(uid, [])
-    if not items:
-        return await cq.answer("❌ Buffer empty!", show_alert=True)
-    items.sort(key=sort_key)
-    preview = format_sort_preview(items)
-    sort_modes[uid] = "done"
-    await cq.answer("✅ Sorted!", show_alert=False)
-    await cq.message.reply_text(
-        f"✅ **Sorted {len(items)} files!**\n\n"
-        f"{preview}\n\n"
-        f"Forward these files to this bot **in this order** to process them in sequence.\n"
-        f"Use /sort clear to reset.",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🗑 Clear Buffer", callback_data=f"sortclear_{uid}"),
+    elif step == "add_ani_type":
+        data["type"] = message.text.strip()
+        set_state(uid, "add_ani_episodes", data)
+        await message.reply_text("Step 3/8 — **Number of episodes** (or 'N/A'):")
+
+    elif step == "add_ani_episodes":
+        data["episodes"] = message.text.strip()
+        set_state(uid, "add_ani_rating", data)
+        await message.reply_text("Step 4/8 — **Rating** (0-10):")
+
+    elif step == "add_ani_rating":
+        try:
+            data["rating"] = float(message.text.strip())
+        except ValueError:
+            data["rating"] = message.text.strip()
+        set_state(uid, "add_ani_genres", data)
+        await message.reply_text("Step 5/8 — **Genres** (comma-separated, e.g. Action, Adventure):")
+
+    elif step == "add_ani_genres":
+        data["genres"] = [g.strip() for g in message.text.split(",")]
+        set_state(uid, "add_ani_status", data)
+        await message.reply_text("Step 6/8 — **Status** (Ongoing / Completed / Upcoming):")
+
+    elif step == "add_ani_status":
+        data["status"] = message.text.strip()
+        set_state(uid, "add_ani_desc", data)
+        await message.reply_text("Step 7/8 — **Description** (short synopsis):")
+
+    elif step == "add_ani_desc":
+        data["description"] = message.text.strip()
+        set_state(uid, "add_ani_image", data)
+        await message.reply_text(
+            "Step 8/8 — Send the **anime image** (photo) AND caption the **watch URL**, "
+            "or send just the URL as text (no image):"
+        )
+
+    elif step == "add_ani_image":
+        watch_url = ""
+        image_file_id = None
+        if message.photo:
+            image_file_id = message.photo.file_id
+            watch_url = message.caption or ""
+        elif message.text:
+            watch_url = message.text.strip()
+        data["image_file_id"] = image_file_id
+        data["watch_url"] = watch_url
+        # Save to DB
+        doc = {
+            "name": data["name"],
+            "name_lower": data["name"].lower(),
+            "type": data.get("type",""),
+            "episodes": data.get("episodes",""),
+            "rating": data.get("rating",""),
+            "genres": data.get("genres",[]),
+            "status": data.get("status",""),
+            "description": data.get("description",""),
+            "image_file_id": image_file_id,
+            "watch_url": watch_url,
+            "aliases": [],
+            "aliases_lower": [],
+            "added_by": uid,
+            "added_at": datetime.utcnow(),
+        }
+        await anime_col.insert_one(doc)
+        clear_state(uid)
+        await message.reply_text(f"✅ **{data['name']}** added to the database!")
+
+    # ── EDIT ANIME FLOW ───────────────────────────────────────────────────────
+    elif step == "edit_ani_name":
+        name = message.text.strip()
+        anime = await anime_col.find_one({"name_lower": name.lower()})
+        if not anime:
+            await message.reply_text("❌ Anime not found. Try again or /cancel."); return
+        data["anime_id"] = anime["_id"]
+        data["current"] = anime
+        set_state(uid, "edit_ani_field", data)
+        await message.reply_text(
+            f"✏️ Editing: **{anime['name']}**\n\n"
+            "Which field do you want to edit?\n"
+            "`name` / `type` / `episodes` / `rating` / `genres` / `status` / `description` / `watch_url` / `image`"
+        )
+
+    elif step == "edit_ani_field":
+        field = message.text.strip().lower()
+        valid = {"name","type","episodes","rating","genres","status","description","watch_url","image"}
+        if field not in valid:
+            await message.reply_text("❌ Invalid field. Choose from the list above."); return
+        data["edit_field"] = field
+        set_state(uid, "edit_ani_value", data)
+        if field == "image":
+            await message.reply_text("📸 Send the new **image** for this anime:")
+        elif field == "genres":
+            await message.reply_text("🎭 Send new **genres** (comma-separated):")
+        else:
+            await message.reply_text(f"✏️ Send the new value for **{field}**:")
+
+    elif step == "edit_ani_value":
+        field = data["edit_field"]
+        anime_id = data["anime_id"]
+        if field == "image":
+            if message.photo:
+                await anime_col.update_one({"_id": anime_id}, {"$set": {"image_file_id": message.photo.file_id}})
+                clear_state(uid)
+                await message.reply_text("✅ Image updated!")
+            else:
+                await message.reply_text("❌ Please send a photo."); return
+        elif field == "genres":
+            genres = [g.strip() for g in message.text.split(",")]
+            await anime_col.update_one({"_id": anime_id}, {"$set": {"genres": genres}})
+            clear_state(uid)
+            await message.reply_text("✅ Genres updated!")
+        elif field == "name":
+            new_name = message.text.strip()
+            await anime_col.update_one({"_id": anime_id}, {"$set": {"name": new_name, "name_lower": new_name.lower()}})
+            clear_state(uid)
+            await message.reply_text("✅ Name updated!")
+        elif field == "rating":
+            try:
+                val = float(message.text.strip())
+            except ValueError:
+                val = message.text.strip()
+            await anime_col.update_one({"_id": anime_id}, {"$set": {"rating": val}})
+            clear_state(uid)
+            await message.reply_text("✅ Rating updated!")
+        else:
+            await anime_col.update_one({"_id": anime_id}, {"$set": {field: message.text.strip()}})
+            clear_state(uid)
+            await message.reply_text(f"✅ **{field}** updated!")
+
+    # ── DELETE ANIME FLOW ─────────────────────────────────────────────────────
+    elif step == "delete_ani_name":
+        name = message.text.strip()
+        anime = await anime_col.find_one({"name_lower": name.lower()})
+        if not anime:
+            await message.reply_text("❌ Anime not found."); clear_state(uid); return
+        data["anime"] = anime
+        set_state(uid, "delete_ani_confirm", data)
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, Delete", callback_data=f"del_confirm_{str(anime['_id'])}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="del_cancel")
         ]])
-    )
+        await message.reply_text(f"⚠️ Delete **{anime['name']}**? This cannot be undone!", reply_markup=keyboard)
+
+    # ── ADD ALIAS FLOW ────────────────────────────────────────────────────────
+    elif step == "add_alias_name":
+        name = message.text.strip()
+        anime = await anime_col.find_one({"name_lower": name.lower()})
+        if not anime:
+            await message.reply_text("❌ Anime not found."); clear_state(uid); return
+        data["anime_id"] = anime["_id"]
+        data["anime_name"] = anime["name"]
+        set_state(uid, "add_alias_values", data)
+        await message.reply_text(f"🔤 Send **aliases** for **{anime['name']}** (comma-separated):")
+
+    elif step == "add_alias_values":
+        aliases = [a.strip() for a in message.text.split(",")]
+        aliases_lower = [a.lower() for a in aliases]
+        await anime_col.update_one(
+            {"_id": data["anime_id"]},
+            {"$addToSet": {"aliases": {"$each": aliases}, "aliases_lower": {"$each": aliases_lower}}}
+        )
+        clear_state(uid)
+        await message.reply_text(f"✅ Aliases added to **{data['anime_name']}**!")
+
+    # ── BULK IMPORT FLOW ──────────────────────────────────────────────────────
+    elif step == "bulk_waiting_file":
+        file_obj = message.document
+        if not file_obj:
+            await message.reply_text("❌ Please send a file."); return
+        fname = file_obj.file_name or ""
+        dl = await message.download(in_memory=True)
+        raw = bytes(dl.getbuffer()).decode("utf-8", errors="ignore")
+
+        imported = 0
+        skipped = 0
+        if fname.endswith(".json"):
+            try:
+                items = json.loads(raw)
+                for item in items:
+                    if not item.get("name"):
+                        skipped += 1; continue
+                    item["name_lower"] = item["name"].lower()
+                    item["aliases_lower"] = [a.lower() for a in item.get("aliases", [])]
+                    item.setdefault("added_by", uid)
+                    item.setdefault("added_at", datetime.utcnow())
+                    existing = await anime_col.find_one({"name_lower": item["name_lower"]})
+                    if existing:
+                        skipped += 1; continue
+                    await anime_col.insert_one(item)
+                    imported += 1
+            except json.JSONDecodeError:
+                await message.reply_text("❌ Invalid JSON file."); clear_state(uid); return
+        elif fname.endswith(".txt"):
+            lines = [l.strip() for l in raw.splitlines() if l.strip()]
+            for name in lines:
+                existing = await anime_col.find_one({"name_lower": name.lower()})
+                if existing:
+                    skipped += 1; continue
+                await anime_col.insert_one({
+                    "name": name, "name_lower": name.lower(),
+                    "aliases": [], "aliases_lower": [],
+                    "added_by": uid, "added_at": datetime.utcnow()
+                })
+                imported += 1
+        else:
+            await message.reply_text("❌ Only .json or .txt files supported."); clear_state(uid); return
+
+        clear_state(uid)
+        await message.reply_text(f"✅ **Bulk Import Done!**\n\n✔️ Imported: {imported}\n⏭️ Skipped: {skipped}")
+
+    # ── BROADCAST FLOW ────────────────────────────────────────────────────────
+    elif step == "broadcast_msg":
+        bcast_text = message.text or message.caption or ""
+        users = await users_col.find({}, {"_id": 1}).to_list(None)
+        sent = 0; failed = 0
+        status_msg = await message.reply_text(f"📢 Broadcasting to {len(users)} users...")
+        for u in users:
+            try:
+                await app.send_message(u["_id"], bcast_text)
+                sent += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.05)
+        clear_state(uid)
+        await status_msg.edit_text(f"✅ Broadcast complete!\n\n✔️ Sent: {sent}\n❌ Failed: {failed}")
+
+    # ── SET START IMG FLOW ────────────────────────────────────────────────────
+    elif step == "set_start_img":
+        if message.photo:
+            await set_setting("start_banner", message.photo.file_id)
+            clear_state(uid)
+            await message.reply_text("✅ Start banner image updated!")
+        else:
+            await message.reply_text("❌ Please send a photo.")
+
+    # ── SET START MSG FLOW ────────────────────────────────────────────────────
+    elif step == "set_start_msg":
+        await set_setting("welcome_message", message.text)
+        clear_state(uid)
+        await message.reply_text("✅ Welcome message updated!")
+
+    # ── ADD MEDIA FLOW ────────────────────────────────────────────────────────
+    elif step == "add_media":
+        media_type = None; file_id = None
+        if message.photo:
+            media_type = "photo"; file_id = message.photo.file_id
+        elif message.video:
+            media_type = "video"; file_id = message.video.file_id
+        else:
+            await message.reply_text("❌ Send a photo or video."); return
+        pool = await get_setting("media_pool", [])
+        pool.append({"type": media_type, "file_id": file_id})
+        await set_setting("media_pool", pool)
+        clear_state(uid)
+        await message.reply_text(f"✅ {media_type.capitalize()} added to media pool! Total: {len(pool)}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CALLBACK QUERIES (inline buttons)
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.on_callback_query()
+async def callback_handler(_, query: CallbackQuery):
+    data = query.data
+    uid = query.from_user.id
+
+    if data.startswith("del_confirm_"):
+        if not await is_admin(uid):
+            await query.answer(BAKA_MSG, show_alert=True); return
+        from bson import ObjectId
+        anime_id = ObjectId(data.replace("del_confirm_", ""))
+        anime = await anime_col.find_one({"_id": anime_id})
+        await anime_col.delete_one({"_id": anime_id})
+        clear_state(uid)
+        await query.message.edit_text(f"✅ **{anime['name'] if anime else 'Anime'}** deleted!")
+
+    elif data == "del_cancel":
+        clear_state(uid)
+        await query.message.edit_text("❌ Deletion cancelled.")
+
+    await query.answer()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BOT STARTUP
+# ═══════════════════════════════════════════════════════════════════════════════
+async def create_indexes():
+    """Create MongoDB indexes for fast search."""
+    await anime_col.create_index("name_lower")
+    await anime_col.create_index("aliases_lower")
+    await anime_col.create_index([("name_lower", "text"), ("aliases_lower", "text")])
+    await users_col.create_index("_id")
+    logger.info("✅ MongoDB indexes created")
+
+async def main():
+    await create_indexes()
+    logger.info("🚀 Kenshin Anime Search Bot starting...")
+    await app.start()
+    me = await app.get_me()
+    logger.info(f"✅ Bot started as @{me.username}")
+    await app.idle()
+    await app.stop()
 
 if __name__ == "__main__":
-    logger.info("🚀 KenshinRenameBot v6.0 PREMIUM starting...")
-    app.run()
+    app.run(main())
