@@ -7,7 +7,7 @@
 
 import os, json, csv, io, asyncio, logging
 from datetime import datetime
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters, enums, idle
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, ChatMemberUpdated
@@ -1018,7 +1018,7 @@ async def main():
     await app.start()
     me = await app.get_me()
     logger.info(f"✅ Bot started as @{me.username}")
-    await app.idle()
+    await idle()
     await app.stop()
 
 if __name__ == "__main__":
