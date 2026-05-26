@@ -171,7 +171,7 @@ HELP_TEXT = """
 /remove_media — Remove media from pool by index
 /set_channel — Set powered-by channel name
 /cancel — Cancel any ongoing operation
-/report — Report an issue
+/report — Report an issue|/report [your problem] 
 
 **👑 Owner Commands:**
 /add_admin — Add an admin
@@ -247,7 +247,7 @@ async def cmd_report(_, message: Message):
     await register_user(message.from_user)
     args = message.text.split(None, 1)
     if len(args) < 2:
-        await message.reply_text("❌ Usage: `/report <message>`")
+        await message.reply_text("❌ Usage: `/report [your message]")
         return
     report_text = args[1]
     user = message.from_user
