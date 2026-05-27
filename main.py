@@ -1,1025 +1,1217 @@
 """
 ╔══════════════════════════════════════════════╗
 ║       KENSHIN ANIME SEARCH BOT               ║
-║  Built with Pyrogram + MongoDB               ║
+║  Pyrofork + MongoDB | Multi-instance ready   ║
 ╚══════════════════════════════════════════════╝
 """
 
-import os, json, csv, io, asyncio, logging
+import os, json, csv, io, asyncio, logging, re
 from datetime import datetime
 from pyrogram import Client, filters, enums, idle
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, ChatMemberUpdated
 )
-from pyrogram.errors import FloodWait, UserNotParticipant
 from motor.motor_asyncio import AsyncIOMotorClient
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# ── ENV ──────────────────────────────────────────────────────────────────────
-BOT_TOKEN   = os.environ["BOT_TOKEN"]
-MONGO_URI   = os.environ["MONGO_URI"]
-ORIGINAL_OWNER_ID = 6728678197   # your Telegram user-id
-API_ID      = int(os.environ["API_ID"])
-API_HASH    = os.environ["API_HASH"]
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIG  —  reads env, supports multiple instances in same process
+# ═══════════════════════════════════════════════════════════════════════════════
+def load_instances():
+    """
+    Primary instance always comes from env vars.
+    Cloned instances are stored in MongoDB under db['instances'].
+    Returns list of dicts: {bot_token, session_name, db_name, original_owner_id}
+    """
+    primary = {
+        "bot_token":         os.environ["BOT_TOKEN"],
+        "api_id":            int(os.environ["API_ID"]),
+        "api_hash":          os.environ["API_HASH"],
+        "original_owner_id": 6728678197,
+        "mongo_uri":         os.environ["MONGO_URI"],
+        "session_name":      "kenshin_primary",
+        "db_name":           Kenshinfileshere,
+    }
+    return primary
 
-# ── MongoDB ──────────────────────────────────────────────────────────────────
-mongo       = AsyncIOMotorClient(MONGO_URI)
-db          = mongo["kenshin_anime_bot"]
-anime_col   = db["animes"]
-users_col   = db["users"]
-staff_col   = db["staff"]          # {_id: user_id, role: "owner"|"admin"}
-settings_col= db["settings"]
+PRIMARY = load_instances()
 
-# ── Pyrogram Client ──────────────────────────────────────────────────────────
-app = Client(
-    "kenshin_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-)
+# ── Shared Mongo client ───────────────────────────────────────────────────────
+_mongo_client = AsyncIOMotorClient(PRIMARY["mongo_uri"])
+
+def get_db(db_name: str):
+    return _mongo_client[db_name]
+
+# ── Primary DB collections ────────────────────────────────────────────────────
+primary_db    = get_db(PRIMARY["db_name"])
+instances_col = _mongo_client["kenshin_meta"]["instances"]   # stores clones
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  HELPERS
+#  BOT FACTORY  — creates a fully featured bot for any instance config
 # ═══════════════════════════════════════════════════════════════════════════════
 BAKA_MSG = "ʙᴀᴋᴀ ʏᴏᴜʀ ɴᴏᴛ ᴍʏ sᴇɴᴘᴀɪ  !!!"
 
-async def get_setting(key: str, default=None):
-    doc = await settings_col.find_one({"_id": key})
-    return doc["value"] if doc else default
+def make_bot(cfg: dict) -> Client:
+    """Build and wire a Pyrogram Client with all handlers for one instance."""
 
-async def set_setting(key: str, value):
-    await settings_col.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
+    db                = get_db(cfg["db_name"])
+    anime_col         = db["animes"]
+    users_col         = db["users"]
+    staff_col         = db["staff"]
+    settings_col      = db["settings"]
+    ORIGINAL_OWNER_ID = cfg["original_owner_id"]
 
-async def register_user(user):
-    await users_col.update_one(
-        {"_id": user.id},
-        {"$set": {"username": user.username, "first_name": user.first_name, "last_seen": datetime.utcnow()}},
-        upsert=True
+    app = Client(
+        cfg["session_name"],
+        api_id    = PRIMARY["api_id"],
+        api_hash  = PRIMARY["api_hash"],
+        bot_token = cfg["bot_token"],
     )
 
-async def is_original_owner(user_id: int) -> bool:
-    return user_id == ORIGINAL_OWNER_ID
+    # ── per-instance state machine ───────────────────────────────────────────
+    _states: dict = {}
 
-async def is_owner(user_id: int) -> bool:
-    if await is_original_owner(user_id):
-        return True
-    doc = await staff_col.find_one({"_id": user_id, "role": "owner"})
-    return doc is not None
+    def get_state(uid):  return _states.get(uid)
+    def set_state(uid, step, data=None): _states[uid] = {"step": step, "data": data or {}}
+    def clear_state(uid): _states.pop(uid, None)
 
-async def is_admin(user_id: int) -> bool:
-    if await is_owner(user_id):
-        return True
-    doc = await staff_col.find_one({"_id": user_id, "role": "admin"})
-    return doc is not None
+    # ── settings helpers ─────────────────────────────────────────────────────
+    async def gset(key, default=None):
+        doc = await settings_col.find_one({"_id": key})
+        return doc["value"] if doc else default
 
-async def get_all_staff_ids() -> list:
-    ids = [ORIGINAL_OWNER_ID]
-    async for doc in staff_col.find({}):
-        ids.append(doc["_id"])
-    return list(set(ids))
+    async def sset(key, value):
+        await settings_col.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
 
-def build_anime_caption(anime: dict, channel_name: str) -> str:
-    genres = ", ".join(anime.get("genres", [])) or "N/A"
-    aliases = ", ".join(anime.get("aliases", [])) or "N/A"
-    return (
-        f"🎌 **{anime['name']}**\n\n"
-        f"📖 **Type:** {anime.get('type','N/A')}\n"
-        f"⭐ **Rating:** {anime.get('rating','N/A')}\n"
-        f"📺 **Episodes:** {anime.get('episodes','N/A')}\n"
-        f"🎭 **Genres:** {genres}\n"
-        f"🔤 **Aliases:** {aliases}\n"
-        f"📝 **Status:** {anime.get('status','N/A')}\n\n"
-        f"📜 {anime.get('description','No description available.')}\n\n"
-        f"**POWERED BY:** {channel_name}"
-    )
+    # ── role helpers ─────────────────────────────────────────────────────────
+    async def is_super(uid):   return uid == ORIGINAL_OWNER_ID
+    async def is_owner(uid):
+        if await is_super(uid): return True
+        return bool(await staff_col.find_one({"_id": uid, "role": "owner"}))
+    async def is_admin(uid):
+        if await is_owner(uid): return True
+        return bool(await staff_col.find_one({"_id": uid, "role": "admin"}))
 
-async def send_anime_result(message: Message, anime: dict):
-    channel_name = await get_setting("channel_name", "@YourChannel")
-    watch_url    = anime.get("watch_url", "https://t.me/")
-    caption      = build_anime_caption(anime, channel_name)
-    keyboard     = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Watch Now", url=watch_url)]])
-    image_id     = anime.get("image_file_id")
-    try:
-        if image_id:
-            await message.reply_photo(photo=image_id, caption=caption, reply_markup=keyboard)
+    async def all_staff_ids():
+        ids = [ORIGINAL_OWNER_ID]
+        async for d in staff_col.find({}): ids.append(d["_id"])
+        return list(set(ids))
+
+    async def resolve_user(message: Message):
+        if message.reply_to_message and message.reply_to_message.from_user:
+            return message.reply_to_message.from_user
+        parts = message.text.split()
+        if len(parts) >= 2:
+            try: return await app.get_users(int(parts[1]))
+            except Exception: pass
+        return None
+
+    async def register_user(user):
+        await users_col.update_one(
+            {"_id": user.id},
+            {"$set": {"username": user.username, "first_name": user.first_name,
+                      "last_seen": datetime.utcnow()}},
+            upsert=True
+        )
+
+    # ── force-sub check ──────────────────────────────────────────────────────
+    async def check_force_sub(message: Message) -> bool:
+        """Returns True if user passes force-sub, False + sends prompt if not."""
+        channels = await gset("force_sub_channels", [])
+        if not channels:
+            return True
+        failed = []
+        for ch in channels:
+            try:
+                member = await app.get_chat_member(ch, message.from_user.id)
+                if member.status in (
+                    enums.ChatMemberStatus.BANNED,
+                    enums.ChatMemberStatus.LEFT,
+                ):
+                    failed.append(ch)
+            except Exception:
+                failed.append(ch)
+        if not failed:
+            return True
+        btns = [[InlineKeyboardButton(f"📢 Join {ch}", url=f"https://t.me/{ch.lstrip('@')}")]
+                for ch in failed]
+        btns.append([InlineKeyboardButton("✅ I Joined", callback_data="check_sub")])
+        await message.reply_text(
+            "⚠️ **Join required channels to use this bot!**",
+            reply_markup=InlineKeyboardMarkup(btns)
+        )
+        return False
+
+    # ── anime output builder (matches screenshot format) ─────────────────────
+    async def send_anime_result(message: Message, anime: dict):
+        channels  = await gset("promo_channels", [])   # list of @channel strings
+        watch_url = anime.get("watch_url") or "https://t.me/"
+        name      = anime["name"]
+        desc      = anime.get("description", "")
+        image_id  = anime.get("image_file_id")
+
+        # ── promo lines ──────────────────────────────────────────────────────
+        if channels:
+            promo_lines = "\n".join(f"👉 {ch}" for ch in channels)
+            promo_block = f"\n\n📗 **FOR MORE ANIME JOIN:**\n{promo_lines}"
         else:
-            await message.reply_text(caption, reply_markup=keyboard)
-    except Exception as e:
-        logger.error(f"send_anime_result error: {e}")
-        await message.reply_text(caption, reply_markup=keyboard)
+            promo_block = ""
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /start
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("start") & filters.private)
-async def cmd_start(_, message: Message):
-    await register_user(message.from_user)
-    welcome = await get_setting("welcome_message",
-        "👋 **Welcome to Kenshin Anime Search Bot!**\n\n"
-        "🎌 Search for any anime using /search <name>\n"
-        "📋 See all commands with /help"
-    )
-    # try sending with media pool
-    media_pool = await get_setting("media_pool", [])
-    if media_pool:
-        import random
-        media = random.choice(media_pool)
+        # Caption format (matches screenshot):
+        # ✨ ANIME NAME ✨
+        # (blank line)
+        # blockquote synopsis
+        # (divider)
+        # promo block
+        caption = (
+            f"✨ **{name.upper()}** ✨\n\n"
+            f"**>** 📖 {desc}"
+            f"{promo_block}"
+        )
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🚀 DOWNLOAD / WATCH NOW 🚀", url=watch_url)
+        ]])
+
         try:
-            if media["type"] == "photo":
-                await message.reply_photo(photo=media["file_id"], caption=welcome)
-            elif media["type"] == "video":
-                await message.reply_video(video=media["file_id"], caption=welcome)
-            return
-        except Exception:
-            pass
-    # fallback text
-    start_img = await get_setting("start_banner", None)
-    if start_img:
-        await message.reply_photo(photo=start_img, caption=welcome)
-    else:
+            if image_id:
+                await message.reply_photo(
+                    photo=image_id, caption=caption, reply_markup=keyboard
+                )
+            else:
+                await message.reply_text(caption, reply_markup=keyboard)
+        except Exception as e:
+            logger.error(f"send_anime_result error: {e}")
+            try:
+                await message.reply_text(caption, reply_markup=keyboard)
+            except Exception as e2:
+                logger.error(f"fallback error: {e2}")
+
+    # ── search helper ────────────────────────────────────────────────────────
+    async def find_anime_in_text(text: str):
+        """Find first anime whose name or alias appears anywhere in text."""
+        # Try exact full-text first
+        anime = await anime_col.find_one({
+            "$or": [
+                {"name_lower":    {"$regex": re.escape(text.lower()), "$options": "i"}},
+                {"aliases_lower": {"$regex": re.escape(text.lower()), "$options": "i"}}
+            ]
+        })
+        if anime:
+            return anime
+        # Try to find any known anime name/alias as substring of the message
+        words = text.lower()
+        async for a in anime_col.find({}):
+            check = [a.get("name_lower", "")] + (a.get("aliases_lower") or [])
+            for term in check:
+                if term and len(term) >= 3 and term in words:
+                    return a
+        return None
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /start
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("start") & filters.private)
+    async def cmd_start(_, message: Message):
+        await register_user(message.from_user)
+        if not await check_force_sub(message): return
+        welcome = await gset(
+            "welcome_message",
+            "👋 **Welcome to Kenshin Anime Search Bot!**\n\n"
+            "🎌 Search any anime — just type its name!\n"
+            "📋 /help for all commands"
+        )
+        start_img = await gset("start_banner", None)
+        if start_img:
+            try:
+                await message.reply_photo(photo=start_img, caption=welcome)
+                return
+            except Exception:
+                await sset("start_banner", None)
         await message.reply_text(welcome)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /help
-# ═══════════════════════════════════════════════════════════════════════════════
-HELP_TEXT = """
-📋 **KENSHIN ANIME BOT — COMMANDS**
-
-**👤 User Commands:**
-/start — Start the bot & see welcome
-/help — Show this help menu
-/search <name> — Search anime by name
-/popular — Show most popular animes
-
-**🛡️ Admin Commands:**
-/add_ani — Add a new anime
-/edit_ani — Edit anime details (interactive)
-/delete_ani — Delete an anime
-/add_alias — Add aliases to anime
-/list — List all animes in database
-/stats — Show bot statistics
-/db_export — Export database (JSON/CSV)
-/bulk — Bulk import animes from file
-/broadcast — Broadcast message to all users
-/set_start_img — Change start banner image (legacy)
-/set_start_msg — Change welcome message
-/add_media — Add image/video to start media pool
-/list_media — List all media in start pool
-/remove_media — Remove media from pool by index
-/set_channel — Set powered-by channel name
-/cancel — Cancel any ongoing operation
-/report — Report an issue
-
-**👑 Owner Commands:**
-/add_admin — Add an admin
-/remove_admin — Remove an admin
-/addowner — Add an owner (original owner only)
-/removeowner — Remove an owner (original owner only)
-/copy — Copy this bot with a new token (original owner only)
-"""
-
-@app.on_message(filters.command("help"))
-async def cmd_help(_, message: Message):
-    await register_user(message.from_user)
-    await message.reply_text(HELP_TEXT)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /search
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("search"))
-async def cmd_search(_, message: Message):
-    await register_user(message.from_user)
-    args = message.text.split(None, 1)
-    if len(args) < 2:
-        await message.reply_text("❌ Usage: `/search <anime name>`", parse_mode=enums.ParseMode.MARKDOWN)
-        return
-    query = args[1].strip().lower()
-    anime = await anime_col.find_one({
-        "$or": [
-            {"name_lower": {"$regex": query, "$options": "i"}},
-            {"aliases_lower": {"$regex": query, "$options": "i"}}
-        ]
-    })
-    if anime:
-        await send_anime_result(message, anime)
-    # No reply if no match (as requested)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Inline / keyword search in groups (no command needed)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.group & ~filters.command([]) & filters.text)
-async def group_keyword_search(_, message: Message):
-    text = message.text.strip().lower()
-    if len(text) < 3:
-        return
-    anime = await anime_col.find_one({
-        "$or": [
-            {"name_lower": {"$regex": text, "$options": "i"}},
-            {"aliases_lower": {"$regex": text, "$options": "i"}}
-        ]
-    })
-    if anime:
-        await send_anime_result(message, anime)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /popular
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("popular"))
-async def cmd_popular(_, message: Message):
-    await register_user(message.from_user)
-    animes = await anime_col.find({}).sort("rating", -1).limit(10).to_list(10)
-    if not animes:
-        await message.reply_text("📭 No animes in database yet!")
-        return
-    text = "🌟 **Most Popular Animes:**\n\n"
-    for i, a in enumerate(animes, 1):
-        text += f"{i}. **{a['name']}** — ⭐ {a.get('rating','N/A')}\n"
-    await message.reply_text(text)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /report
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("report"))
-async def cmd_report(_, message: Message):
-    await register_user(message.from_user)
-    args = message.text.split(None, 1)
-    if len(args) < 2:
-        await message.reply_text("❌ Usage: `/report <message>`")
-        return
-    report_text = args[1]
-    user = message.from_user
-    staff_ids = await get_all_staff_ids()
-    notify = (
-        f"🚨 **New Report**\n\n"
-        f"👤 From: {user.first_name} (@{user.username or 'N/A'}) [ID: `{user.id}`]\n"
-        f"📝 Message: {report_text}"
-    )
-    for sid in staff_ids:
-        try:
-            await app.send_message(sid, notify)
-        except Exception:
-            pass
-    await message.reply_text("✅ Your report has been sent to the admins!")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  STATE MACHINE for multi-step commands
-# ═══════════════════════════════════════════════════════════════════════════════
-# user_id -> {"step": ..., "data": {...}}
-pending_states: dict = {}
-
-def get_state(user_id):
-    return pending_states.get(user_id)
-
-def set_state(user_id, step, data=None):
-    pending_states[user_id] = {"step": step, "data": data or {}}
-
-def clear_state(user_id):
-    pending_states.pop(user_id, None)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /cancel
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("cancel"))
-async def cmd_cancel(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    clear_state(message.from_user.id)
-    await message.reply_text("❌ Operation cancelled.")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /add_ani  (admin)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("add_ani"))
-async def cmd_add_ani(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    set_state(message.from_user.id, "add_ani_name")
-    await message.reply_text(
-        "➕ **Add New Anime**\n\nStep 1/8 — Send the **anime name** (or /cancel):"
-    )
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /edit_ani  (admin)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("edit_ani"))
-async def cmd_edit_ani(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    set_state(message.from_user.id, "edit_ani_name")
-    await message.reply_text("✏️ **Edit Anime**\n\nSend the **name** of the anime you want to edit:")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /delete_ani  (admin)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("delete_ani"))
-async def cmd_delete_ani(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    set_state(message.from_user.id, "delete_ani_name")
-    await message.reply_text("🗑️ **Delete Anime**\n\nSend the **name** of the anime to delete:")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /add_alias  (admin)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("add_alias"))
-async def cmd_add_alias(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    set_state(message.from_user.id, "add_alias_name")
-    await message.reply_text("🔤 **Add Alias**\n\nSend the **anime name** to add aliases to:")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /list  (admin)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("list"))
-async def cmd_list(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    animes = await anime_col.find({}, {"name": 1}).sort("name", 1).to_list(None)
-    if not animes:
-        await message.reply_text("📭 No animes in database.")
-        return
-    lines = [f"{i+1}. {a['name']}" for i, a in enumerate(animes)]
-    # Split into chunks of 50
-    for i in range(0, len(lines), 50):
-        chunk = "\n".join(lines[i:i+50])
-        await message.reply_text(f"📋 **Anime List ({i+1}-{min(i+50, len(lines))}):**\n\n{chunk}")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /stats  (admin)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("stats"))
-async def cmd_stats(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    total_anime = await anime_col.count_documents({})
-    total_users = await users_col.count_documents({})
-    total_admins = await staff_col.count_documents({"role": "admin"})
-    total_owners = await staff_col.count_documents({"role": "owner"})
-    await message.reply_text(
-        f"📊 **Bot Statistics**\n\n"
-        f"🎌 Animes: `{total_anime}`\n"
-        f"👤 Users: `{total_users}`\n"
-        f"🛡️ Admins: `{total_admins}`\n"
-        f"👑 Owners: `{total_owners + 1}` (incl. original)\n"
-    )
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /db_export  (admin)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("db_export"))
-async def cmd_db_export(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    args = message.text.split()
-    fmt = args[1].lower() if len(args) > 1 else "json"
-    animes = await anime_col.find({}, {"_id": 0}).to_list(None)
-    if fmt == "csv":
-        output = io.StringIO()
-        if animes:
-            writer = csv.DictWriter(output, fieldnames=animes[0].keys())
-            writer.writeheader()
-            writer.writerows(animes)
-        bio = io.BytesIO(output.getvalue().encode())
-        bio.name = "anime_export.csv"
-        await message.reply_document(bio, caption="📤 Database export (CSV)")
-    else:
-        data = json.dumps(animes, ensure_ascii=False, indent=2)
-        bio = io.BytesIO(data.encode())
-        bio.name = "anime_export.json"
-        await message.reply_document(bio, caption="📤 Database export (JSON)")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /bulk  (admin) — accepts .json or .txt file
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("bulk"))
-async def cmd_bulk(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    set_state(message.from_user.id, "bulk_waiting_file")
-    await message.reply_text(
-        "📦 **Bulk Import**\n\n"
-        "Send a `.json` or `.txt` file.\n\n"
-        "**JSON format** — array of objects:\n"
-        "```json\n[{\"name\":\"Naruto\",\"type\":\"Shonen\",\"episodes\":220,"
-        "\"rating\":8.3,\"genres\":[\"Action\"],\"aliases\":[\"ナルト\"],"
-        "\"description\":\"...\",\"watch_url\":\"https://...\",\"status\":\"Completed\"}]\n```\n\n"
-        "**TXT format** — one name per line."
-    )
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /broadcast  (admin)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("broadcast"))
-async def cmd_broadcast(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    set_state(message.from_user.id, "broadcast_msg")
-    await message.reply_text("📢 Send the message you want to broadcast to all users:")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /set_start_img  (admin, legacy)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("set_start_img"))
-async def cmd_set_start_img(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    set_state(message.from_user.id, "set_start_img")
-    await message.reply_text("🖼️ Send the new **start banner image**:")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /set_start_msg  (admin)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("set_start_msg"))
-async def cmd_set_start_msg(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    set_state(message.from_user.id, "set_start_msg")
-    await message.reply_text("✏️ Send the new **welcome message** text:")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /add_media  (admin)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("add_media"))
-async def cmd_add_media(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    set_state(message.from_user.id, "add_media")
-    await message.reply_text("🎬 Send the **image or video** to add to the start media pool:")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /list_media  (admin)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("list_media"))
-async def cmd_list_media(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    pool = await get_setting("media_pool", [])
-    if not pool:
-        await message.reply_text("📭 Media pool is empty.")
-        return
-    lines = [f"{i}. {m['type'].upper()} — `{m['file_id'][:20]}...`" for i, m in enumerate(pool)]
-    await message.reply_text("🎬 **Media Pool:**\n\n" + "\n".join(lines))
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /remove_media  (admin)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("remove_media"))
-async def cmd_remove_media(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    args = message.text.split()
-    if len(args) < 2:
-        await message.reply_text("❌ Usage: `/remove_media <index>`"); return
-    try:
-        idx = int(args[1])
-        pool = await get_setting("media_pool", [])
-        if idx < 0 or idx >= len(pool):
-            await message.reply_text("❌ Invalid index."); return
-        pool.pop(idx)
-        await set_setting("media_pool", pool)
-        await message.reply_text(f"✅ Media at index {idx} removed.")
-    except ValueError:
-        await message.reply_text("❌ Index must be a number.")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /set_channel  (admin)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("set_channel"))
-async def cmd_set_channel(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    args = message.text.split(None, 1)
-    if len(args) < 2:
-        await message.reply_text("❌ Usage: `/set_channel @ChannelName`"); return
-    await set_setting("channel_name", args[1].strip())
-    await message.reply_text(f"✅ Channel name set to `{args[1].strip()}`")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  OWNER COMMANDS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.on_message(filters.command("add_admin"))
-async def cmd_add_admin(_, message: Message):
-    if not await is_owner(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    target = None
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-    else:
-        args = message.text.split()
-        if len(args) < 2:
-            await message.reply_text("❌ Reply to a user or use `/add_admin <user_id>`"); return
-        try:
-            uid = int(args[1])
-            target_info = await app.get_users(uid)
-            target = target_info
-        except Exception:
-            await message.reply_text("❌ User not found."); return
-    await staff_col.update_one({"_id": target.id}, {"$set": {"role": "admin", "name": target.first_name}}, upsert=True)
-    await message.reply_text(f"✅ **{target.first_name}** is now an admin!")
-
-@app.on_message(filters.command("remove_admin"))
-async def cmd_remove_admin(_, message: Message):
-    if not await is_owner(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    target = None
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-    else:
-        args = message.text.split()
-        if len(args) < 2:
-            await message.reply_text("❌ Reply to a user or use `/remove_admin <user_id>`"); return
-        try:
-            uid = int(args[1])
-            target_info = await app.get_users(uid)
-            target = target_info
-        except Exception:
-            await message.reply_text("❌ User not found."); return
-    result = await staff_col.delete_one({"_id": target.id, "role": "admin"})
-    if result.deleted_count:
-        await message.reply_text(f"✅ **{target.first_name}** removed from admins.")
-    else:
-        await message.reply_text("❌ That user is not an admin.")
-
-@app.on_message(filters.command("addowner"))
-async def cmd_add_owner(_, message: Message):
-    if not await is_original_owner(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    target = None
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-    else:
-        args = message.text.split()
-        if len(args) < 2:
-            await message.reply_text("❌ Reply to a user or use `/addowner <user_id>`"); return
-        try:
-            uid = int(args[1])
-            target_info = await app.get_users(uid)
-            target = target_info
-        except Exception:
-            await message.reply_text("❌ User not found."); return
-    await staff_col.update_one({"_id": target.id}, {"$set": {"role": "owner", "name": target.first_name}}, upsert=True)
-    await message.reply_text(f"✅ **{target.first_name}** is now an owner!")
-
-@app.on_message(filters.command("removeowner"))
-async def cmd_remove_owner(_, message: Message):
-    if not await is_original_owner(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    target = None
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-    else:
-        args = message.text.split()
-        if len(args) < 2:
-            await message.reply_text("❌ Reply to a user or use `/removeowner <user_id>`"); return
-        try:
-            uid = int(args[1])
-            target_info = await app.get_users(uid)
-            target = target_info
-        except Exception:
-            await message.reply_text("❌ User not found."); return
-    if target.id == ORIGINAL_OWNER_ID:
-        await message.reply_text("❌ Cannot remove the original owner!"); return
-    result = await staff_col.delete_one({"_id": target.id, "role": "owner"})
-    if result.deleted_count:
-        await message.reply_text(f"✅ **{target.first_name}** removed from owners.")
-    else:
-        await message.reply_text("❌ That user is not an added owner.")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /copy  — original owner only — spawn identical bot with new token
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("copy"))
-async def cmd_copy(_, message: Message):
-    if not await is_original_owner(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    args = message.text.split(None, 1)
-    if len(args) < 2:
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /help
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("help"))
+    async def cmd_help(_, message: Message):
+        await register_user(message.from_user)
         await message.reply_text(
-            "🤖 **Copy Bot**\n\n"
-            "Usage: `/copy <NEW_BOT_TOKEN>`\n\n"
-            "This will create an identical bot with a **separate database**.\n"
-            "Make sure to set `MONGO_URI` for the new instance separately.\n"
-            "Deploy the same code with the new token as `BOT_TOKEN` env variable."
-        )
-        return
-    new_token = args[1].strip()
-    # Validate token format
-    parts = new_token.split(":")
-    if len(parts) != 2 or not parts[0].isdigit():
-        await message.reply_text("❌ Invalid bot token format."); return
-    # Save copy request to DB for reference
-    await db["copy_requests"].insert_one({
-        "requested_by": message.from_user.id,
-        "new_token_preview": f"{parts[0]}:***",
-        "timestamp": datetime.utcnow()
-    })
-    await message.reply_text(
-        f"✅ **Copy Instructions:**\n\n"
-        f"1️⃣ Deploy the same bot code on a new server/Railway project\n"
-        f"2️⃣ Set these environment variables:\n"
-        f"   • `BOT_TOKEN` = `{parts[0]}:***` (your new token)\n"
-        f"   • `MONGO_URI` = (a NEW MongoDB URI for separate DB)\n"
-        f"   • `API_ID` = same as current\n"
-        f"   • `API_HASH` = same as current\n"
-        f"   • `ORIGINAL_OWNER_ID` = your Telegram ID\n\n"
-        f"3️⃣ The new bot will have its own completely separate database! 🎉\n\n"
-        f"⚠️ Keep your token safe and don't share it!"
-    )
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  WELCOME / GOODBYE in groups
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_chat_member_updated()
-async def member_update(_, update: ChatMemberUpdated):
-    try:
-        if update.new_chat_member and update.new_chat_member.status in (
-            enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR
-        ):
-            if not update.old_chat_member or update.old_chat_member.status in (
-                enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED
-            ):
-                # User joined
-                welcome_tmpl = await get_setting(
-                    "group_welcome",
-                    "👋 Welcome {name} to {chat}!\n🎌 Use /search <anime> to find animes!"
-                )
-                user = update.new_chat_member.user
-                text = welcome_tmpl.replace("{name}", f"**{user.first_name}**") \
-                                   .replace("{chat}", f"**{update.chat.title}**") \
-                                   .replace("{mention}", user.mention)
-                await app.send_message(update.chat.id, text)
-
-        elif update.old_chat_member and update.old_chat_member.status in (
-            enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR
-        ):
-            if update.new_chat_member and update.new_chat_member.status in (
-                enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED
-            ):
-                # User left
-                goodbye_tmpl = await get_setting(
-                    "group_goodbye",
-                    "👋 {name} has left {chat}. Sayonara! 🎌"
-                )
-                user = update.old_chat_member.user
-                text = goodbye_tmpl.replace("{name}", f"**{user.first_name}**") \
-                                   .replace("{chat}", f"**{update.chat.title}**") \
-                                   .replace("{mention}", user.mention)
-                await app.send_message(update.chat.id, text)
-    except Exception as e:
-        logger.error(f"member_update error: {e}")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /set_welcome & /set_goodbye  (group welcome/goodbye edit)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("set_welcome"))
-async def cmd_set_welcome(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    args = message.text.split(None, 1)
-    if len(args) < 2:
-        await message.reply_text(
-            "❌ Usage: `/set_welcome <text>`\n\n"
-            "Variables: `{name}` `{chat}` `{mention}`"
-        ); return
-    await set_setting("group_welcome", args[1])
-    await message.reply_text("✅ Group welcome message updated!")
-
-@app.on_message(filters.command("set_goodbye"))
-async def cmd_set_goodbye(_, message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.reply_text(BAKA_MSG); return
-    args = message.text.split(None, 1)
-    if len(args) < 2:
-        await message.reply_text(
-            "❌ Usage: `/set_goodbye <text>`\n\n"
-            "Variables: `{name}` `{chat}` `{mention}`"
-        ); return
-    await set_setting("group_goodbye", args[1])
-    await message.reply_text("✅ Group goodbye message updated!")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  STATE HANDLER — catches all non-command messages for multi-step flows
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(~filters.command([]) & (filters.private | filters.group))
-async def state_handler(_, message: Message):
-    uid = message.from_user.id
-    state = get_state(uid)
-    if not state:
-        return
-
-    step = state["step"]
-    data = state["data"]
-
-    # ── ADD ANIME FLOW ────────────────────────────────────────────────────────
-    if step == "add_ani_name":
-        data["name"] = message.text.strip()
-        set_state(uid, "add_ani_type", data)
-        await message.reply_text("Step 2/8 — **Type** (e.g. Shonen, Seinen, Movie):")
-
-    elif step == "add_ani_type":
-        data["type"] = message.text.strip()
-        set_state(uid, "add_ani_episodes", data)
-        await message.reply_text("Step 3/8 — **Number of episodes** (or 'N/A'):")
-
-    elif step == "add_ani_episodes":
-        data["episodes"] = message.text.strip()
-        set_state(uid, "add_ani_rating", data)
-        await message.reply_text("Step 4/8 — **Rating** (0-10):")
-
-    elif step == "add_ani_rating":
-        try:
-            data["rating"] = float(message.text.strip())
-        except ValueError:
-            data["rating"] = message.text.strip()
-        set_state(uid, "add_ani_genres", data)
-        await message.reply_text("Step 5/8 — **Genres** (comma-separated, e.g. Action, Adventure):")
-
-    elif step == "add_ani_genres":
-        data["genres"] = [g.strip() for g in message.text.split(",")]
-        set_state(uid, "add_ani_status", data)
-        await message.reply_text("Step 6/8 — **Status** (Ongoing / Completed / Upcoming):")
-
-    elif step == "add_ani_status":
-        data["status"] = message.text.strip()
-        set_state(uid, "add_ani_desc", data)
-        await message.reply_text("Step 7/8 — **Description** (short synopsis):")
-
-    elif step == "add_ani_desc":
-        data["description"] = message.text.strip()
-        set_state(uid, "add_ani_image", data)
-        await message.reply_text(
-            "Step 8/8 — Send the **anime image** (photo) AND caption the **watch URL**, "
-            "or send just the URL as text (no image):"
+            "📋 **KENSHIN ANIME BOT — COMMANDS**\n\n"
+            "**👤 User:**\n"
+            "/start — Welcome message\n"
+            "/search <name> — Search anime\n"
+            "/popular — Top rated animes\n"
+            "/report <msg> — Report issue\n\n"
+            "**🛡️ Admin:**\n"
+            "/add_ani — Add anime (4 steps)\n"
+            "/edit_ani — Edit anime\n"
+            "/delete_ani — Delete anime\n"
+            "/add_alias — Add aliases\n"
+            "/list — List all animes\n"
+            "/stats — Bot stats\n"
+            "/db_export [json|csv] — Export DB\n"
+            "/bulk — Bulk import (.json/.txt)\n"
+            "/broadcast — Message all users\n"
+            "/set_start_img — Set start image\n"
+            "/set_start_msg — Set welcome text\n"
+            "/set_welcome — Group welcome msg+img\n"
+            "/set_goodbye — Group goodbye msg+img\n"
+            "/set_channel — Set promo channels\n"
+            "/add_forcesub — Add force-sub channel\n"
+            "/rem_forcesub — Remove force-sub channel\n"
+            "/cancel — Cancel operation\n\n"
+            "**👑 Owner:**\n"
+            "/add_admin — Add admin\n"
+            "/remove_admin — Remove admin\n"
+            "/addowner — Add owner\n"
+            "/removeowner — Remove owner\n\n"
+            "**⚡ Super Owner only:**\n"
+            "/copy <token> — Clone this bot (new token, same owner, separate DB)\n\n"
+            "**📝 Bulk format (.txt):**\n"
+            "One per line: `img_url|synopsis|watch_link|alias1,alias2`\n"
+            "Name is first line or inside JSON as `name` field."
         )
 
-    elif step == "add_ani_image":
-        watch_url = ""
-        image_file_id = None
-        if message.photo:
-            image_file_id = message.photo.file_id
-            watch_url = message.caption or ""
-        elif message.text:
-            watch_url = message.text.strip()
-        data["image_file_id"] = image_file_id
-        data["watch_url"] = watch_url
-        # Save to DB
-        doc = {
-            "name": data["name"],
-            "name_lower": data["name"].lower(),
-            "type": data.get("type",""),
-            "episodes": data.get("episodes",""),
-            "rating": data.get("rating",""),
-            "genres": data.get("genres",[]),
-            "status": data.get("status",""),
-            "description": data.get("description",""),
-            "image_file_id": image_file_id,
-            "watch_url": watch_url,
-            "aliases": [],
-            "aliases_lower": [],
-            "added_by": uid,
-            "added_at": datetime.utcnow(),
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /search  (also works in private)
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("search"))
+    async def cmd_search(_, message: Message):
+        await register_user(message.from_user)
+        if not await check_force_sub(message): return
+        parts = message.text.split(None, 1)
+        if len(parts) < 2:
+            await message.reply_text("Usage: /search <anime name>"); return
+        anime = await find_anime_in_text(parts[1].strip())
+        if anime:
+            await send_anime_result(message, anime)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Text in private — search by name/alias in any position in text
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.private & ~filters.command([]) & filters.text)
+    async def private_text_search(_, message: Message):
+        uid   = message.from_user.id
+        state = get_state(uid)
+        if state:
+            await state_handler_fn(message); return
+        await register_user(message.from_user)
+        if not await check_force_sub(message): return
+        text  = (message.text or "").strip()
+        anime = await find_anime_in_text(text)
+        if anime:
+            await send_anime_result(message, anime)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Group text — detect anime name/alias anywhere in sentence
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.group & ~filters.command([]) & filters.text)
+    async def group_text_search(_, message: Message):
+        uid   = message.from_user.id
+        state = get_state(uid)
+        if state:
+            await state_handler_fn(message); return
+        text  = (message.text or "").strip()
+        if len(text) < 3: return
+        anime = await find_anime_in_text(text)
+        if anime:
+            await send_anime_result(message, anime)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /popular
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("popular"))
+    async def cmd_popular(_, message: Message):
+        await register_user(message.from_user)
+        if not await check_force_sub(message): return
+        animes = await anime_col.find({}).sort("name", 1).limit(15).to_list(15)
+        if not animes:
+            await message.reply_text("📭 No animes yet!"); return
+        lines = "\n".join(f"{i+1}. **{a['name']}**" for i, a in enumerate(animes))
+        await message.reply_text(f"🌟 **Anime List (Top 15):**\n\n{lines}")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /report
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("report"))
+    async def cmd_report(_, message: Message):
+        await register_user(message.from_user)
+        parts = message.text.split(None, 1)
+        if len(parts) < 2:
+            await message.reply_text("Usage: /report <your message>"); return
+        user   = message.from_user
+        notify = (
+            f"🚨 New Report\n\n"
+            f"From: {user.first_name} (@{user.username or 'N/A'}) "
+            f"[ID: <{user.id}>]\n"
+            f"Message: {parts[1]}"
+        )
+        for sid in await all_staff_ids():
+            try: await app.send_message(sid, notify)
+            except Exception: pass
+        await message.reply_text("✅ Report sent to admins!")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /cancel
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("cancel"))
+    async def cmd_cancel(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        clear_state(message.from_user.id)
+        await message.reply_text("❌ Cancelled.")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /add_ani  —  4 steps: image → synopsis → watch link → aliases
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("add_ani"))
+    async def cmd_add_ani(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        set_state(message.from_user.id, "ani_img")
+        await message.reply_text(
+            "➕ **Add Anime — Step 1/4**\n\n"
+            "Send the **anime image** (photo) or an image URL.\n"
+            "You can add the anime **name** as the photo caption.\n"
+            "Type SKIP to add without image.\n\n/cancel to abort."
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /edit_ani
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("edit_ani"))
+    async def cmd_edit_ani(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        set_state(message.from_user.id, "edit_name")
+        await message.reply_text("✏️ Send the anime **name** to edit:")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /delete_ani
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("delete_ani"))
+    async def cmd_delete_ani(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        set_state(message.from_user.id, "del_name")
+        await message.reply_text("🗑️ Send anime **name** to delete:")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /add_alias
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("add_alias"))
+    async def cmd_add_alias(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        set_state(message.from_user.id, "alias_name")
+        await message.reply_text("🔤 Send anime **name** to add aliases to:")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /list
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("list"))
+    async def cmd_list(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        animes = await anime_col.find({}, {"name":1}).sort("name", 1).to_list(None)
+        if not animes:
+            await message.reply_text("📭 Empty database."); return
+        lines = [f"{i+1}. {a['name']}" for i, a in enumerate(animes)]
+        for i in range(0, len(lines), 50):
+            await message.reply_text(
+                f"📋 **List ({i+1}–{min(i+50,len(lines))}):**\n\n" +
+                "\n".join(lines[i:i+50])
+            )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /stats
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("stats"))
+    async def cmd_stats(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        ta = await anime_col.count_documents({})
+        tu = await users_col.count_documents({})
+        ad = await staff_col.count_documents({"role":"admin"})
+        ow = await staff_col.count_documents({"role":"owner"})
+        await message.reply_text(
+            f"📊 **Stats**\n\n"
+            f"🎌 Animes: {ta}\n"
+            f"👤 Users: {tu}\n"
+            f"🛡️ Admins: {ad}\n"
+            f"👑 Owners: {ow+1}"
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /db_export
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("db_export"))
+    async def cmd_db_export(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        args = message.text.split()
+        fmt  = args[1].lower() if len(args) > 1 else "json"
+        def clean(d):
+            d.pop("_id", None)
+            if "added_at" in d and hasattr(d["added_at"], "isoformat"):
+                d["added_at"] = d["added_at"].isoformat()
+            return d
+        animes = [clean(a) async for a in anime_col.find({})]
+        ts     = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        if fmt == "csv":
+            out = io.StringIO()
+            if animes:
+                w = csv.DictWriter(out, fieldnames=animes[0].keys())
+                w.writeheader(); w.writerows(animes)
+            bio = io.BytesIO(out.getvalue().encode())
+            bio.name = f"kenshin_backup_{ts}.csv"
+            await message.reply_document(bio, caption="📤 CSV Export")
+        else:
+            bio = io.BytesIO(json.dumps(animes, ensure_ascii=False, indent=2,
+                                        default=str).encode())
+            bio.name = f"kenshin_backup_{ts}.json"
+            await message.reply_document(bio, caption="📤 JSON Export")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /bulk  —  format: name\nimg_url|synopsis|watch_link|alias1,alias2
+    #  JSON format same as before
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("bulk"))
+    async def cmd_bulk(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        set_state(message.from_user.id, "bulk_file")
+        await message.reply_text(
+            "📦 **Bulk Import**\n\n"
+            "Send a **.txt** or **.json** file.\n\n"
+            "**TXT format** — blocks separated by blank lines:\n"
+            "```\n"
+            "Anime Name\n"
+            "img_url|synopsis|watch_link|alias1,alias2\n"
+            "\n"
+            "Next Anime\n"
+            "img_url|synopsis|watch_link|\n"
+            "```\n\n"
+            "**JSON format** — array:\n"
+            "```json\n"
+            '[{"name":"One Piece","image_url":"https://...","description":"...","watch_url":"https://...","aliases":["OP"]}]\n'
+            "```"
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /broadcast
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("broadcast"))
+    async def cmd_broadcast(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        set_state(message.from_user.id, "bcast")
+        await message.reply_text("📢 Send broadcast message:")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /set_start_img
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("set_start_img"))
+    async def cmd_set_start_img(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        set_state(message.from_user.id, "set_start_img")
+        await message.reply_text("🖼️ Send the start banner image:")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /set_start_msg
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("set_start_msg"))
+    async def cmd_set_start_msg(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        set_state(message.from_user.id, "set_start_msg")
+        await message.reply_text("✏️ Send the new welcome message text:")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /set_channel — manage promo channels list
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("set_channel"))
+    async def cmd_set_channel(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        parts = message.text.split(None, 1)
+        if len(parts) < 2:
+            channels = await gset("promo_channels", [])
+            ch_list  = "\n".join(channels) if channels else "None"
+            await message.reply_text(
+                f"📢 **Promo Channels:**\n{ch_list}\n\n"
+                "Usage:\n"
+                "/set_channel add @channel\n"
+                "/set_channel remove @channel\n"
+                "/set_channel clear"
+            ); return
+        action = parts[1].strip()
+        channels = await gset("promo_channels", [])
+        if action == "clear":
+            await sset("promo_channels", [])
+            await message.reply_text("✅ All promo channels cleared.")
+        elif action.startswith("add "):
+            ch = action[4:].strip()
+            if ch not in channels: channels.append(ch)
+            await sset("promo_channels", channels)
+            await message.reply_text(f"✅ Added {ch}")
+        elif action.startswith("remove "):
+            ch = action[7:].strip()
+            channels = [c for c in channels if c != ch]
+            await sset("promo_channels", channels)
+            await message.reply_text(f"✅ Removed {ch}")
+        else:
+            await message.reply_text("Unknown action. Use: add / remove / clear")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /add_forcesub  /rem_forcesub
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("add_forcesub"))
+    async def cmd_add_forcesub(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        parts = message.text.split()
+        if len(parts) < 2:
+            channels = await gset("force_sub_channels", [])
+            ch_list  = "\n".join(channels) if channels else "None"
+            await message.reply_text(
+                f"🔒 **Force Sub Channels:**\n{ch_list}\n\n"
+                "Usage: /add_forcesub @channel"
+            ); return
+        ch       = parts[1].strip()
+        channels = await gset("force_sub_channels", [])
+        if ch not in channels: channels.append(ch)
+        await sset("force_sub_channels", channels)
+        await message.reply_text(f"✅ Force sub added: {ch}")
+
+    @app.on_message(filters.command("rem_forcesub"))
+    async def cmd_rem_forcesub(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        parts = message.text.split()
+        if len(parts) < 2:
+            await message.reply_text("Usage: /rem_forcesub @channel"); return
+        ch       = parts[1].strip()
+        channels = await gset("force_sub_channels", [])
+        channels = [c for c in channels if c != ch]
+        await sset("force_sub_channels", channels)
+        await message.reply_text(f"✅ Removed from force sub: {ch}")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /set_welcome  /set_goodbye
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("set_welcome"))
+    async def cmd_set_welcome(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        set_state(message.from_user.id, "set_welcome_text")
+        await message.reply_text(
+            "✏️ Send welcome text.\n\n"
+            "Placeholders: {name} {first_name} {mention} {id} {chat}\n\n"
+            "After text, you can send an image too."
+        )
+
+    @app.on_message(filters.command("set_goodbye"))
+    async def cmd_set_goodbye(_, message: Message):
+        if not await is_admin(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        set_state(message.from_user.id, "set_goodbye_text")
+        await message.reply_text(
+            "✏️ Send goodbye text.\n\n"
+            "Placeholders: {name} {first_name} {mention} {id} {chat}"
+        )
+
+    def fmt_text(tmpl, user, chat_title):
+        fn = user.first_name or ""
+        ln = user.last_name  or ""
+        return (tmpl
+            .replace("{name}",       f"{fn} {ln}".strip())
+            .replace("{first_name}", fn)
+            .replace("{last_name}",  ln)
+            .replace("{mention}",    user.mention or fn)
+            .replace("{id}",         str(user.id))
+            .replace("{chat}",       chat_title or ""))
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Group member join / leave
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_chat_member_updated()
+    async def member_update(_, update: ChatMemberUpdated):
+        try:
+            old = update.old_chat_member.status if update.old_chat_member else None
+            new = update.new_chat_member.status if update.new_chat_member else None
+            joined = (new in (enums.ChatMemberStatus.MEMBER,
+                               enums.ChatMemberStatus.ADMINISTRATOR)
+                      and old in (enums.ChatMemberStatus.LEFT,
+                                  enums.ChatMemberStatus.BANNED, None))
+            left   = (old in (enums.ChatMemberStatus.MEMBER,
+                               enums.ChatMemberStatus.ADMINISTRATOR)
+                      and new in (enums.ChatMemberStatus.LEFT,
+                                  enums.ChatMemberStatus.BANNED))
+            if joined:
+                user   = update.new_chat_member.user
+                tmpl   = await gset("group_welcome",
+                    "👋 Welcome {mention} to **{chat}**!\n🎌 Type any anime name to search!")
+                text   = fmt_text(tmpl, user, update.chat.title or "")
+                img_id = await gset("welcome_img", None)
+                kb     = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("👋 Say Hi!", url=f"tg://user?id={user.id}")
+                ]])
+                if img_id:
+                    try:
+                        await app.send_photo(update.chat.id, img_id, caption=text, reply_markup=kb)
+                        return
+                    except Exception: pass
+                await app.send_message(update.chat.id, text, reply_markup=kb)
+            elif left:
+                user   = update.old_chat_member.user
+                tmpl   = await gset("group_goodbye",
+                    "👋 **{name}** has left **{chat}**. Sayonara! 🎌")
+                text   = fmt_text(tmpl, user, update.chat.title or "")
+                img_id = await gset("goodbye_img", None)
+                if img_id:
+                    try:
+                        await app.send_photo(update.chat.id, img_id, caption=text); return
+                    except Exception: pass
+                await app.send_message(update.chat.id, text)
+        except Exception as e:
+            logger.error(f"member_update: {e}")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  OWNER COMMANDS
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("add_admin"))
+    async def cmd_add_admin(_, message: Message):
+        if not await is_owner(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        t = await resolve_user(message)
+        if not t: await message.reply_text("Reply to user or /add_admin <id>"); return
+        await staff_col.update_one({"_id": t.id},
+            {"$set": {"role":"admin","name":t.first_name}}, upsert=True)
+        await message.reply_text(f"✅ **{t.first_name}** is now admin!")
+
+    @app.on_message(filters.command("remove_admin"))
+    async def cmd_remove_admin(_, message: Message):
+        if not await is_owner(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        t = await resolve_user(message)
+        if not t: await message.reply_text("Reply to user or /remove_admin <id>"); return
+        r = await staff_col.delete_one({"_id": t.id, "role": "admin"})
+        await message.reply_text("✅ Removed from admins." if r.deleted_count
+                                  else "That user is not an admin.")
+
+    @app.on_message(filters.command("addowner"))
+    async def cmd_add_owner(_, message: Message):
+        if not await is_super(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        t = await resolve_user(message)
+        if not t: await message.reply_text("Reply to user or /addowner <id>"); return
+        await staff_col.update_one({"_id": t.id},
+            {"$set": {"role":"owner","name":t.first_name}}, upsert=True)
+        await message.reply_text(f"✅ **{t.first_name}** is now owner!")
+
+    @app.on_message(filters.command("removeowner"))
+    async def cmd_remove_owner(_, message: Message):
+        if not await is_super(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        t = await resolve_user(message)
+        if not t: await message.reply_text("Reply to user or /removeowner <id>"); return
+        if t.id == ORIGINAL_OWNER_ID:
+            await message.reply_text("Cannot remove super owner!"); return
+        r = await staff_col.delete_one({"_id": t.id, "role": "owner"})
+        await message.reply_text("✅ Removed from owners." if r.deleted_count
+                                  else "That user is not an owner.")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /copy  —  super owner only
+    #  Clones this bot: stores new token+dbname in MongoDB,
+    #  starts a new Client in the SAME PROCESS — no extra deploy needed.
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_message(filters.command("copy"))
+    async def cmd_copy(_, message: Message):
+        if not (await is_super(message.from_user.id) or
+                await is_owner(message.from_user.id)):
+            await message.reply_text(BAKA_MSG); return
+
+        parts = message.text.split(None, 1)
+        if len(parts) < 2:
+            await message.reply_text(
+                "⚡ **Clone Bot**\n\n"
+                "Usage: /copy <NEW_BOT_TOKEN>\n\n"
+                "• Creates a new bot instance inside this same process\n"
+                "• Separate DB — all settings/animes need to be configured fresh\n"
+                "• Same super owner\n"
+                "• Clone persists across restarts (stored in DB)\n"
+                "• Clone is destroyed with /delcopy <bot_id>"
+            ); return
+
+        new_token = parts[1].strip()
+        tparts    = new_token.split(":")
+        if len(tparts) != 2 or not tparts[0].isdigit():
+            await message.reply_text("Invalid token format."); return
+        new_bot_id = tparts[0]
+
+        # Check not already cloned
+        existing = await instances_col.find_one({"bot_id": new_bot_id})
+        if existing:
+            await message.reply_text("This token is already cloned!"); return
+
+        # Validate token
+        status_msg = await message.reply_text("🔄 Validating token and starting clone…")
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"https://api.telegram.org/bot{new_token}/getMe",
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as r:
+                    res = await r.json()
+            if not res.get("ok"):
+                await status_msg.edit_text(
+                    f"Token invalid: {res.get('description')}"); return
+            new_username = res["result"].get("username", new_bot_id)
+        except Exception as e:
+            await status_msg.edit_text(f"Token check failed: {e}"); return
+
+        clone_cfg = {
+            "bot_token":         new_token,
+            "session_name":      f"kenshin_clone_{new_bot_id}",
+            "db_name":           f"kenshin_clone_{new_bot_id}",
+            "original_owner_id": ORIGINAL_OWNER_ID,
         }
-        await anime_col.insert_one(doc)
-        clear_state(uid)
-        await message.reply_text(f"✅ **{data['name']}** added to the database!")
 
-    # ── EDIT ANIME FLOW ───────────────────────────────────────────────────────
-    elif step == "edit_ani_name":
-        name = message.text.strip()
-        anime = await anime_col.find_one({"name_lower": name.lower()})
-        if not anime:
-            await message.reply_text("❌ Anime not found. Try again or /cancel."); return
-        data["anime_id"] = anime["_id"]
-        data["current"] = anime
-        set_state(uid, "edit_ani_field", data)
-        await message.reply_text(
-            f"✏️ Editing: **{anime['name']}**\n\n"
-            "Which field do you want to edit?\n"
-            "`name` / `type` / `episodes` / `rating` / `genres` / `status` / `description` / `watch_url` / `image`"
-        )
+        try:
+            clone_app = make_bot(clone_cfg)
+            await clone_app.start()
+            RUNNING_CLONES[new_bot_id] = clone_app
+            # Persist so it restarts next boot
+            await instances_col.update_one(
+                {"bot_id": new_bot_id},
+                {"$set": {**clone_cfg, "username": new_username,
+                           "created_by": message.from_user.id,
+                           "created_at": datetime.utcnow()}},
+                upsert=True
+            )
+            await status_msg.edit_text(
+                f"✅ **@{new_username} is now live!**\n\n"
+                f"• Runs in same process as this bot\n"
+                f"• Has its own separate database\n"
+                f"• Same super owner: you\n"
+                f"• All settings/animes are empty — configure fresh\n"
+                f"• To stop clone: /delcopy {new_bot_id}"
+            )
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Failed to start clone: {e}")
 
-    elif step == "edit_ani_field":
-        field = message.text.strip().lower()
-        valid = {"name","type","episodes","rating","genres","status","description","watch_url","image"}
-        if field not in valid:
-            await message.reply_text("❌ Invalid field. Choose from the list above."); return
-        data["edit_field"] = field
-        set_state(uid, "edit_ani_value", data)
-        if field == "image":
-            await message.reply_text("📸 Send the new **image** for this anime:")
-        elif field == "genres":
-            await message.reply_text("🎭 Send new **genres** (comma-separated):")
-        else:
-            await message.reply_text(f"✏️ Send the new value for **{field}**:")
+    @app.on_message(filters.command("delcopy"))
+    async def cmd_delcopy(_, message: Message):
+        if not await is_super(message.from_user.id):
+            await message.reply_text(BAKA_MSG); return
+        parts = message.text.split()
+        if len(parts) < 2:
+            clones = [c async for c in instances_col.find({})]
+            if not clones:
+                await message.reply_text("No clones running."); return
+            lines = "\n".join(
+                f"• @{c.get('username','?')} — ID: {c['bot_id']}" for c in clones)
+            await message.reply_text(f"🤖 **Active clones:**\n{lines}\n\nUsage: /delcopy <bot_id>")
+            return
+        bid = parts[1].strip()
+        clone_app = RUNNING_CLONES.pop(bid, None)
+        if clone_app:
+            try: await clone_app.stop()
+            except Exception: pass
+        await instances_col.delete_one({"bot_id": bid})
+        await message.reply_text(f"✅ Clone {bid} stopped and removed.")
 
-    elif step == "edit_ani_value":
-        field = data["edit_field"]
-        anime_id = data["anime_id"]
-        if field == "image":
-            if message.photo:
-                await anime_col.update_one({"_id": anime_id}, {"$set": {"image_file_id": message.photo.file_id}})
-                clear_state(uid)
-                await message.reply_text("✅ Image updated!")
+    # ═══════════════════════════════════════════════════════════════════════
+    #  CALLBACK QUERIES
+    # ═══════════════════════════════════════════════════════════════════════
+    @app.on_callback_query()
+    async def cb_handler(_, query: CallbackQuery):
+        data = query.data
+        uid  = query.from_user.id
+        if data == "check_sub":
+            # Re-check force sub
+            channels = await gset("force_sub_channels", [])
+            failed   = []
+            for ch in channels:
+                try:
+                    m = await app.get_chat_member(ch, uid)
+                    if m.status in (enums.ChatMemberStatus.BANNED,
+                                    enums.ChatMemberStatus.LEFT):
+                        failed.append(ch)
+                except Exception:
+                    failed.append(ch)
+            if not failed:
+                await query.message.delete()
+                await query.answer("✅ Access granted!", show_alert=True)
             else:
-                await message.reply_text("❌ Please send a photo."); return
-        elif field == "genres":
-            genres = [g.strip() for g in message.text.split(",")]
-            await anime_col.update_one({"_id": anime_id}, {"$set": {"genres": genres}})
+                await query.answer("❌ Still not joined all channels!", show_alert=True)
+        elif data.startswith("del_confirm_"):
+            if not await is_admin(uid):
+                await query.answer(BAKA_MSG, show_alert=True); return
+            from bson import ObjectId
+            aid   = ObjectId(data.replace("del_confirm_", ""))
+            anime = await anime_col.find_one({"_id": aid})
+            await anime_col.delete_one({"_id": aid})
             clear_state(uid)
-            await message.reply_text("✅ Genres updated!")
-        elif field == "name":
-            new_name = message.text.strip()
-            await anime_col.update_one({"_id": anime_id}, {"$set": {"name": new_name, "name_lower": new_name.lower()}})
+            await query.message.edit_text(
+                f"✅ **{anime['name'] if anime else 'Anime'}** deleted!")
+        elif data == "del_cancel":
             clear_state(uid)
-            await message.reply_text("✅ Name updated!")
-        elif field == "rating":
-            try:
-                val = float(message.text.strip())
-            except ValueError:
-                val = message.text.strip()
-            await anime_col.update_one({"_id": anime_id}, {"$set": {"rating": val}})
+            await query.message.edit_text("❌ Cancelled.")
+        await query.answer()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  STATE HANDLER (shared by private_text_search and group_text_search)
+    # ═══════════════════════════════════════════════════════════════════════
+    async def state_handler_fn(message: Message):
+        uid  = message.from_user.id
+        s    = get_state(uid)
+        if not s: return
+        step = s["step"]
+        data = s["data"]
+
+        # ── ADD ANIME ──────────────────────────────────────────────────────
+        if step == "ani_img":
+            if message.photo:
+                data["image_file_id"] = message.photo.file_id
+                data["name"]          = (message.caption or "").strip()
+            elif message.text and message.text.strip().upper() == "SKIP":
+                data["image_file_id"] = None
+                data["name"]          = ""
+            elif message.text and message.text.strip().startswith("http"):
+                data["image_file_id"] = message.text.strip()
+                data["name"]          = ""
+            else:
+                await message.reply_text(
+                    "Send a photo (caption = anime name), an image URL, or SKIP."
+                ); return
+            set_state(uid, "ani_name" if not data.get("name") else "ani_synopsis", data)
+            if data.get("name"):
+                await message.reply_text(
+                    f"✅ Image set! Name detected: **{data['name']}**\n\n"
+                    "Step 2/4 — Send **synopsis** (description):"
+                )
+            else:
+                await message.reply_text("Step 1b — Send the **anime name**:")
+
+        elif step == "ani_name":
+            data["name"] = message.text.strip()
+            set_state(uid, "ani_synopsis", data)
+            await message.reply_text("Step 2/4 — Send **synopsis** (description):")
+
+        elif step == "ani_synopsis":
+            data["description"] = message.text.strip()
+            set_state(uid, "ani_watchlink", data)
+            await message.reply_text("Step 3/4 — Send **Watch/Download link** (URL):")
+
+        elif step == "ani_watchlink":
+            text = message.text.strip() if message.text else ""
+            data["watch_url"] = "" if text.upper() == "SKIP" else text
+            set_state(uid, "ani_aliases", data)
+            await message.reply_text(
+                "Step 4/4 — Send **aliases** (comma-separated).\n"
+                "e.g. OP, One P, ワンピース\n"
+                "Type SKIP if none."
+            )
+
+        elif step == "ani_aliases":
+            text = (message.text or "").strip()
+            if text.upper() != "SKIP" and text:
+                aliases = [a.strip() for a in text.split(",") if a.strip()]
+            else:
+                aliases = []
+            doc = {
+                "name":          data["name"],
+                "name_lower":    data["name"].lower(),
+                "description":   data.get("description", ""),
+                "image_file_id": data.get("image_file_id"),
+                "watch_url":     data.get("watch_url", ""),
+                "aliases":       aliases,
+                "aliases_lower": [a.lower() for a in aliases],
+                "added_by":      uid,
+                "added_at":      datetime.utcnow(),
+            }
+            await anime_col.insert_one(doc)
             clear_state(uid)
-            await message.reply_text("✅ Rating updated!")
-        else:
-            await anime_col.update_one({"_id": anime_id}, {"$set": {field: message.text.strip()}})
+            await message.reply_text(
+                f"✅ **{data['name']}** added!\n\n"
+                f"Users can now search this anime!\n"
+                f"Add another? → /add_ani"
+            )
+
+        # ── EDIT ANIME ────────────────────────────────────────────────────
+        elif step == "edit_name":
+            anime = await anime_col.find_one({"name_lower": message.text.strip().lower()})
+            if not anime:
+                await message.reply_text("Anime not found. /cancel to abort."); return
+            data["anime_id"] = anime["_id"]
+            set_state(uid, "edit_field", data)
+            await message.reply_text(
+                f"✏️ Editing **{anime['name']}**\n\n"
+                "Field: name / description / image / watch_url / aliases"
+            )
+        elif step == "edit_field":
+            field = message.text.strip().lower()
+            if field not in {"name","description","image","watch_url","aliases"}:
+                await message.reply_text("Invalid field."); return
+            data["edit_field"] = field
+            set_state(uid, "edit_value", data)
+            await message.reply_text(
+                f"Send new {'image (photo)' if field == 'image' else field}:"
+            )
+        elif step == "edit_value":
+            field = data["edit_field"]
+            aid   = data["anime_id"]
+            if field == "image":
+                if not message.photo:
+                    await message.reply_text("Send a photo."); return
+                await anime_col.update_one({"_id": aid},
+                    {"$set": {"image_file_id": message.photo.file_id}})
+            elif field == "name":
+                v = message.text.strip()
+                await anime_col.update_one({"_id": aid},
+                    {"$set": {"name": v, "name_lower": v.lower()}})
+            elif field == "aliases":
+                al = [a.strip() for a in message.text.split(",") if a.strip()]
+                await anime_col.update_one({"_id": aid},
+                    {"$set": {"aliases": al, "aliases_lower": [a.lower() for a in al]}})
+            else:
+                await anime_col.update_one({"_id": aid},
+                    {"$set": {field: message.text.strip()}})
             clear_state(uid)
-            await message.reply_text(f"✅ **{field}** updated!")
+            await message.reply_text(f"✅ {field} updated!")
 
-    # ── DELETE ANIME FLOW ─────────────────────────────────────────────────────
-    elif step == "delete_ani_name":
-        name = message.text.strip()
-        anime = await anime_col.find_one({"name_lower": name.lower()})
-        if not anime:
-            await message.reply_text("❌ Anime not found."); clear_state(uid); return
-        data["anime"] = anime
-        set_state(uid, "delete_ani_confirm", data)
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Yes, Delete", callback_data=f"del_confirm_{str(anime['_id'])}"),
-            InlineKeyboardButton("❌ Cancel", callback_data="del_cancel")
-        ]])
-        await message.reply_text(f"⚠️ Delete **{anime['name']}**? This cannot be undone!", reply_markup=keyboard)
+        # ── DELETE ANIME ──────────────────────────────────────────────────
+        elif step == "del_name":
+            anime = await anime_col.find_one({"name_lower": message.text.strip().lower()})
+            if not anime:
+                await message.reply_text("Anime not found."); clear_state(uid); return
+            data["anime_id"]   = anime["_id"]
+            data["anime_name"] = anime["name"]
+            set_state(uid, "del_confirm", data)
+            await message.reply_text(
+                f"⚠️ Delete **{anime['name']}**?",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Yes", callback_data=f"del_confirm_{anime['_id']}"),
+                    InlineKeyboardButton("❌ No",  callback_data="del_cancel")
+                ]])
+            )
 
-    # ── ADD ALIAS FLOW ────────────────────────────────────────────────────────
-    elif step == "add_alias_name":
-        name = message.text.strip()
-        anime = await anime_col.find_one({"name_lower": name.lower()})
-        if not anime:
-            await message.reply_text("❌ Anime not found."); clear_state(uid); return
-        data["anime_id"] = anime["_id"]
-        data["anime_name"] = anime["name"]
-        set_state(uid, "add_alias_values", data)
-        await message.reply_text(f"🔤 Send **aliases** for **{anime['name']}** (comma-separated):")
+        # ── ADD ALIAS ─────────────────────────────────────────────────────
+        elif step == "alias_name":
+            anime = await anime_col.find_one({"name_lower": message.text.strip().lower()})
+            if not anime:
+                await message.reply_text("Anime not found."); clear_state(uid); return
+            data["anime_id"]   = anime["_id"]
+            data["anime_name"] = anime["name"]
+            set_state(uid, "alias_values", data)
+            await message.reply_text(f"Send aliases for **{anime['name']}** (comma-separated):")
+        elif step == "alias_values":
+            al  = [a.strip() for a in message.text.split(",") if a.strip()]
+            alL = [a.lower() for a in al]
+            await anime_col.update_one({"_id": data["anime_id"]}, {"$addToSet": {
+                "aliases":       {"$each": al},
+                "aliases_lower": {"$each": alL}
+            }})
+            clear_state(uid)
+            await message.reply_text(f"✅ Aliases added to **{data['anime_name']}**!")
 
-    elif step == "add_alias_values":
-        aliases = [a.strip() for a in message.text.split(",")]
-        aliases_lower = [a.lower() for a in aliases]
-        await anime_col.update_one(
-            {"_id": data["anime_id"]},
-            {"$addToSet": {"aliases": {"$each": aliases}, "aliases_lower": {"$each": aliases_lower}}}
-        )
-        clear_state(uid)
-        await message.reply_text(f"✅ Aliases added to **{data['anime_name']}**!")
+        # ── BULK IMPORT ───────────────────────────────────────────────────
+        elif step == "bulk_file":
+            if not message.document:
+                await message.reply_text("Send a .txt or .json file."); return
+            fname = message.document.file_name or ""
+            dl    = await message.download(in_memory=True)
+            raw   = bytes(dl.getbuffer()).decode("utf-8", errors="ignore")
+            imp   = skp = 0
 
-    # ── BULK IMPORT FLOW ──────────────────────────────────────────────────────
-    elif step == "bulk_waiting_file":
-        file_obj = message.document
-        if not file_obj:
-            await message.reply_text("❌ Please send a file."); return
-        fname = file_obj.file_name or ""
-        dl = await message.download(in_memory=True)
-        raw = bytes(dl.getbuffer()).decode("utf-8", errors="ignore")
-
-        imported = 0
-        skipped = 0
-        if fname.endswith(".json"):
-            try:
-                items = json.loads(raw)
+            if fname.endswith(".json"):
+                try: items = json.loads(raw)
+                except Exception:
+                    await message.reply_text("Invalid JSON."); clear_state(uid); return
                 for item in items:
-                    if not item.get("name"):
-                        skipped += 1; continue
-                    item["name_lower"] = item["name"].lower()
-                    item["aliases_lower"] = [a.lower() for a in item.get("aliases", [])]
-                    item.setdefault("added_by", uid)
-                    item.setdefault("added_at", datetime.utcnow())
-                    existing = await anime_col.find_one({"name_lower": item["name_lower"]})
-                    if existing:
-                        skipped += 1; continue
-                    await anime_col.insert_one(item)
-                    imported += 1
-            except json.JSONDecodeError:
-                await message.reply_text("❌ Invalid JSON file."); clear_state(uid); return
-        elif fname.endswith(".txt"):
-            lines = [l.strip() for l in raw.splitlines() if l.strip()]
-            for name in lines:
-                existing = await anime_col.find_one({"name_lower": name.lower()})
-                if existing:
-                    skipped += 1; continue
-                await anime_col.insert_one({
-                    "name": name, "name_lower": name.lower(),
-                    "aliases": [], "aliases_lower": [],
-                    "added_by": uid, "added_at": datetime.utcnow()
-                })
-                imported += 1
-        else:
-            await message.reply_text("❌ Only .json or .txt files supported."); clear_state(uid); return
+                    if not item.get("name"): skp += 1; continue
+                    nl = item["name"].lower()
+                    if await anime_col.find_one({"name_lower": nl}): skp += 1; continue
+                    al = item.get("aliases", [])
+                    await anime_col.insert_one({
+                        "name":          item["name"],
+                        "name_lower":    nl,
+                        "description":   item.get("description",""),
+                        "image_file_id": item.get("image_url") or item.get("image_file_id"),
+                        "watch_url":     item.get("watch_url",""),
+                        "aliases":       al,
+                        "aliases_lower": [a.lower() for a in al],
+                        "added_by": uid, "added_at": datetime.utcnow()
+                    })
+                    imp += 1
 
-        clear_state(uid)
-        await message.reply_text(f"✅ **Bulk Import Done!**\n\n✔️ Imported: {imported}\n⏭️ Skipped: {skipped}")
+            elif fname.endswith(".txt"):
+                # Format: blocks separated by blank lines
+                # Line1: Anime Name
+                # Line2: img_url|synopsis|watch_link|alias1,alias2
+                blocks = raw.strip().split("\n\n")
+                for block in blocks:
+                    lines = [l.strip() for l in block.strip().splitlines() if l.strip()]
+                    if not lines: continue
+                    name = lines[0]
+                    nl   = name.lower()
+                    if await anime_col.find_one({"name_lower": nl}): skp += 1; continue
+                    img_url = syn = wurl = ""
+                    aliases = []
+                    if len(lines) >= 2:
+                        seg = lines[1].split("|")
+                        img_url = seg[0].strip() if len(seg) > 0 else ""
+                        syn     = seg[1].strip() if len(seg) > 1 else ""
+                        wurl    = seg[2].strip() if len(seg) > 2 else ""
+                        al_str  = seg[3].strip() if len(seg) > 3 else ""
+                        aliases = [a.strip() for a in al_str.split(",") if a.strip()]
+                    await anime_col.insert_one({
+                        "name": name, "name_lower": nl,
+                        "description": syn,
+                        "image_file_id": img_url or None,
+                        "watch_url": wurl,
+                        "aliases": aliases,
+                        "aliases_lower": [a.lower() for a in aliases],
+                        "added_by": uid, "added_at": datetime.utcnow()
+                    })
+                    imp += 1
+            else:
+                await message.reply_text("Only .json or .txt supported."); clear_state(uid); return
 
-    # ── BROADCAST FLOW ────────────────────────────────────────────────────────
-    elif step == "broadcast_msg":
-        bcast_text = message.text or message.caption or ""
-        users = await users_col.find({}, {"_id": 1}).to_list(None)
-        sent = 0; failed = 0
-        status_msg = await message.reply_text(f"📢 Broadcasting to {len(users)} users...")
-        for u in users:
-            try:
-                await app.send_message(u["_id"], bcast_text)
-                sent += 1
-            except Exception:
-                failed += 1
-            await asyncio.sleep(0.05)
-        clear_state(uid)
-        await status_msg.edit_text(f"✅ Broadcast complete!\n\n✔️ Sent: {sent}\n❌ Failed: {failed}")
-
-    # ── SET START IMG FLOW ────────────────────────────────────────────────────
-    elif step == "set_start_img":
-        if message.photo:
-            await set_setting("start_banner", message.photo.file_id)
             clear_state(uid)
-            await message.reply_text("✅ Start banner image updated!")
-        else:
-            await message.reply_text("❌ Please send a photo.")
+            await message.reply_text(
+                f"✅ **Bulk Import Done!**\n\nImported: {imp}\nSkipped: {skp}"
+            )
 
-    # ── SET START MSG FLOW ────────────────────────────────────────────────────
-    elif step == "set_start_msg":
-        await set_setting("welcome_message", message.text)
-        clear_state(uid)
-        await message.reply_text("✅ Welcome message updated!")
+        # ── BROADCAST ─────────────────────────────────────────────────────
+        elif step == "bcast":
+            txt   = message.text or message.caption or ""
+            users = await users_col.find({}, {"_id":1}).to_list(None)
+            sent = failed = 0
+            sm   = await message.reply_text(f"📢 Broadcasting to {len(users)} users…")
+            for u in users:
+                try: await app.send_message(u["_id"], txt); sent += 1
+                except Exception: failed += 1
+                await asyncio.sleep(0.05)
+            clear_state(uid)
+            await sm.edit_text(f"✅ Done! Sent: {sent} | Failed: {failed}")
 
-    # ── ADD MEDIA FLOW ────────────────────────────────────────────────────────
-    elif step == "add_media":
-        media_type = None; file_id = None
-        if message.photo:
-            media_type = "photo"; file_id = message.photo.file_id
-        elif message.video:
-            media_type = "video"; file_id = message.video.file_id
-        else:
-            await message.reply_text("❌ Send a photo or video."); return
-        pool = await get_setting("media_pool", [])
-        pool.append({"type": media_type, "file_id": file_id})
-        await set_setting("media_pool", pool)
-        clear_state(uid)
-        await message.reply_text(f"✅ {media_type.capitalize()} added to media pool! Total: {len(pool)}")
+        # ── SET START IMG ─────────────────────────────────────────────────
+        elif step == "set_start_img":
+            if message.photo:
+                await sset("start_banner", message.photo.file_id)
+                clear_state(uid)
+                await message.reply_text("✅ Start banner updated!")
+            else:
+                await message.reply_text("Send a photo (not as file).")
+
+        # ── SET START MSG ─────────────────────────────────────────────────
+        elif step == "set_start_msg":
+            if message.text:
+                await sset("welcome_message", message.text)
+                clear_state(uid); await message.reply_text("✅ Welcome message updated!")
+            else:
+                await message.reply_text("Send text.")
+
+        # ── SET WELCOME TEXT → IMAGE ──────────────────────────────────────
+        elif step == "set_welcome_text":
+            if message.text:
+                data["wtext"] = message.text
+                set_state(uid, "set_welcome_img", data)
+                await message.reply_text("Send welcome image, or type SKIP:")
+            else:
+                await message.reply_text("Send text.")
+        elif step == "set_welcome_img":
+            if message.photo:
+                await sset("welcome_img", message.photo.file_id)
+            elif not (message.text and message.text.strip().upper() == "SKIP"):
+                await message.reply_text("Send photo or SKIP."); return
+            await sset("group_welcome", data["wtext"])
+            clear_state(uid); await message.reply_text("✅ Welcome updated!")
+
+        # ── SET GOODBYE TEXT → IMAGE ──────────────────────────────────────
+        elif step == "set_goodbye_text":
+            if message.text:
+                data["gtext"] = message.text
+                set_state(uid, "set_goodbye_img", data)
+                await message.reply_text("Send goodbye image, or type SKIP:")
+            else:
+                await message.reply_text("Send text.")
+        elif step == "set_goodbye_img":
+            if message.photo:
+                await sset("goodbye_img", message.photo.file_id)
+            elif not (message.text and message.text.strip().upper() == "SKIP"):
+                await message.reply_text("Send photo or SKIP."); return
+            await sset("group_goodbye", data["gtext"])
+            clear_state(uid); await message.reply_text("✅ Goodbye updated!")
+
+    return app
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CALLBACK QUERIES (inline buttons)
+#  RUNNING CLONES registry  (bot_id -> Client)
 # ═══════════════════════════════════════════════════════════════════════════════
-@app.on_callback_query()
-async def callback_handler(_, query: CallbackQuery):
-    data = query.data
-    uid = query.from_user.id
-
-    if data.startswith("del_confirm_"):
-        if not await is_admin(uid):
-            await query.answer(BAKA_MSG, show_alert=True); return
-        from bson import ObjectId
-        anime_id = ObjectId(data.replace("del_confirm_", ""))
-        anime = await anime_col.find_one({"_id": anime_id})
-        await anime_col.delete_one({"_id": anime_id})
-        clear_state(uid)
-        await query.message.edit_text(f"✅ **{anime['name'] if anime else 'Anime'}** deleted!")
-
-    elif data == "del_cancel":
-        clear_state(uid)
-        await query.message.edit_text("❌ Deletion cancelled.")
-
-    await query.answer()
+RUNNING_CLONES: dict = {}
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BOT STARTUP
+#  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
-async def create_indexes():
-    """Create MongoDB indexes for fast search."""
-    await anime_col.create_index("name_lower")
-    await anime_col.create_index("aliases_lower")
-    await anime_col.create_index([("name_lower", "text"), ("aliases_lower", "text")])
-    await users_col.create_index("_id")
-    logger.info("✅ MongoDB indexes created")
-
 async def main():
-    await create_indexes()
-    logger.info("🚀 Kenshin Anime Search Bot starting...")
-    await app.start()
-    me = await app.get_me()
-    logger.info(f"✅ Bot started as @{me.username}")
-    await app.idle()
-    await app.stop()
+    # Create indexes
+    db = get_db(PRIMARY["db_name"])
+    await db["animes"].create_index("name_lower")
+    await db["animes"].create_index("aliases_lower")
+    await db["users"].create_index("_id")
+    logger.info("✅ Indexes ready")
+
+    # Start primary bot
+    primary_app = make_bot(PRIMARY)
+    await primary_app.start()
+    me = await primary_app.get_me()
+    logger.info(f"✅ Primary bot: @{me.username}")
+
+    # Restore clones from DB
+    async for inst in instances_col.find({}):
+        cfg = {
+            "bot_token":         inst["bot_token"],
+            "session_name":      inst["session_name"],
+            "db_name":           inst["db_name"],
+            "original_owner_id": inst["original_owner_id"],
+        }
+        try:
+            clone = make_bot(cfg)
+            await clone.start()
+            cm = await clone.get_me()
+            RUNNING_CLONES[inst["bot_id"]] = clone
+            logger.info(f"✅ Clone restored: @{cm.username}")
+        except Exception as e:
+            logger.error(f"Failed to restore clone {inst.get('bot_id')}: {e}")
+
+    logger.info("🚀 All bots running. Idling…")
+    await primary_app.idle()
+
+    # Graceful stop
+    for c in RUNNING_CLONES.values():
+        try: await c.stop()
+        except Exception: pass
+    await primary_app.stop()
 
 if __name__ == "__main__":
-    app.run(main())
+    primary_app_tmp = Client(
+        PRIMARY["session_name"],
+        api_id    = PRIMARY["api_id"],
+        api_hash  = PRIMARY["api_hash"],
+        bot_token = PRIMARY["bot_token"],
+    )
+    primary_app_tmp.run(main())
