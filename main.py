@@ -38,11 +38,11 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 def load_primary():
     return {
-        "bot_token":         "8285265972:AAGVX-BGABNk1nHBZ2Sr3gUSQ2XHfH7KWSU",
+        "bot_token":         "8898514649:AAGdzCQF8kEgCuRPMtzlgV7V3ObYmz3BerI",
         "api_id":            37407868,
         "api_hash":          "d7d3bff9f7cf9f3b111129bdbd13a065",
         "original_owner_id": 6728678197,
-        "mongo_uri":         "mongodb+srv://kenshinxu6:iammohitgurjar.1@kenshinfileshere.ad3ygfa.mongodb.net/?appName=Kenshinfileshere",
+        "mongo_uri":         "mongodb+srv://kenshinxu1:iammohitgurjar.1@kenshinfileshere.fyvrwjd.mongodb.net/?appName=Kenshinfileshere",
         "session_name":      "kenshin_primary",
         "db_name":           "Kenshinfileshere",
     }
