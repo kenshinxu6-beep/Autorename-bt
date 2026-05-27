@@ -7,7 +7,7 @@
 
 import os, json, csv, io, asyncio, logging
 from datetime import datetime
-from pyrogram import Client, filters, enums, idle
+from pyrogram import Client, filters, enums
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, ChatMemberUpdated
@@ -171,7 +171,7 @@ HELP_TEXT = """
 /remove_media — Remove media from pool by index
 /set_channel — Set powered-by channel name
 /cancel — Cancel any ongoing operation
-/report — Report an issue|/report [your problem] 
+/report — Report an issue
 
 **👑 Owner Commands:**
 /add_admin — Add an admin
@@ -247,7 +247,7 @@ async def cmd_report(_, message: Message):
     await register_user(message.from_user)
     args = message.text.split(None, 1)
     if len(args) < 2:
-        await message.reply_text("❌ Usage: `/report [your message]")
+        await message.reply_text("❌ Usage: `/report <message>`")
         return
     report_text = args[1]
     user = message.from_user
@@ -1018,7 +1018,7 @@ async def main():
     await app.start()
     me = await app.get_me()
     logger.info(f"✅ Bot started as @{me.username}")
-    await idle()
+    await app.idle()
     await app.stop()
 
 if __name__ == "__main__":
