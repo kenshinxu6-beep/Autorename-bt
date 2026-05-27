@@ -1199,7 +1199,7 @@ async def main():
             logger.error(f"Failed to restore clone {inst.get('bot_id')}: {e}")
 
     logger.info("🚀 All bots running. Idling…")
-    await primary_app.idle()
+    await idle()
 
     # Graceful stop
     for c in RUNNING_CLONES.values():
