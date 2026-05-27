@@ -41,10 +41,10 @@ def load_primary():
         "bot_token":         os.environ["BOT_TOKEN"],
         "api_id":            int(os.environ["API_ID"]),
         "api_hash":          os.environ["API_HASH"],
-        "original_owner_id": int(os.environ["ORIGINAL_OWNER_ID"]),
+        "original_owner_id": 6728678197,
         "mongo_uri":         os.environ["MONGO_URI"],
         "session_name":      "kenshin_primary",
-        "db_name":           os.environ.get("DB_NAME", "kenshin_anime_bot"),
+        "db_name":           'Kenshinfileshere',
     }
 
 PRIMARY = load_primary()
