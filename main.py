@@ -7,7 +7,7 @@
 
 import os, json, csv, io, asyncio, logging
 from datetime import datetime
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters, enums, idle
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, ChatMemberUpdated
