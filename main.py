@@ -36,7 +36,7 @@ def load_instances():
         "original_owner_id": 6728678197,
         "mongo_uri":         os.environ["MONGO_URI"],
         "session_name":      "kenshin_primary",
-        "db_name":           Kenshinfileshere,
+        "db_name":           "Kenshinfileshere",
     }
     return primary
 
