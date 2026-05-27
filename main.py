@@ -5,7 +5,7 @@
 ╚══════════════════════════════════════════════╝
 
 CHANGES v2:
-• pyrogram → pyrofork (hydrogram)
+• pyrogram (pyrofork)
 • /start: works without start_banner set (shows text-only)
 • /report: uses [] for code, removed <> entity that caused ENTITY_BOUNDS_INVALID
 • /add_ani: simplified 4-step flow → img → synopsis → watch_link → aliases
@@ -20,8 +20,8 @@ CHANGES v2:
 
 import os, json, csv, io, asyncio, logging, re
 from datetime import datetime
-from hydrogram import Client, filters, enums
-from hydrogram.types import (
+from pyrogram import Client, filters, enums
+from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, ChatMemberUpdated
 )
@@ -44,7 +44,7 @@ def load_primary():
         "original_owner_id": 6728678197,
         "mongo_uri":         os.environ["MONGO_URI"],
         "session_name":      "kenshin_primary",
-        "db_name":           'Kenshinfileshere',
+        "db_name":           "Kenshinfileshere",
     }
 
 PRIMARY = load_primary()
@@ -1360,8 +1360,11 @@ async def main():
             logger.error(f"Failed to restore clone {inst.get('bot_id')}: {e}")
 
     logger.info("🏃 All bots running. Idling…")
-    await primary_app.idle()
 
+    from pyrogram import idle
+    await idle()
+
+    logger.info("🛑 Shutting down…")
     for c in RUNNING_CLONES.values():
         try: await c.stop()
         except Exception: pass
@@ -1369,10 +1372,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    primary_app_tmp = Client(
-        PRIMARY["session_name"],
-        api_id    = PRIMARY["api_id"],
-        api_hash  = PRIMARY["api_hash"],
-        bot_token = PRIMARY["bot_token"],
-    )
-    primary_app_tmp.run(main())
+    asyncio.run(main())
