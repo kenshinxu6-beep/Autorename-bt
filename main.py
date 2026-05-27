@@ -232,8 +232,10 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     #  /start
     # ═══════════════════════════════════════════════════════════════════════
-    @app.on_message(filters.command("start") & filters.private)
+    @app.on_message(filters.command("start"))
     async def cmd_start(_, message: Message):
+        if not message.from_user:
+            return
         await register_user(message.from_user)
         if not await check_force_sub(message):
             return
@@ -244,6 +246,8 @@ def make_bot(cfg: dict) -> Client:
             "📋 /help for all commands"
         )
         welcome   = await gset("welcome_message", default_welcome)
+        # Apply placeholders to start message too
+        welcome   = fmt_text(welcome, message.from_user, getattr(message.chat, "title", None))
         start_img = await gset("start_banner", None)
 
         if start_img:
@@ -262,6 +266,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("help"))
     async def cmd_help(_, message: Message):
+        if not message.from_user:
+            return
         await register_user(message.from_user)
         await message.reply_text(
             "📋 **KENSHIN ANIME BOT — COMMANDS**\n\n"
@@ -307,6 +313,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("search"))
     async def cmd_search(_, message: Message):
+        if not message.from_user:
+            return
         await register_user(message.from_user)
         if not await check_force_sub(message):
             return
@@ -333,6 +341,8 @@ def make_bot(cfg: dict) -> Client:
 
     @app.on_message(filters.private & ~filters.command(ALL_CMDS) & filters.text)
     async def private_text_search(_, message: Message):
+        if not message.from_user:
+            return
         uid   = message.from_user.id
         state = get_state(uid)
         if state:
@@ -348,6 +358,8 @@ def make_bot(cfg: dict) -> Client:
     # Handle photo/document uploads in private (for state machine)
     @app.on_message(filters.private & (filters.photo | filters.document))
     async def private_media_handler(_, message: Message):
+        if not message.from_user:
+            return
         uid   = message.from_user.id
         state = get_state(uid)
         if state:
@@ -358,18 +370,49 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.group & ~filters.command(ALL_CMDS) & filters.text)
     async def group_text_search(_, message: Message):
+        if not message.from_user:
+            return  # Ignore channel posts / anonymous messages
         text = (message.text or "").strip()
         if len(text) < 3:
             return
-        anime = await find_anime_in_text(text)
-        if anime:
-            await send_anime_result(message, anime)
+        # Only search if: bot is mentioned, or message is a reply to bot, or /search cmd triggered
+        # To avoid responding to ALL group messages, check if bot is mentioned or it's a direct search
+        bot_mentioned = False
+        if message.entities:
+            for ent in message.entities:
+                if ent.type == enums.MessageEntityType.MENTION:
+                    mentioned_name = text[ent.offset:ent.offset + ent.length]
+                    me = await app.get_me()
+                    if mentioned_name.lstrip("@").lower() == (me.username or "").lower():
+                        bot_mentioned = True
+                        break
+        if message.reply_to_message and message.reply_to_message.from_user:
+            me = await app.get_me()
+            if message.reply_to_message.from_user.id == me.id:
+                bot_mentioned = True
+
+        if bot_mentioned:
+            # Remove bot mention from text for cleaner search
+            me = await app.get_me()
+            clean_text = re.sub(rf"@{re.escape(me.username or '')}", "", text, flags=re.IGNORECASE).strip()
+            anime = await find_anime_in_text(clean_text if clean_text else text)
+            if anime:
+                await send_anime_result(message, anime)
+            else:
+                await message.reply_text("❌ Anime not found. Try `/search [name]` or type exact anime name.")
+        else:
+            # Silent passive search — only reply if found (no error msg spam in GC)
+            anime = await find_anime_in_text(text)
+            if anime:
+                await send_anime_result(message, anime)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  /popular
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("popular"))
     async def cmd_popular(_, message: Message):
+        if not message.from_user:
+            return
         await register_user(message.from_user)
         if not await check_force_sub(message):
             return
@@ -385,6 +428,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("report"))
     async def cmd_report(_, message: Message):
+        if not message.from_user:
+            return
         await register_user(message.from_user)
         parts = message.text.split(None, 1)
         if len(parts) < 2:
@@ -410,6 +455,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("cancel"))
     async def cmd_cancel(_, message: Message):
+        if not message.from_user:
+            return
         clear_state(message.from_user.id)
         await message.reply_text("❌ Cancelled.")
 
@@ -418,6 +465,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("add_ani"))
     async def cmd_add_ani(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -435,6 +484,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("edit_ani"))
     async def cmd_edit_ani(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -446,6 +497,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("delete_ani"))
     async def cmd_delete_ani(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -457,6 +510,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("add_alias"))
     async def cmd_add_alias(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -468,6 +523,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("list"))
     async def cmd_list(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -487,6 +544,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("stats"))
     async def cmd_stats(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -507,6 +566,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("db_export"))
     async def cmd_db_export(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -544,6 +605,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("bulk"))
     async def cmd_bulk(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -564,6 +627,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("broadcast"))
     async def cmd_broadcast(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -575,6 +640,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("set_start_img"))
     async def cmd_set_start_img(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -586,6 +653,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("set_start_msg"))
     async def cmd_set_start_msg(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -600,6 +669,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("set_channel"))
     async def cmd_set_channel(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -639,6 +710,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("add_forcesub"))
     async def cmd_add_forcesub(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -660,6 +733,8 @@ def make_bot(cfg: dict) -> Client:
 
     @app.on_message(filters.command("rem_forcesub"))
     async def cmd_rem_forcesub(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -678,6 +753,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("set_welcome"))
     async def cmd_set_welcome(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -690,6 +767,8 @@ def make_bot(cfg: dict) -> Client:
 
     @app.on_message(filters.command("set_goodbye"))
     async def cmd_set_goodbye(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_admin(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -772,6 +851,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("add_admin"))
     async def cmd_add_admin(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_owner(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -786,6 +867,8 @@ def make_bot(cfg: dict) -> Client:
 
     @app.on_message(filters.command("remove_admin"))
     async def cmd_remove_admin(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_owner(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -800,6 +883,8 @@ def make_bot(cfg: dict) -> Client:
 
     @app.on_message(filters.command("addowner"))
     async def cmd_add_owner(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_super(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -814,6 +899,8 @@ def make_bot(cfg: dict) -> Client:
 
     @app.on_message(filters.command("removeowner"))
     async def cmd_remove_owner(_, message: Message):
+        if not message.from_user:
+            return
         if not await is_super(message.from_user.id):
             await message.reply_text(BAKA_MSG)
             return
@@ -835,6 +922,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("copy"))
     async def cmd_copy(_, message: Message):
+        if not message.from_user:
+            return
         uid = message.from_user.id
         if not (await is_super(uid) or await is_owner(uid)):
             await message.reply_text(BAKA_MSG)
@@ -920,6 +1009,8 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("delcopy"))
     async def cmd_delcopy(_, message: Message):
+        if not message.from_user:
+            return
         if not (await is_super(message.from_user.id) or await is_owner(message.from_user.id)):
             await message.reply_text(BAKA_MSG)
             return
