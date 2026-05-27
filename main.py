@@ -3,12 +3,25 @@
 ║       KENSHIN ANIME SEARCH BOT               ║
 ║  Pyrofork + MongoDB | Multi-instance ready   ║
 ╚══════════════════════════════════════════════╝
+
+CHANGES v2:
+• pyrogram → pyrofork (hydrogram)
+• /start: works without start_banner set (shows text-only)
+• /report: uses [] for code, removed <> entity that caused ENTITY_BOUNDS_INVALID
+• /add_ani: simplified 4-step flow → img → synopsis → watch_link → aliases
+• /copy: super-owner OR main-owner only
+• /set_start_img only — removed add_media / remove_media / list_media
+• blockquote synopsis in anime result (expandable)
+• Bulk TXT: img_link|synopsis|watch_link|aliases (one line per anime, no blank-block needed)
+• Multiple promo channels, force-sub channels
+• Group welcome/goodbye with image + placeholders
+• Private & group inline search (name in any sentence position)
 """
 
 import os, json, csv, io, asyncio, logging, re
 from datetime import datetime
-from pyrogram import Client, filters, enums, idle
-from pyrogram.types import (
+from hydrogram import Client, filters, enums
+from hydrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, ChatMemberUpdated
 )
@@ -21,44 +34,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CONFIG  —  reads env, supports multiple instances in same process
+#  CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-def load_instances():
-    """
-    Primary instance always comes from env vars.
-    Cloned instances are stored in MongoDB under db['instances'].
-    Returns list of dicts: {bot_token, session_name, db_name, original_owner_id}
-    """
-    primary = {
+def load_primary():
+    return {
         "bot_token":         os.environ["BOT_TOKEN"],
         "api_id":            int(os.environ["API_ID"]),
         "api_hash":          os.environ["API_HASH"],
-        "original_owner_id": 6728678197,
+        "original_owner_id": int(os.environ["ORIGINAL_OWNER_ID"]),
         "mongo_uri":         os.environ["MONGO_URI"],
         "session_name":      "kenshin_primary",
-        "db_name":           "Kenshinfileshere",
+        "db_name":           os.environ.get("DB_NAME", "kenshin_anime_bot"),
     }
-    return primary
 
-PRIMARY = load_instances()
+PRIMARY = load_primary()
 
-# ── Shared Mongo client ───────────────────────────────────────────────────────
-_mongo_client = AsyncIOMotorClient(PRIMARY["mongo_uri"])
+_mongo_client  = AsyncIOMotorClient(PRIMARY["mongo_uri"])
+instances_col  = _mongo_client["kenshin_meta"]["instances"]
 
 def get_db(db_name: str):
     return _mongo_client[db_name]
 
-# ── Primary DB collections ────────────────────────────────────────────────────
-primary_db    = get_db(PRIMARY["db_name"])
-instances_col = _mongo_client["kenshin_meta"]["instances"]   # stores clones
+RUNNING_CLONES: dict = {}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  BOT FACTORY  — creates a fully featured bot for any instance config
-# ═══════════════════════════════════════════════════════════════════════════════
 BAKA_MSG = "ʙᴀᴋᴀ ʏᴏᴜʀ ɴᴏᴛ ᴍʏ sᴇɴᴘᴀɪ  !!!"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BOT FACTORY
+# ═══════════════════════════════════════════════════════════════════════════════
 def make_bot(cfg: dict) -> Client:
-    """Build and wire a Pyrogram Client with all handlers for one instance."""
+    """Build and wire a Pyrofork Client with all handlers for one instance."""
 
     db                = get_db(cfg["db_name"])
     anime_col         = db["animes"]
@@ -74,12 +79,11 @@ def make_bot(cfg: dict) -> Client:
         bot_token = cfg["bot_token"],
     )
 
-    # ── per-instance state machine ───────────────────────────────────────────
+    # ── state machine ────────────────────────────────────────────────────────
     _states: dict = {}
-
-    def get_state(uid):  return _states.get(uid)
+    def get_state(uid):              return _states.get(uid)
     def set_state(uid, step, data=None): _states[uid] = {"step": step, "data": data or {}}
-    def clear_state(uid): _states.pop(uid, None)
+    def clear_state(uid):            _states.pop(uid, None)
 
     # ── settings helpers ─────────────────────────────────────────────────────
     async def gset(key, default=None):
@@ -87,10 +91,12 @@ def make_bot(cfg: dict) -> Client:
         return doc["value"] if doc else default
 
     async def sset(key, value):
-        await settings_col.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
+        await settings_col.update_one(
+            {"_id": key}, {"$set": {"value": value}}, upsert=True
+        )
 
     # ── role helpers ─────────────────────────────────────────────────────────
-    async def is_super(uid):   return uid == ORIGINAL_OWNER_ID
+    async def is_super(uid):  return uid == ORIGINAL_OWNER_ID
     async def is_owner(uid):
         if await is_super(uid): return True
         return bool(await staff_col.find_one({"_id": uid, "role": "owner"}))
@@ -100,7 +106,8 @@ def make_bot(cfg: dict) -> Client:
 
     async def all_staff_ids():
         ids = [ORIGINAL_OWNER_ID]
-        async for d in staff_col.find({}): ids.append(d["_id"])
+        async for d in staff_col.find({}):
+            ids.append(d["_id"])
         return list(set(ids))
 
     async def resolve_user(message: Message):
@@ -108,21 +115,21 @@ def make_bot(cfg: dict) -> Client:
             return message.reply_to_message.from_user
         parts = message.text.split()
         if len(parts) >= 2:
-            try: return await app.get_users(int(parts[1]))
+            try:   return await app.get_users(int(parts[1]))
             except Exception: pass
         return None
 
     async def register_user(user):
         await users_col.update_one(
             {"_id": user.id},
-            {"$set": {"username": user.username, "first_name": user.first_name,
-                      "last_seen": datetime.utcnow()}},
+            {"$set": {"username":   user.username,
+                      "first_name": user.first_name,
+                      "last_seen":  datetime.utcnow()}},
             upsert=True
         )
 
     # ── force-sub check ──────────────────────────────────────────────────────
     async def check_force_sub(message: Message) -> bool:
-        """Returns True if user passes force-sub, False + sends prompt if not."""
         channels = await gset("force_sub_channels", [])
         if not channels:
             return True
@@ -139,8 +146,10 @@ def make_bot(cfg: dict) -> Client:
                 failed.append(ch)
         if not failed:
             return True
-        btns = [[InlineKeyboardButton(f"📢 Join {ch}", url=f"https://t.me/{ch.lstrip('@')}")]
-                for ch in failed]
+        btns = [
+            [InlineKeyboardButton(f"📢 Join {ch}", url=f"https://t.me/{ch.lstrip('@')}")]
+            for ch in failed
+        ]
         btns.append([InlineKeyboardButton("✅ I Joined", callback_data="check_sub")])
         await message.reply_text(
             "⚠️ **Join required channels to use this bot!**",
@@ -148,27 +157,34 @@ def make_bot(cfg: dict) -> Client:
         )
         return False
 
-    # ── anime output builder (matches screenshot format) ─────────────────────
+    # ── anime output builder ─────────────────────────────────────────────────
     async def send_anime_result(message: Message, anime: dict):
-        channels  = await gset("promo_channels", [])   # list of @channel strings
+        """
+        Format (matches screenshot):
+        [IMAGE]
+        ✨ ANIME NAME ✨
+
+        > 📖 synopsis  (blockquote — expandable on tap)
+
+        ━━━━━━━━━━━━━━━━━━━━━━━━
+        📗 FOR MORE ANIME JOIN:
+        > 👉 @channel1
+        > 👉 @channel2
+
+        [🚀 DOWNLOAD / WATCH NOW 🚀]
+        """
+        channels  = await gset("promo_channels", [])
         watch_url = anime.get("watch_url") or "https://t.me/"
         name      = anime["name"]
         desc      = anime.get("description", "")
         image_id  = anime.get("image_file_id")
 
-        # ── promo lines ──────────────────────────────────────────────────────
         if channels:
-            promo_lines = "\n".join(f"👉 {ch}" for ch in channels)
-            promo_block = f"\n\n📗 **FOR MORE ANIME JOIN:**\n{promo_lines}"
+            ch_lines    = "\n".join(f"👉 {ch}" for ch in channels)
+            promo_block = f"\n\n━━━━━━━━━━━━━━━━━\n📗 **FOR MORE ANIME JOIN:**\n**>** {ch_lines}"
         else:
             promo_block = ""
 
-        # Caption format (matches screenshot):
-        # ✨ ANIME NAME ✨
-        # (blank line)
-        # blockquote synopsis
-        # (divider)
-        # promo block
         caption = (
             f"✨ **{name.upper()}** ✨\n\n"
             f"**>** 📖 {desc}"
@@ -179,38 +195,37 @@ def make_bot(cfg: dict) -> Client:
             InlineKeyboardButton("🚀 DOWNLOAD / WATCH NOW 🚀", url=watch_url)
         ]])
 
-        try:
-            if image_id:
+        if image_id:
+            try:
                 await message.reply_photo(
                     photo=image_id, caption=caption, reply_markup=keyboard
                 )
-            else:
-                await message.reply_text(caption, reply_markup=keyboard)
-        except Exception as e:
-            logger.error(f"send_anime_result error: {e}")
-            try:
-                await message.reply_text(caption, reply_markup=keyboard)
-            except Exception as e2:
-                logger.error(f"fallback error: {e2}")
+                return
+            except Exception as e:
+                logger.error(f"send_anime_result photo error: {e}")
+        try:
+            await message.reply_text(caption, reply_markup=keyboard)
+        except Exception as e2:
+            logger.error(f"send_anime_result text fallback error: {e2}")
 
     # ── search helper ────────────────────────────────────────────────────────
     async def find_anime_in_text(text: str):
-        """Find first anime whose name or alias appears anywhere in text."""
-        # Try exact full-text first
+        """Find anime whose name or alias appears anywhere in text."""
+        tl = text.lower()
+        # Try regex match first (name/alias anywhere in text)
         anime = await anime_col.find_one({
             "$or": [
-                {"name_lower":    {"$regex": re.escape(text.lower()), "$options": "i"}},
-                {"aliases_lower": {"$regex": re.escape(text.lower()), "$options": "i"}}
+                {"name_lower":    {"$regex": re.escape(tl), "$options": "i"}},
+                {"aliases_lower": {"$regex": re.escape(tl), "$options": "i"}}
             ]
         })
         if anime:
             return anime
-        # Try to find any known anime name/alias as substring of the message
-        words = text.lower()
+        # Substring scan: does the text contain any known anime name/alias?
         async for a in anime_col.find({}):
-            check = [a.get("name_lower", "")] + (a.get("aliases_lower") or [])
-            for term in check:
-                if term and len(term) >= 3 and term in words:
+            terms = [a.get("name_lower", "")] + (a.get("aliases_lower") or [])
+            for term in terms:
+                if term and len(term) >= 3 and term in tl:
                     return a
         return None
 
@@ -220,20 +235,26 @@ def make_bot(cfg: dict) -> Client:
     @app.on_message(filters.command("start") & filters.private)
     async def cmd_start(_, message: Message):
         await register_user(message.from_user)
-        if not await check_force_sub(message): return
-        welcome = await gset(
-            "welcome_message",
+        if not await check_force_sub(message):
+            return
+
+        default_welcome = (
             "👋 **Welcome to Kenshin Anime Search Bot!**\n\n"
             "🎌 Search any anime — just type its name!\n"
             "📋 /help for all commands"
         )
+        welcome   = await gset("welcome_message", default_welcome)
         start_img = await gset("start_banner", None)
+
         if start_img:
             try:
                 await message.reply_photo(photo=start_img, caption=welcome)
                 return
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Start banner send failed ({e}), clearing banner.")
                 await sset("start_banner", None)
+
+        # No banner or banner failed → text only (no error)
         await message.reply_text(welcome)
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -246,11 +267,11 @@ def make_bot(cfg: dict) -> Client:
             "📋 **KENSHIN ANIME BOT — COMMANDS**\n\n"
             "**👤 User:**\n"
             "/start — Welcome message\n"
-            "/search <name> — Search anime\n"
-            "/popular — Top rated animes\n"
-            "/report <msg> — Report issue\n\n"
+            "/search [name] — Search anime\n"
+            "/popular — Anime list\n"
+            "/report [msg] — Report issue\n\n"
             "**🛡️ Admin:**\n"
-            "/add_ani — Add anime (4 steps)\n"
+            "/add_ani — Add anime (4 steps: img→synopsis→link→aliases)\n"
             "/edit_ani — Edit anime\n"
             "/delete_ani — Delete anime\n"
             "/add_alias — Add aliases\n"
@@ -259,67 +280,79 @@ def make_bot(cfg: dict) -> Client:
             "/db_export [json|csv] — Export DB\n"
             "/bulk — Bulk import (.json/.txt)\n"
             "/broadcast — Message all users\n"
-            "/set_start_img — Set start image\n"
+            "/set_start_img — Set start banner image\n"
             "/set_start_msg — Set welcome text\n"
-            "/set_welcome — Group welcome msg+img\n"
-            "/set_goodbye — Group goodbye msg+img\n"
-            "/set_channel — Set promo channels\n"
+            "/set_welcome — Group welcome msg + img\n"
+            "/set_goodbye — Group goodbye msg + img\n"
+            "/set_channel — Manage promo channels\n"
             "/add_forcesub — Add force-sub channel\n"
             "/rem_forcesub — Remove force-sub channel\n"
-            "/cancel — Cancel operation\n\n"
+            "/cancel — Cancel current operation\n\n"
             "**👑 Owner:**\n"
-            "/add_admin — Add admin\n"
+            "/add_admin — Promote to admin\n"
             "/remove_admin — Remove admin\n"
-            "/addowner — Add owner\n"
+            "/addowner — Promote to owner\n"
             "/removeowner — Remove owner\n\n"
-            "**⚡ Super Owner only:**\n"
-            "/copy <token> — Clone this bot (new token, same owner, separate DB)\n\n"
-            "**📝 Bulk format (.txt):**\n"
-            "One per line: `img_url|synopsis|watch_link|alias1,alias2`\n"
-            "Name is first line or inside JSON as `name` field."
+            "**⚡ Super / Main Owner only:**\n"
+            "/copy [token] — Clone bot (same owner, separate DB)\n"
+            "/delcopy [bot_id] — Remove clone\n\n"
+            "**📝 Bulk TXT format** (one anime per line):\n"
+            "`Anime Name | img_url | synopsis | watch_link | alias1,alias2`\n\n"
+            "**Placeholders for welcome/goodbye:**\n"
+            "`{name}` `{first_name}` `{last_name}` `{mention}` `{id}` `{chat}`"
         )
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  /search  (also works in private)
+    #  /search
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("search"))
     async def cmd_search(_, message: Message):
         await register_user(message.from_user)
-        if not await check_force_sub(message): return
+        if not await check_force_sub(message):
+            return
         parts = message.text.split(None, 1)
         if len(parts) < 2:
-            await message.reply_text("Usage: /search <anime name>"); return
+            await message.reply_text("Usage: /search [anime name]")
+            return
         anime = await find_anime_in_text(parts[1].strip())
         if anime:
             await send_anime_result(message, anime)
+        else:
+            await message.reply_text("❌ Anime not found. Try another name or alias.")
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  Text in private — search by name/alias in any position in text
+    #  Private text — search by name/alias anywhere in text
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.private & ~filters.command([]) & filters.text)
     async def private_text_search(_, message: Message):
         uid   = message.from_user.id
         state = get_state(uid)
         if state:
-            await state_handler_fn(message); return
+            await state_handler_fn(message)
+            return
         await register_user(message.from_user)
-        if not await check_force_sub(message): return
-        text  = (message.text or "").strip()
-        anime = await find_anime_in_text(text)
+        if not await check_force_sub(message):
+            return
+        anime = await find_anime_in_text((message.text or "").strip())
         if anime:
             await send_anime_result(message, anime)
+
+    # Handle photo uploads in private (for state machine — e.g. adding anime image)
+    @app.on_message(filters.private & filters.photo)
+    async def private_photo_handler(_, message: Message):
+        uid   = message.from_user.id
+        state = get_state(uid)
+        if state:
+            await state_handler_fn(message)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Group text — detect anime name/alias anywhere in sentence
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.group & ~filters.command([]) & filters.text)
     async def group_text_search(_, message: Message):
-        uid   = message.from_user.id
-        state = get_state(uid)
-        if state:
-            await state_handler_fn(message); return
-        text  = (message.text or "").strip()
-        if len(text) < 3: return
+        text = (message.text or "").strip()
+        if len(text) < 3:
+            return
         anime = await find_anime_in_text(text)
         if anime:
             await send_anime_result(message, anime)
@@ -330,32 +363,38 @@ def make_bot(cfg: dict) -> Client:
     @app.on_message(filters.command("popular"))
     async def cmd_popular(_, message: Message):
         await register_user(message.from_user)
-        if not await check_force_sub(message): return
+        if not await check_force_sub(message):
+            return
         animes = await anime_col.find({}).sort("name", 1).limit(15).to_list(15)
         if not animes:
-            await message.reply_text("📭 No animes yet!"); return
+            await message.reply_text("📭 No animes yet!")
+            return
         lines = "\n".join(f"{i+1}. **{a['name']}**" for i, a in enumerate(animes))
         await message.reply_text(f"🌟 **Anime List (Top 15):**\n\n{lines}")
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  /report
+    #  /report  — uses [] instead of <> to avoid ENTITY_BOUNDS_INVALID
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("report"))
     async def cmd_report(_, message: Message):
         await register_user(message.from_user)
         parts = message.text.split(None, 1)
         if len(parts) < 2:
-            await message.reply_text("Usage: /report <your message>"); return
+            await message.reply_text("Usage: /report [your message]")
+            return
         user   = message.from_user
+        uname  = f"@{user.username}" if user.username else "N/A"
         notify = (
-            f"🚨 New Report\n\n"
-            f"From: {user.first_name} (@{user.username or 'N/A'}) "
-            f"[ID: <{user.id}>]\n"
+            f"🚨 **New Report**\n\n"
+            f"From: {user.first_name} [{uname}]\n"
+            f"ID: [{user.id}]\n"
             f"Message: {parts[1]}"
         )
         for sid in await all_staff_ids():
-            try: await app.send_message(sid, notify)
-            except Exception: pass
+            try:
+                await app.send_message(sid, notify)
+            except Exception:
+                pass
         await message.reply_text("✅ Report sent to admins!")
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -363,24 +402,24 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("cancel"))
     async def cmd_cancel(_, message: Message):
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
         clear_state(message.from_user.id)
         await message.reply_text("❌ Cancelled.")
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  /add_ani  —  4 steps: image → synopsis → watch link → aliases
+    #  /add_ani — 4 steps: img → synopsis → watch_link → aliases
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("add_ani"))
     async def cmd_add_ani(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         set_state(message.from_user.id, "ani_img")
         await message.reply_text(
             "➕ **Add Anime — Step 1/4**\n\n"
-            "Send the **anime image** (photo) or an image URL.\n"
-            "You can add the anime **name** as the photo caption.\n"
-            "Type SKIP to add without image.\n\n/cancel to abort."
+            "📸 Send the **anime image** (photo) or an image URL.\n"
+            "• Caption the photo with the anime name (optional)\n"
+            "• Or type SKIP to continue without image\n\n"
+            "/cancel to abort."
         )
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -389,7 +428,8 @@ def make_bot(cfg: dict) -> Client:
     @app.on_message(filters.command("edit_ani"))
     async def cmd_edit_ani(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         set_state(message.from_user.id, "edit_name")
         await message.reply_text("✏️ Send the anime **name** to edit:")
 
@@ -399,7 +439,8 @@ def make_bot(cfg: dict) -> Client:
     @app.on_message(filters.command("delete_ani"))
     async def cmd_delete_ani(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         set_state(message.from_user.id, "del_name")
         await message.reply_text("🗑️ Send anime **name** to delete:")
 
@@ -409,7 +450,8 @@ def make_bot(cfg: dict) -> Client:
     @app.on_message(filters.command("add_alias"))
     async def cmd_add_alias(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         set_state(message.from_user.id, "alias_name")
         await message.reply_text("🔤 Send anime **name** to add aliases to:")
 
@@ -419,14 +461,16 @@ def make_bot(cfg: dict) -> Client:
     @app.on_message(filters.command("list"))
     async def cmd_list(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        animes = await anime_col.find({}, {"name":1}).sort("name", 1).to_list(None)
+            await message.reply_text(BAKA_MSG)
+            return
+        animes = await anime_col.find({}, {"name": 1}).sort("name", 1).to_list(None)
         if not animes:
-            await message.reply_text("📭 Empty database."); return
+            await message.reply_text("📭 Empty database.")
+            return
         lines = [f"{i+1}. {a['name']}" for i, a in enumerate(animes)]
         for i in range(0, len(lines), 50):
             await message.reply_text(
-                f"📋 **List ({i+1}–{min(i+50,len(lines))}):**\n\n" +
+                f"📋 **List ({i+1}–{min(i+50, len(lines))}):**\n\n" +
                 "\n".join(lines[i:i+50])
             )
 
@@ -436,17 +480,18 @@ def make_bot(cfg: dict) -> Client:
     @app.on_message(filters.command("stats"))
     async def cmd_stats(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         ta = await anime_col.count_documents({})
         tu = await users_col.count_documents({})
-        ad = await staff_col.count_documents({"role":"admin"})
-        ow = await staff_col.count_documents({"role":"owner"})
+        ad = await staff_col.count_documents({"role": "admin"})
+        ow = await staff_col.count_documents({"role": "owner"})
         await message.reply_text(
             f"📊 **Stats**\n\n"
             f"🎌 Animes: {ta}\n"
             f"👤 Users: {tu}\n"
             f"🛡️ Admins: {ad}\n"
-            f"👑 Owners: {ow+1}"
+            f"👑 Owners: {ow + 1}"
         )
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -455,54 +500,55 @@ def make_bot(cfg: dict) -> Client:
     @app.on_message(filters.command("db_export"))
     async def cmd_db_export(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         args = message.text.split()
         fmt  = args[1].lower() if len(args) > 1 else "json"
+
         def clean(d):
             d.pop("_id", None)
             if "added_at" in d and hasattr(d["added_at"], "isoformat"):
                 d["added_at"] = d["added_at"].isoformat()
             return d
+
         animes = [clean(a) async for a in anime_col.find({})]
         ts     = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
         if fmt == "csv":
             out = io.StringIO()
             if animes:
                 w = csv.DictWriter(out, fieldnames=animes[0].keys())
-                w.writeheader(); w.writerows(animes)
-            bio = io.BytesIO(out.getvalue().encode())
+                w.writeheader()
+                w.writerows(animes)
+            bio      = io.BytesIO(out.getvalue().encode())
             bio.name = f"kenshin_backup_{ts}.csv"
             await message.reply_document(bio, caption="📤 CSV Export")
         else:
-            bio = io.BytesIO(json.dumps(animes, ensure_ascii=False, indent=2,
-                                        default=str).encode())
+            bio      = io.BytesIO(
+                json.dumps(animes, ensure_ascii=False, indent=2, default=str).encode()
+            )
             bio.name = f"kenshin_backup_{ts}.json"
             await message.reply_document(bio, caption="📤 JSON Export")
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  /bulk  —  format: name\nimg_url|synopsis|watch_link|alias1,alias2
-    #  JSON format same as before
+    #  /bulk — format: Name|img_url|synopsis|watch_link|alias1,alias2
+    #  One anime per line (TXT) or JSON array
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("bulk"))
     async def cmd_bulk(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         set_state(message.from_user.id, "bulk_file")
         await message.reply_text(
             "📦 **Bulk Import**\n\n"
             "Send a **.txt** or **.json** file.\n\n"
-            "**TXT format** — blocks separated by blank lines:\n"
-            "```\n"
-            "Anime Name\n"
-            "img_url|synopsis|watch_link|alias1,alias2\n"
-            "\n"
-            "Next Anime\n"
-            "img_url|synopsis|watch_link|\n"
-            "```\n\n"
+            "**TXT format** — one anime per line:\n"
+            "`Name | img_url | synopsis | watch_link | alias1,alias2`\n\n"
+            "Example:\n"
+            "`One Piece | https://img.url/op.jpg | Luffy sets sail... | https://watch.link | OP,ワンピース`\n\n"
             "**JSON format** — array:\n"
-            "```json\n"
-            '[{"name":"One Piece","image_url":"https://...","description":"...","watch_url":"https://...","aliases":["OP"]}]\n'
-            "```"
+            '`[{"name":"One Piece","image_url":"...","description":"...","watch_url":"...","aliases":["OP"]}]`'
         )
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -511,19 +557,21 @@ def make_bot(cfg: dict) -> Client:
     @app.on_message(filters.command("broadcast"))
     async def cmd_broadcast(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         set_state(message.from_user.id, "bcast")
         await message.reply_text("📢 Send broadcast message:")
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  /set_start_img
+    #  /set_start_img  (only this — no add/remove/list media cmds)
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("set_start_img"))
     async def cmd_set_start_img(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         set_state(message.from_user.id, "set_start_img")
-        await message.reply_text("🖼️ Send the start banner image:")
+        await message.reply_text("🖼️ Send the start banner image (photo):")
 
     # ═══════════════════════════════════════════════════════════════════════
     #  /set_start_msg
@@ -531,17 +579,22 @@ def make_bot(cfg: dict) -> Client:
     @app.on_message(filters.command("set_start_msg"))
     async def cmd_set_start_msg(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         set_state(message.from_user.id, "set_start_msg")
-        await message.reply_text("✏️ Send the new welcome message text:")
+        await message.reply_text(
+            "✏️ Send the new welcome message text.\n\n"
+            "Placeholders: `{name}` `{first_name}` `{mention}` `{id}`"
+        )
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  /set_channel — manage promo channels list
+    #  /set_channel — manage promo channels
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("set_channel"))
     async def cmd_set_channel(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         parts = message.text.split(None, 1)
         if len(parts) < 2:
             channels = await gset("promo_channels", [])
@@ -552,22 +605,24 @@ def make_bot(cfg: dict) -> Client:
                 "/set_channel add @channel\n"
                 "/set_channel remove @channel\n"
                 "/set_channel clear"
-            ); return
-        action = parts[1].strip()
+            )
+            return
+        action   = parts[1].strip()
         channels = await gset("promo_channels", [])
         if action == "clear":
             await sset("promo_channels", [])
             await message.reply_text("✅ All promo channels cleared.")
         elif action.startswith("add "):
             ch = action[4:].strip()
-            if ch not in channels: channels.append(ch)
+            if ch not in channels:
+                channels.append(ch)
             await sset("promo_channels", channels)
-            await message.reply_text(f"✅ Added {ch}")
+            await message.reply_text(f"✅ Added: {ch}")
         elif action.startswith("remove "):
             ch = action[7:].strip()
             channels = [c for c in channels if c != ch]
             await sset("promo_channels", channels)
-            await message.reply_text(f"✅ Removed {ch}")
+            await message.reply_text(f"✅ Removed: {ch}")
         else:
             await message.reply_text("Unknown action. Use: add / remove / clear")
 
@@ -577,7 +632,8 @@ def make_bot(cfg: dict) -> Client:
     @app.on_message(filters.command("add_forcesub"))
     async def cmd_add_forcesub(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         parts = message.text.split()
         if len(parts) < 2:
             channels = await gset("force_sub_channels", [])
@@ -585,20 +641,24 @@ def make_bot(cfg: dict) -> Client:
             await message.reply_text(
                 f"🔒 **Force Sub Channels:**\n{ch_list}\n\n"
                 "Usage: /add_forcesub @channel"
-            ); return
+            )
+            return
         ch       = parts[1].strip()
         channels = await gset("force_sub_channels", [])
-        if ch not in channels: channels.append(ch)
+        if ch not in channels:
+            channels.append(ch)
         await sset("force_sub_channels", channels)
         await message.reply_text(f"✅ Force sub added: {ch}")
 
     @app.on_message(filters.command("rem_forcesub"))
     async def cmd_rem_forcesub(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         parts = message.text.split()
         if len(parts) < 2:
-            await message.reply_text("Usage: /rem_forcesub @channel"); return
+            await message.reply_text("Usage: /rem_forcesub @channel")
+            return
         ch       = parts[1].strip()
         channels = await gset("force_sub_channels", [])
         channels = [c for c in channels if c != ch]
@@ -611,22 +671,25 @@ def make_bot(cfg: dict) -> Client:
     @app.on_message(filters.command("set_welcome"))
     async def cmd_set_welcome(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         set_state(message.from_user.id, "set_welcome_text")
         await message.reply_text(
             "✏️ Send welcome text.\n\n"
-            "Placeholders: {name} {first_name} {mention} {id} {chat}\n\n"
-            "After text, you can send an image too."
+            "Placeholders: `{name}` `{first_name}` `{last_name}` `{mention}` `{id}` `{chat}`\n\n"
+            "After sending text, you'll be asked for an optional image."
         )
 
     @app.on_message(filters.command("set_goodbye"))
     async def cmd_set_goodbye(_, message: Message):
         if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         set_state(message.from_user.id, "set_goodbye_text")
         await message.reply_text(
             "✏️ Send goodbye text.\n\n"
-            "Placeholders: {name} {first_name} {mention} {id} {chat}"
+            "Placeholders: `{name}` `{first_name}` `{last_name}` `{mention}` `{id}` `{chat}`\n\n"
+            "After sending text, you'll be asked for an optional image."
         )
 
     def fmt_text(tmpl, user, chat_title):
@@ -636,7 +699,7 @@ def make_bot(cfg: dict) -> Client:
             .replace("{name}",       f"{fn} {ln}".strip())
             .replace("{first_name}", fn)
             .replace("{last_name}",  ln)
-            .replace("{mention}",    user.mention or fn)
+            .replace("{mention}",    f"@{user.username}" if user.username else fn)
             .replace("{id}",         str(user.id))
             .replace("{chat}",       chat_title or ""))
 
@@ -648,40 +711,51 @@ def make_bot(cfg: dict) -> Client:
         try:
             old = update.old_chat_member.status if update.old_chat_member else None
             new = update.new_chat_member.status if update.new_chat_member else None
-            joined = (new in (enums.ChatMemberStatus.MEMBER,
-                               enums.ChatMemberStatus.ADMINISTRATOR)
-                      and old in (enums.ChatMemberStatus.LEFT,
-                                  enums.ChatMemberStatus.BANNED, None))
-            left   = (old in (enums.ChatMemberStatus.MEMBER,
-                               enums.ChatMemberStatus.ADMINISTRATOR)
-                      and new in (enums.ChatMemberStatus.LEFT,
-                                  enums.ChatMemberStatus.BANNED))
+
+            joined = (
+                new in (enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR)
+                and old in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED, None)
+            )
+            left = (
+                old in (enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR)
+                and new in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED)
+            )
+
             if joined:
                 user   = update.new_chat_member.user
-                tmpl   = await gset("group_welcome",
-                    "👋 Welcome {mention} to **{chat}**!\n🎌 Type any anime name to search!")
+                tmpl   = await gset(
+                    "group_welcome",
+                    "👋 Welcome {mention} to **{chat}**!\n🎌 Type any anime name to search!"
+                )
                 text   = fmt_text(tmpl, user, update.chat.title or "")
                 img_id = await gset("welcome_img", None)
-                kb     = InlineKeyboardMarkup([[
+                kb = InlineKeyboardMarkup([[
                     InlineKeyboardButton("👋 Say Hi!", url=f"tg://user?id={user.id}")
                 ]])
                 if img_id:
                     try:
                         await app.send_photo(update.chat.id, img_id, caption=text, reply_markup=kb)
                         return
-                    except Exception: pass
+                    except Exception:
+                        pass
                 await app.send_message(update.chat.id, text, reply_markup=kb)
+
             elif left:
                 user   = update.old_chat_member.user
-                tmpl   = await gset("group_goodbye",
-                    "👋 **{name}** has left **{chat}**. Sayonara! 🎌")
+                tmpl   = await gset(
+                    "group_goodbye",
+                    "👋 **{name}** has left **{chat}**. Sayonara! 🎌"
+                )
                 text   = fmt_text(tmpl, user, update.chat.title or "")
                 img_id = await gset("goodbye_img", None)
                 if img_id:
                     try:
-                        await app.send_photo(update.chat.id, img_id, caption=text); return
-                    except Exception: pass
+                        await app.send_photo(update.chat.id, img_id, caption=text)
+                        return
+                    except Exception:
+                        pass
                 await app.send_message(update.chat.id, text)
+
         except Exception as e:
             logger.error(f"member_update: {e}")
 
@@ -691,80 +765,98 @@ def make_bot(cfg: dict) -> Client:
     @app.on_message(filters.command("add_admin"))
     async def cmd_add_admin(_, message: Message):
         if not await is_owner(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         t = await resolve_user(message)
-        if not t: await message.reply_text("Reply to user or /add_admin <id>"); return
-        await staff_col.update_one({"_id": t.id},
-            {"$set": {"role":"admin","name":t.first_name}}, upsert=True)
+        if not t:
+            await message.reply_text("Reply to user or /add_admin [id]")
+            return
+        await staff_col.update_one(
+            {"_id": t.id}, {"$set": {"role": "admin", "name": t.first_name}}, upsert=True
+        )
         await message.reply_text(f"✅ **{t.first_name}** is now admin!")
 
     @app.on_message(filters.command("remove_admin"))
     async def cmd_remove_admin(_, message: Message):
         if not await is_owner(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         t = await resolve_user(message)
-        if not t: await message.reply_text("Reply to user or /remove_admin <id>"); return
+        if not t:
+            await message.reply_text("Reply to user or /remove_admin [id]")
+            return
         r = await staff_col.delete_one({"_id": t.id, "role": "admin"})
-        await message.reply_text("✅ Removed from admins." if r.deleted_count
-                                  else "That user is not an admin.")
+        await message.reply_text(
+            "✅ Removed from admins." if r.deleted_count else "That user is not an admin."
+        )
 
     @app.on_message(filters.command("addowner"))
     async def cmd_add_owner(_, message: Message):
         if not await is_super(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         t = await resolve_user(message)
-        if not t: await message.reply_text("Reply to user or /addowner <id>"); return
-        await staff_col.update_one({"_id": t.id},
-            {"$set": {"role":"owner","name":t.first_name}}, upsert=True)
+        if not t:
+            await message.reply_text("Reply to user or /addowner [id]")
+            return
+        await staff_col.update_one(
+            {"_id": t.id}, {"$set": {"role": "owner", "name": t.first_name}}, upsert=True
+        )
         await message.reply_text(f"✅ **{t.first_name}** is now owner!")
 
     @app.on_message(filters.command("removeowner"))
     async def cmd_remove_owner(_, message: Message):
         if not await is_super(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+            await message.reply_text(BAKA_MSG)
+            return
         t = await resolve_user(message)
-        if not t: await message.reply_text("Reply to user or /removeowner <id>"); return
+        if not t:
+            await message.reply_text("Reply to user or /removeowner [id]")
+            return
         if t.id == ORIGINAL_OWNER_ID:
-            await message.reply_text("Cannot remove super owner!"); return
+            await message.reply_text("Cannot remove super owner!")
+            return
         r = await staff_col.delete_one({"_id": t.id, "role": "owner"})
-        await message.reply_text("✅ Removed from owners." if r.deleted_count
-                                  else "That user is not an owner.")
+        await message.reply_text(
+            "✅ Removed from owners." if r.deleted_count else "That user is not an owner."
+        )
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  /copy  —  super owner only
-    #  Clones this bot: stores new token+dbname in MongoDB,
-    #  starts a new Client in the SAME PROCESS — no extra deploy needed.
+    #  /copy — super owner OR main owner only
+    #  Clones this bot in-process: new token, same ORIGINAL_OWNER_ID, separate DB
     # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("copy"))
     async def cmd_copy(_, message: Message):
-        if not (await is_super(message.from_user.id) or
-                await is_owner(message.from_user.id)):
-            await message.reply_text(BAKA_MSG); return
+        uid = message.from_user.id
+        if not (await is_super(uid) or await is_owner(uid)):
+            await message.reply_text(BAKA_MSG)
+            return
 
         parts = message.text.split(None, 1)
         if len(parts) < 2:
             await message.reply_text(
                 "⚡ **Clone Bot**\n\n"
-                "Usage: /copy <NEW_BOT_TOKEN>\n\n"
-                "• Creates a new bot instance inside this same process\n"
-                "• Separate DB — all settings/animes need to be configured fresh\n"
-                "• Same super owner\n"
-                "• Clone persists across restarts (stored in DB)\n"
-                "• Clone is destroyed with /delcopy <bot_id>"
-            ); return
+                "Usage: /copy [NEW_BOT_TOKEN]\n\n"
+                "• New bot, same super owner, separate DB\n"
+                "• Runs inside this same process — no extra deploy\n"
+                "• All settings/animes start fresh\n"
+                "• Persists across restarts\n"
+                "• Remove with: /delcopy [bot_id]"
+            )
+            return
 
         new_token = parts[1].strip()
         tparts    = new_token.split(":")
         if len(tparts) != 2 or not tparts[0].isdigit():
-            await message.reply_text("Invalid token format."); return
+            await message.reply_text("Invalid token format.")
+            return
         new_bot_id = tparts[0]
 
-        # Check not already cloned
         existing = await instances_col.find_one({"bot_id": new_bot_id})
         if existing:
-            await message.reply_text("This token is already cloned!"); return
+            await message.reply_text("This token is already cloned!")
+            return
 
-        # Validate token
         status_msg = await message.reply_text("🔄 Validating token and starting clone…")
         try:
             import aiohttp
@@ -775,11 +867,12 @@ def make_bot(cfg: dict) -> Client:
                 ) as r:
                     res = await r.json()
             if not res.get("ok"):
-                await status_msg.edit_text(
-                    f"Token invalid: {res.get('description')}"); return
+                await status_msg.edit_text(f"Token invalid: {res.get('description')}")
+                return
             new_username = res["result"].get("username", new_bot_id)
         except Exception as e:
-            await status_msg.edit_text(f"Token check failed: {e}"); return
+            await status_msg.edit_text(f"Token check failed: {e}")
+            return
 
         clone_cfg = {
             "bot_token":         new_token,
@@ -792,39 +885,50 @@ def make_bot(cfg: dict) -> Client:
             clone_app = make_bot(clone_cfg)
             await clone_app.start()
             RUNNING_CLONES[new_bot_id] = clone_app
-            # Persist so it restarts next boot
             await instances_col.update_one(
                 {"bot_id": new_bot_id},
-                {"$set": {**clone_cfg, "username": new_username,
-                           "created_by": message.from_user.id,
-                           "created_at": datetime.utcnow()}},
+                {"$set": {
+                    **clone_cfg,
+                    "bot_id":     new_bot_id,
+                    "username":   new_username,
+                    "created_by": uid,
+                    "created_at": datetime.utcnow()
+                }},
                 upsert=True
             )
             await status_msg.edit_text(
                 f"✅ **@{new_username} is now live!**\n\n"
                 f"• Runs in same process as this bot\n"
                 f"• Has its own separate database\n"
-                f"• Same super owner: you\n"
-                f"• All settings/animes are empty — configure fresh\n"
-                f"• To stop clone: /delcopy {new_bot_id}"
+                f"• Same super owner\n"
+                f"• Settings/animes are empty — configure fresh\n"
+                f"• To stop: /delcopy {new_bot_id}"
             )
         except Exception as e:
             await status_msg.edit_text(f"❌ Failed to start clone: {e}")
 
+    # ═══════════════════════════════════════════════════════════════════════
+    #  /delcopy
+    # ═══════════════════════════════════════════════════════════════════════
     @app.on_message(filters.command("delcopy"))
     async def cmd_delcopy(_, message: Message):
-        if not await is_super(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+        if not (await is_super(message.from_user.id) or await is_owner(message.from_user.id)):
+            await message.reply_text(BAKA_MSG)
+            return
         parts = message.text.split()
         if len(parts) < 2:
             clones = [c async for c in instances_col.find({})]
             if not clones:
-                await message.reply_text("No clones running."); return
+                await message.reply_text("No clones running.")
+                return
             lines = "\n".join(
-                f"• @{c.get('username','?')} — ID: {c['bot_id']}" for c in clones)
-            await message.reply_text(f"🤖 **Active clones:**\n{lines}\n\nUsage: /delcopy <bot_id>")
+                f"• @{c.get('username', '?')} — ID: {c['bot_id']}" for c in clones
+            )
+            await message.reply_text(
+                f"🤖 **Active clones:**\n{lines}\n\nUsage: /delcopy [bot_id]"
+            )
             return
-        bid = parts[1].strip()
+        bid       = parts[1].strip()
         clone_app = RUNNING_CLONES.pop(bid, None)
         if clone_app:
             try: await clone_app.stop()
@@ -839,8 +943,8 @@ def make_bot(cfg: dict) -> Client:
     async def cb_handler(_, query: CallbackQuery):
         data = query.data
         uid  = query.from_user.id
+
         if data == "check_sub":
-            # Re-check force sub
             channels = await gset("force_sub_channels", [])
             failed   = []
             for ch in channels:
@@ -856,32 +960,38 @@ def make_bot(cfg: dict) -> Client:
                 await query.answer("✅ Access granted!", show_alert=True)
             else:
                 await query.answer("❌ Still not joined all channels!", show_alert=True)
+
         elif data.startswith("del_confirm_"):
             if not await is_admin(uid):
-                await query.answer(BAKA_MSG, show_alert=True); return
+                await query.answer(BAKA_MSG, show_alert=True)
+                return
             from bson import ObjectId
             aid   = ObjectId(data.replace("del_confirm_", ""))
             anime = await anime_col.find_one({"_id": aid})
             await anime_col.delete_one({"_id": aid})
             clear_state(uid)
             await query.message.edit_text(
-                f"✅ **{anime['name'] if anime else 'Anime'}** deleted!")
+                f"✅ **{anime['name'] if anime else 'Anime'}** deleted!"
+            )
+
         elif data == "del_cancel":
             clear_state(uid)
             await query.message.edit_text("❌ Cancelled.")
+
         await query.answer()
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  STATE HANDLER (shared by private_text_search and group_text_search)
+    #  STATE HANDLER
     # ═══════════════════════════════════════════════════════════════════════
     async def state_handler_fn(message: Message):
         uid  = message.from_user.id
         s    = get_state(uid)
-        if not s: return
+        if not s:
+            return
         step = s["step"]
         data = s["data"]
 
-        # ── ADD ANIME ──────────────────────────────────────────────────────
+        # ── ADD ANIME: step 1 — image ──────────────────────────────────────
         if step == "ani_img":
             if message.photo:
                 data["image_file_id"] = message.photo.file_id
@@ -895,42 +1005,52 @@ def make_bot(cfg: dict) -> Client:
             else:
                 await message.reply_text(
                     "Send a photo (caption = anime name), an image URL, or SKIP."
-                ); return
-            set_state(uid, "ani_name" if not data.get("name") else "ani_synopsis", data)
+                )
+                return
+
             if data.get("name"):
+                set_state(uid, "ani_synopsis", data)
                 await message.reply_text(
-                    f"✅ Image set! Name detected: **{data['name']}**\n\n"
-                    "Step 2/4 — Send **synopsis** (description):"
+                    f"✅ Image set! Name: **{data['name']}**\n\n"
+                    "📝 **Step 2/4** — Send the **synopsis** (description):"
                 )
             else:
-                await message.reply_text("Step 1b — Send the **anime name**:")
+                set_state(uid, "ani_name", data)
+                await message.reply_text("📝 **Step 1b** — Send the **anime name**:")
 
+        # ── ADD ANIME: step 1b — name (if not in caption) ─────────────────
         elif step == "ani_name":
             data["name"] = message.text.strip()
             set_state(uid, "ani_synopsis", data)
-            await message.reply_text("Step 2/4 — Send **synopsis** (description):")
+            await message.reply_text("📝 **Step 2/4** — Send the **synopsis** (description):")
 
+        # ── ADD ANIME: step 2 — synopsis ──────────────────────────────────
         elif step == "ani_synopsis":
             data["description"] = message.text.strip()
             set_state(uid, "ani_watchlink", data)
-            await message.reply_text("Step 3/4 — Send **Watch/Download link** (URL):")
-
-        elif step == "ani_watchlink":
-            text = message.text.strip() if message.text else ""
-            data["watch_url"] = "" if text.upper() == "SKIP" else text
-            set_state(uid, "ani_aliases", data)
             await message.reply_text(
-                "Step 4/4 — Send **aliases** (comma-separated).\n"
-                "e.g. OP, One P, ワンピース\n"
+                "🔗 **Step 3/4** — Send the **Watch / Download link** (URL):\n"
                 "Type SKIP if none."
             )
 
+        # ── ADD ANIME: step 3 — watch link ────────────────────────────────
+        elif step == "ani_watchlink":
+            text = (message.text or "").strip()
+            data["watch_url"] = "" if text.upper() == "SKIP" else text
+            set_state(uid, "ani_aliases", data)
+            await message.reply_text(
+                "🏷️ **Step 4/4** — Send **aliases** (comma-separated).\n"
+                "e.g. `OP, One P, ワンピース`\n"
+                "Type SKIP if none."
+            )
+
+        # ── ADD ANIME: step 4 — aliases → save ────────────────────────────
         elif step == "ani_aliases":
             text = (message.text or "").strip()
-            if text.upper() != "SKIP" and text:
-                aliases = [a.strip() for a in text.split(",") if a.strip()]
-            else:
-                aliases = []
+            aliases = (
+                [a.strip() for a in text.split(",") if a.strip()]
+                if text.upper() != "SKIP" and text else []
+            )
             doc = {
                 "name":          data["name"],
                 "name_lower":    data["name"].lower(),
@@ -954,41 +1074,51 @@ def make_bot(cfg: dict) -> Client:
         elif step == "edit_name":
             anime = await anime_col.find_one({"name_lower": message.text.strip().lower()})
             if not anime:
-                await message.reply_text("Anime not found. /cancel to abort."); return
+                await message.reply_text("Anime not found. /cancel to abort.")
+                return
             data["anime_id"] = anime["_id"]
             set_state(uid, "edit_field", data)
             await message.reply_text(
                 f"✏️ Editing **{anime['name']}**\n\n"
-                "Field: name / description / image / watch_url / aliases"
+                "Which field? `name / description / image / watch_url / aliases`"
             )
+
         elif step == "edit_field":
             field = message.text.strip().lower()
-            if field not in {"name","description","image","watch_url","aliases"}:
-                await message.reply_text("Invalid field."); return
+            if field not in {"name", "description", "image", "watch_url", "aliases"}:
+                await message.reply_text("Invalid field.")
+                return
             data["edit_field"] = field
             set_state(uid, "edit_value", data)
             await message.reply_text(
                 f"Send new {'image (photo)' if field == 'image' else field}:"
             )
+
         elif step == "edit_value":
             field = data["edit_field"]
             aid   = data["anime_id"]
             if field == "image":
                 if not message.photo:
-                    await message.reply_text("Send a photo."); return
-                await anime_col.update_one({"_id": aid},
-                    {"$set": {"image_file_id": message.photo.file_id}})
+                    await message.reply_text("Send a photo.")
+                    return
+                await anime_col.update_one(
+                    {"_id": aid}, {"$set": {"image_file_id": message.photo.file_id}}
+                )
             elif field == "name":
                 v = message.text.strip()
-                await anime_col.update_one({"_id": aid},
-                    {"$set": {"name": v, "name_lower": v.lower()}})
+                await anime_col.update_one(
+                    {"_id": aid}, {"$set": {"name": v, "name_lower": v.lower()}}
+                )
             elif field == "aliases":
                 al = [a.strip() for a in message.text.split(",") if a.strip()]
-                await anime_col.update_one({"_id": aid},
-                    {"$set": {"aliases": al, "aliases_lower": [a.lower() for a in al]}})
+                await anime_col.update_one(
+                    {"_id": aid},
+                    {"$set": {"aliases": al, "aliases_lower": [a.lower() for a in al]}}
+                )
             else:
-                await anime_col.update_one({"_id": aid},
-                    {"$set": {field: message.text.strip()}})
+                await anime_col.update_one(
+                    {"_id": aid}, {"$set": {field: message.text.strip()}}
+                )
             clear_state(uid)
             await message.reply_text(f"✅ {field} updated!")
 
@@ -996,7 +1126,9 @@ def make_bot(cfg: dict) -> Client:
         elif step == "del_name":
             anime = await anime_col.find_one({"name_lower": message.text.strip().lower()})
             if not anime:
-                await message.reply_text("Anime not found."); clear_state(uid); return
+                await message.reply_text("Anime not found.")
+                clear_state(uid)
+                return
             data["anime_id"]   = anime["_id"]
             data["anime_name"] = anime["name"]
             set_state(uid, "del_confirm", data)
@@ -1012,45 +1144,61 @@ def make_bot(cfg: dict) -> Client:
         elif step == "alias_name":
             anime = await anime_col.find_one({"name_lower": message.text.strip().lower()})
             if not anime:
-                await message.reply_text("Anime not found."); clear_state(uid); return
+                await message.reply_text("Anime not found.")
+                clear_state(uid)
+                return
             data["anime_id"]   = anime["_id"]
             data["anime_name"] = anime["name"]
             set_state(uid, "alias_values", data)
-            await message.reply_text(f"Send aliases for **{anime['name']}** (comma-separated):")
+            await message.reply_text(
+                f"Send aliases for **{anime['name']}** (comma-separated):"
+            )
+
         elif step == "alias_values":
             al  = [a.strip() for a in message.text.split(",") if a.strip()]
             alL = [a.lower() for a in al]
-            await anime_col.update_one({"_id": data["anime_id"]}, {"$addToSet": {
-                "aliases":       {"$each": al},
-                "aliases_lower": {"$each": alL}
-            }})
+            await anime_col.update_one(
+                {"_id": data["anime_id"]},
+                {"$addToSet": {
+                    "aliases":       {"$each": al},
+                    "aliases_lower": {"$each": alL}
+                }}
+            )
             clear_state(uid)
             await message.reply_text(f"✅ Aliases added to **{data['anime_name']}**!")
 
         # ── BULK IMPORT ───────────────────────────────────────────────────
         elif step == "bulk_file":
             if not message.document:
-                await message.reply_text("Send a .txt or .json file."); return
+                await message.reply_text("Send a .txt or .json file.")
+                return
             fname = message.document.file_name or ""
             dl    = await message.download(in_memory=True)
             raw   = bytes(dl.getbuffer()).decode("utf-8", errors="ignore")
-            imp   = skp = 0
+            imp = skp = 0
 
             if fname.endswith(".json"):
-                try: items = json.loads(raw)
+                try:
+                    items = json.loads(raw)
                 except Exception:
-                    await message.reply_text("Invalid JSON."); clear_state(uid); return
+                    await message.reply_text("Invalid JSON.")
+                    clear_state(uid)
+                    return
                 for item in items:
-                    if not item.get("name"): skp += 1; continue
+                    if not item.get("name"):
+                        skp += 1
+                        continue
                     nl = item["name"].lower()
-                    if await anime_col.find_one({"name_lower": nl}): skp += 1; continue
+                    if await anime_col.find_one({"name_lower": nl}):
+                        skp += 1
+                        continue
                     al = item.get("aliases", [])
                     await anime_col.insert_one({
                         "name":          item["name"],
                         "name_lower":    nl,
-                        "description":   item.get("description",""),
+                        "description":   item.get("description", ""),
                         "image_file_id": item.get("image_url") or item.get("image_file_id"),
-                        "watch_url":     item.get("watch_url",""),
+                        "watch_url":     item.get("watch_url", ""),
                         "aliases":       al,
                         "aliases_lower": [a.lower() for a in al],
                         "added_by": uid, "added_at": datetime.utcnow()
@@ -1058,52 +1206,59 @@ def make_bot(cfg: dict) -> Client:
                     imp += 1
 
             elif fname.endswith(".txt"):
-                # Format: blocks separated by blank lines
-                # Line1: Anime Name
-                # Line2: img_url|synopsis|watch_link|alias1,alias2
-                blocks = raw.strip().split("\n\n")
-                for block in blocks:
-                    lines = [l.strip() for l in block.strip().splitlines() if l.strip()]
-                    if not lines: continue
-                    name = lines[0]
-                    nl   = name.lower()
-                    if await anime_col.find_one({"name_lower": nl}): skp += 1; continue
-                    img_url = syn = wurl = ""
-                    aliases = []
-                    if len(lines) >= 2:
-                        seg = lines[1].split("|")
-                        img_url = seg[0].strip() if len(seg) > 0 else ""
-                        syn     = seg[1].strip() if len(seg) > 1 else ""
-                        wurl    = seg[2].strip() if len(seg) > 2 else ""
-                        al_str  = seg[3].strip() if len(seg) > 3 else ""
-                        aliases = [a.strip() for a in al_str.split(",") if a.strip()]
+                # Format: Name | img_url | synopsis | watch_link | alias1,alias2
+                # One anime per line (blank lines ignored)
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    seg     = [s.strip() for s in line.split("|")]
+                    name    = seg[0] if len(seg) > 0 else ""
+                    img_url = seg[1] if len(seg) > 1 else ""
+                    syn     = seg[2] if len(seg) > 2 else ""
+                    wurl    = seg[3] if len(seg) > 3 else ""
+                    al_str  = seg[4] if len(seg) > 4 else ""
+                    aliases = [a.strip() for a in al_str.split(",") if a.strip()]
+                    if not name:
+                        skp += 1
+                        continue
+                    nl = name.lower()
+                    if await anime_col.find_one({"name_lower": nl}):
+                        skp += 1
+                        continue
                     await anime_col.insert_one({
-                        "name": name, "name_lower": nl,
-                        "description": syn,
+                        "name":          name,
+                        "name_lower":    nl,
+                        "description":   syn,
                         "image_file_id": img_url or None,
-                        "watch_url": wurl,
-                        "aliases": aliases,
+                        "watch_url":     wurl,
+                        "aliases":       aliases,
                         "aliases_lower": [a.lower() for a in aliases],
                         "added_by": uid, "added_at": datetime.utcnow()
                     })
                     imp += 1
             else:
-                await message.reply_text("Only .json or .txt supported."); clear_state(uid); return
+                await message.reply_text("Only .json or .txt supported.")
+                clear_state(uid)
+                return
 
             clear_state(uid)
             await message.reply_text(
-                f"✅ **Bulk Import Done!**\n\nImported: {imp}\nSkipped: {skp}"
+                f"✅ **Bulk Import Done!**\n\nImported: {imp}\nSkipped (duplicates): {skp}"
             )
 
         # ── BROADCAST ─────────────────────────────────────────────────────
         elif step == "bcast":
             txt   = message.text or message.caption or ""
-            users = await users_col.find({}, {"_id":1}).to_list(None)
+            users = await users_col.find({}, {"_id": 1}).to_list(None)
             sent = failed = 0
             sm   = await message.reply_text(f"📢 Broadcasting to {len(users)} users…")
             for u in users:
-                try: await app.send_message(u["_id"], txt); sent += 1
-                except Exception: failed += 1
+                try:
+                    await app.send_message(u["_id"], txt)
+                    sent += 1
+                except Exception:
+                    failed += 1
                 await asyncio.sleep(0.05)
             clear_state(uid)
             await sm.edit_text(f"✅ Done! Sent: {sent} | Failed: {failed}")
@@ -1121,7 +1276,8 @@ def make_bot(cfg: dict) -> Client:
         elif step == "set_start_msg":
             if message.text:
                 await sset("welcome_message", message.text)
-                clear_state(uid); await message.reply_text("✅ Welcome message updated!")
+                clear_state(uid)
+                await message.reply_text("✅ Welcome message updated!")
             else:
                 await message.reply_text("Send text.")
 
@@ -1130,56 +1286,61 @@ def make_bot(cfg: dict) -> Client:
             if message.text:
                 data["wtext"] = message.text
                 set_state(uid, "set_welcome_img", data)
-                await message.reply_text("Send welcome image, or type SKIP:")
+                await message.reply_text(
+                    "Send welcome image (photo), or type **SKIP** to keep no image:"
+                )
             else:
                 await message.reply_text("Send text.")
+
         elif step == "set_welcome_img":
             if message.photo:
                 await sset("welcome_img", message.photo.file_id)
             elif not (message.text and message.text.strip().upper() == "SKIP"):
-                await message.reply_text("Send photo or SKIP."); return
+                await message.reply_text("Send photo or type SKIP.")
+                return
             await sset("group_welcome", data["wtext"])
-            clear_state(uid); await message.reply_text("✅ Welcome updated!")
+            clear_state(uid)
+            await message.reply_text("✅ Welcome message updated!")
 
         # ── SET GOODBYE TEXT → IMAGE ──────────────────────────────────────
         elif step == "set_goodbye_text":
             if message.text:
                 data["gtext"] = message.text
                 set_state(uid, "set_goodbye_img", data)
-                await message.reply_text("Send goodbye image, or type SKIP:")
+                await message.reply_text(
+                    "Send goodbye image (photo), or type **SKIP** to keep no image:"
+                )
             else:
                 await message.reply_text("Send text.")
+
         elif step == "set_goodbye_img":
             if message.photo:
                 await sset("goodbye_img", message.photo.file_id)
             elif not (message.text and message.text.strip().upper() == "SKIP"):
-                await message.reply_text("Send photo or SKIP."); return
+                await message.reply_text("Send photo or type SKIP.")
+                return
             await sset("group_goodbye", data["gtext"])
-            clear_state(uid); await message.reply_text("✅ Goodbye updated!")
+            clear_state(uid)
+            await message.reply_text("✅ Goodbye message updated!")
 
     return app
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  RUNNING CLONES registry  (bot_id -> Client)
-# ═══════════════════════════════════════════════════════════════════════════════
-RUNNING_CLONES: dict = {}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 async def main():
-    # Create indexes
     db = get_db(PRIMARY["db_name"])
     await db["animes"].create_index("name_lower")
     await db["animes"].create_index("aliases_lower")
     await db["users"].create_index("_id")
-    logger.info("✅ Indexes ready")
+    logger.info("✅ MongoDB indexes created")
 
-    # Start primary bot
     primary_app = make_bot(PRIMARY)
+    logger.info("🚀 Kenshin Anime Search Bot starting…")
     await primary_app.start()
     me = await primary_app.get_me()
-    logger.info(f"✅ Primary bot: @{me.username}")
+    logger.info(f"✅ Bot started as @{me.username}")
 
     # Restore clones from DB
     async for inst in instances_col.find({}):
@@ -1198,14 +1359,14 @@ async def main():
         except Exception as e:
             logger.error(f"Failed to restore clone {inst.get('bot_id')}: {e}")
 
-    logger.info("🚀 All bots running. Idling…")
-    await idle()
+    logger.info("🏃 All bots running. Idling…")
+    await primary_app.idle()
 
-    # Graceful stop
     for c in RUNNING_CLONES.values():
         try: await c.stop()
         except Exception: pass
     await primary_app.stop()
+
 
 if __name__ == "__main__":
     primary_app_tmp = Client(
