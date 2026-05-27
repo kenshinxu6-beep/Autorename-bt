@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 def load_primary():
     return {
-        "bot_token":         "8898514649:AAGdzCQF8kEgCuRPMtzlgV7V3ObYmz3BerI",
+        "bot_token":         "8780999113:AAEiC461K0DGQX1QIInMXYGbB-UZIkIafrU",
         "api_id":            37407868,
         "api_hash":          "d7d3bff9f7cf9f3b111129bdbd13a065",
         "original_owner_id": 6728678197,
