@@ -20,7 +20,7 @@ CHANGES v2:
 
 import os, json, csv, io, asyncio, logging, re
 from datetime import datetime
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters, enums, idle
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, ChatMemberUpdated
@@ -323,7 +323,15 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     #  Private text — search by name/alias anywhere in text
     # ═══════════════════════════════════════════════════════════════════════
-    @app.on_message(filters.private & ~filters.command([]) & filters.text)
+    ALL_CMDS = [
+        "start","help","search","popular","report","cancel",
+        "add_ani","edit_ani","delete_ani","add_alias","list","stats",
+        "db_export","bulk","broadcast","set_start_img","set_start_msg",
+        "set_channel","add_forcesub","rem_forcesub","set_welcome","set_goodbye",
+        "add_admin","remove_admin","addowner","removeowner","copy","delcopy"
+    ]
+
+    @app.on_message(filters.private & ~filters.command(ALL_CMDS) & filters.text)
     async def private_text_search(_, message: Message):
         uid   = message.from_user.id
         state = get_state(uid)
@@ -337,9 +345,9 @@ def make_bot(cfg: dict) -> Client:
         if anime:
             await send_anime_result(message, anime)
 
-    # Handle photo uploads in private (for state machine — e.g. adding anime image)
-    @app.on_message(filters.private & filters.photo)
-    async def private_photo_handler(_, message: Message):
+    # Handle photo/document uploads in private (for state machine)
+    @app.on_message(filters.private & (filters.photo | filters.document))
+    async def private_media_handler(_, message: Message):
         uid   = message.from_user.id
         state = get_state(uid)
         if state:
@@ -348,7 +356,7 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════════════════════════
     #  Group text — detect anime name/alias anywhere in sentence
     # ═══════════════════════════════════════════════════════════════════════
-    @app.on_message(filters.group & ~filters.command([]) & filters.text)
+    @app.on_message(filters.group & ~filters.command(ALL_CMDS) & filters.text)
     async def group_text_search(_, message: Message):
         text = (message.text or "").strip()
         if len(text) < 3:
