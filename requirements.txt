@@ -1,6 +1,4 @@
-pyrofork==2.3.17
-TgCrypto==1.2.5
-motor==3.3.2
-pymongo==4.6.1
-dnspython==2.6.1
-aiohttp==3.9.5
+hydrogram
+motor
+aiohttp
+pymongo
