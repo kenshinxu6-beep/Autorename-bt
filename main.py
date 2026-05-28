@@ -86,6 +86,10 @@ def make_bot(cfg: dict) -> Client:
     async def sset(k, v):
         await settings_col.update_one({"_id": k}, {"$set": {"value": v}}, upsert=True)
 
+    async def bot_name():
+        """Returns the custom bot display name set via /set_name, default = 'Anime Bot'."""
+        return await gset("bot_name", "Anime Bot")
+
     # ── role checks ────────────────────────────────────
     async def is_super(uid): return uid == OWNER_ID
     async def is_owner(uid): return await is_super(uid) or bool(await staff_col.find_one({"_id": uid, "role": "owner"}))
@@ -284,58 +288,61 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════
     #  CONSTANTS
     # ═══════════════════════════════════════════════════
-    HELP_TEXT = (
-        "📋 **KENSHIN ANIME BOT — FULL COMMAND LIST**\n\n"
-        "━━━━ 👤 USER ━━━━\n"
-        "/start — Welcome message\n"
-        "/help — Full command list\n"
-        "/search [name] — Search anime\n"
-        "/popular — Browse anime list\n"
-        "/ping — Check bot speed\n"
-        "/id — Your Telegram ID\n"
-        "/report [msg] — Report to admins\n\n"
-        "━━━━ 🛡️ ADMIN ━━━━\n"
-        "/panel — Admin control panel\n"
-        "/add_ani — Add new anime\n"
-        "/edit_ani — Edit anime (inline)\n"
-        "/delete_ani — Delete anime\n"
-        "/add_alias — Add search aliases\n"
-        "/list — All animes with edit/delete\n"
-        "/stats — Bot statistics\n"
-        "/db_export — Export database\n"
-        "/bulk — Bulk import (.txt/.json)\n"
-        "/broadcast — Message all users\n"
-        "/set_start_img — Set start banner\n"
-        "/set_start_msg — Set welcome text\n"
-        "/set_welcome — Group welcome msg\n"
-        "/set_goodbye — Group goodbye msg\n"
-        "/set_channel — Promo channels\n"
-        "/add_forcesub — Force-sub channel\n"
-        "/rem_forcesub — Remove force-sub\n"
-        "/adminlist — List all staff\n"
-        "/ban [id] — Ban user from bot\n"
-        "/unban [id] — Unban user\n"
-        "/userinfo [id] — User info\n"
-        "/cancel — Cancel current operation\n\n"
-        "━━━━ 🔗 INFINITE LINKS ━━━━\n"
-        "/infinite [channel_id] — 60-sec invite link\n"
-        "/infinite req [id] — Request-to-join\n"
-        "/infinite list — Your links\n"
-        "/infinite remove [id] — Delete link\n"
-        "/infinite set — Set image (reply photo)\n"
-        "/infinite unset — Remove image\n"
-        "/infinite myimage — View current image\n\n"
-        "━━━━ 👑 OWNER ━━━━\n"
-        "/add_admin [id] — Promote to admin\n"
-        "/remove_admin [id] — Remove admin\n"
-        "/addowner [id] — Promote to owner\n"
-        "/removeowner [id] — Remove owner\n\n"
-        "━━━━ ⚡ SUPER OWNER ━━━━\n"
-        "/copy [token] — Start clone bot\n"
-        "/delcopy [bot_id] — Stop clone bot\n"
-        "/clones — List all clone bots\n\n"
-        "💡 **Placeholders:** `{name}` `{first_name}` `{last_name}` `{mention}` `{id}` `{chat}`"
-    )
+    async def get_help_text():
+        bn = await bot_name()
+        return (
+            f"📋 **{bn.upper()} — FULL COMMAND LIST**\n\n"
+            "━━━━ 👤 USER ━━━━\n"
+            "/start — Welcome message\n"
+            "/help — Full command list\n"
+            "/search [name] — Search anime\n"
+            "/popular — Browse anime list\n"
+            "/ping — Check bot speed\n"
+            "/id — Your Telegram ID\n"
+            "/report [msg] — Report to admins\n\n"
+            "━━━━ 🛡️ ADMIN ━━━━\n"
+            "/panel — Admin control panel\n"
+            "/add_ani — Add new anime\n"
+            "/edit_ani — Edit anime (inline)\n"
+            "/delete_ani — Delete anime\n"
+            "/add_alias — Add search aliases\n"
+            "/list — All animes with edit/delete\n"
+            "/stats — Bot statistics\n"
+            "/db_export — Export database\n"
+            "/bulk — Bulk import (.txt/.json)\n"
+            "/broadcast — Message all users\n"
+            "/set_start_img — Set start banner\n"
+            "/set_start_msg — Set welcome text\n"
+            "/set_welcome — Group welcome msg\n"
+            "/set_goodbye — Group goodbye msg\n"
+            "/set_channel — Promo channels\n"
+            "/add_forcesub — Force-sub channel\n"
+            "/rem_forcesub — Remove force-sub\n"
+            "/adminlist — List all staff\n"
+            "/ban [id] — Ban user from bot\n"
+            "/unban [id] — Unban user\n"
+            "/userinfo [id] — User info\n"
+            "/cancel — Cancel current operation\n\n"
+            "━━━━ 🔗 INFINITE LINKS ━━━━\n"
+            "/infinite [channel_id] — 60-sec invite link\n"
+            "/infinite req [id] — Request-to-join\n"
+            "/infinite list — Your links\n"
+            "/infinite remove [id] — Delete link\n"
+            "/infinite set — Set image (reply photo)\n"
+            "/infinite unset — Remove image\n"
+            "/infinite myimage — View current image\n\n"
+            "━━━━ 👑 OWNER ━━━━\n"
+            "/set_name [name] — Set bot display name\n"
+            "/add_admin [id] — Promote to admin\n"
+            "/remove_admin [id] — Remove admin\n"
+            "/addowner [id] — Promote to owner\n"
+            "/removeowner [id] — Remove owner\n\n"
+            "━━━━ ⚡ SUPER OWNER ━━━━\n"
+            "/copy [token] — Start clone bot\n"
+            "/delcopy [bot_id] — Stop clone bot\n"
+            "/clones — List all clone bots\n\n"
+            "💡 **Placeholders:** `{name}` `{first_name}` `{last_name}` `{mention}` `{id}` `{chat}`"
+        )
 
     ALL_CMDS = [
         "start","help","search","popular","report","cancel","panel","infinite",
@@ -344,6 +351,7 @@ def make_bot(cfg: dict) -> Client:
         "bulk","broadcast","set_start_img","set_start_msg","set_channel",
         "add_forcesub","rem_forcesub","set_welcome","set_goodbye",
         "add_admin","remove_admin","addowner","removeowner","copy","delcopy",
+        "set_name",
     ]
 
     # ── admin panel builder ────────────────────────────
@@ -377,6 +385,7 @@ def make_bot(cfg: dict) -> Client:
         if is_ownr:
             rows += [
                 [InlineKeyboardButton("━━━━━ 👑  STAFF  👑 ━━━━━", callback_data="noop")],
+                [InlineKeyboardButton("🏷️ Set Bot Name",  callback_data="panel_set_name")],
                 [InlineKeyboardButton("🛡️ Add Admin",   callback_data="panel_add_admin"),
                  InlineKeyboardButton("❌ Rem Admin",   callback_data="panel_remove_admin")],
                 [InlineKeyboardButton("👑 Add Owner",   callback_data="panel_add_owner"),
@@ -392,7 +401,8 @@ def make_bot(cfg: dict) -> Client:
 
     async def send_panel(target, uid):
         kb   = await build_panel(uid)
-        text = "🎛️ **KENSHIN ADMIN PANEL**\n\nSelect an action:"
+        bn   = await bot_name()
+        text = f"🎛️ **{bn.upper()} — ADMIN PANEL**\n\nSelect an action:"
         if isinstance(target, Message):
             await target.reply_text(text, reply_markup=kb)
         else:
@@ -427,18 +437,18 @@ def make_bot(cfg: dict) -> Client:
 
         if not await fsub_ok(msg): return
 
-        welcome   = await gset("welcome_message",
-            "👋 **Ohayou, {first_name}!**\n\n"
-            "🎌 Welcome to **Kenshin Anime Search Bot**!\n\n"
-            "⚡ Just type any anime name to search.\n"
-            "📋 Use /help to see all commands.")
+        bn        = await bot_name()
+        _def_wel  = (f"👋 **Ohayou, {{first_name}}!**\n\n"
+                     f"🎌 Welcome to **{bn}**!\n\n"
+                     f"⚡ Just type any anime name to search.\n"
+                     f"📋 Use /help to see all commands.")
+        welcome   = await gset("welcome_message", _def_wel)
         welcome   = fmt(welcome, msg.from_user, getattr(msg.chat, "title", "") or "")
         banner    = await gset("start_banner", None)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔍 Search Anime", switch_inline_query_current_chat=""),
-             InlineKeyboardButton("📋 Help",          callback_data="show_help")],
-            [InlineKeyboardButton("🌟 Anime List",    callback_data="show_popular"),
-             InlineKeyboardButton("🎛️ Panel",          callback_data="open_panel")],
+             InlineKeyboardButton("📋 Help",         callback_data="show_help")],
+            [InlineKeyboardButton("🌟 Anime List",   callback_data="show_popular")],
         ])
         if banner:
             try:   await msg.reply_photo(photo=banner, caption=welcome, reply_markup=kb); return
@@ -457,7 +467,7 @@ def make_bot(cfg: dict) -> Client:
             [InlineKeyboardButton("🎛️ Admin Panel",  callback_data="open_panel")],
             [InlineKeyboardButton("🌟 Anime List",   callback_data="show_popular")],
         ])
-        await msg.reply_text(HELP_TEXT, reply_markup=kb)
+        await msg.reply_text(await get_help_text(), reply_markup=kb)
 
     # ═══════════════════════════════════════════════════
     #  /panel
@@ -531,7 +541,7 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════
     #  Private text / media — search + state handler
     # ═══════════════════════════════════════════════════
-    @app.on_message(filters.private & ~filters.command(ALL_CMDS) & filters.text)
+    @app.on_message(filters.private & ~filters.command(ALL_CMDS) & filters.text, group=1)
     async def priv_text(_, msg: Message):
         if not msg.from_user: return
         uid = msg.from_user.id
@@ -549,7 +559,7 @@ def make_bot(cfg: dict) -> Client:
                 "❌ Anime not found!\n\n"
                 "💡 Try: `/search [name]` or browse /popular")
 
-    @app.on_message(filters.private & (filters.photo | filters.document))
+    @app.on_message(filters.private & (filters.photo | filters.document), group=1)
     async def priv_media(_, msg: Message):
         if not msg.from_user: return
         if get_st(msg.from_user.id): await state_fn(msg)
@@ -627,7 +637,7 @@ def make_bot(cfg: dict) -> Client:
             return
 
         if sub == "list":
-            links = await infinite_col.find({"owner_uid": uid, "channel_id": {"$gt": 0}}).to_list(None)
+            links = await infinite_col.find({"owner_uid": uid, "channel_id": {"$ne": 0}}).to_list(None)
             if not links: await msg.reply_text("📭 No links yet. Use /infinite [channel_id]"); return
             un = await bot_un()
             rows, lines = [], []
@@ -804,7 +814,7 @@ def make_bot(cfg: dict) -> Client:
         tu = await users_col.count_documents({})
         ad = await staff_col.count_documents({"role": "admin"})
         ow = await staff_col.count_documents({"role": "owner"})
-        il = await infinite_col.count_documents({"channel_id": {"$gt": 0}})
+        il = await infinite_col.count_documents({"channel_id": {"$ne": 0}})
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📄 Export JSON", callback_data="export_json"),
              InlineKeyboardButton("📊 Export CSV",  callback_data="export_csv")],
@@ -839,12 +849,34 @@ def make_bot(cfg: dict) -> Client:
             "📦 **Bulk Import**\n\nSend a **.txt** or **.json** file.\n\n"
             "**TXT format** (one per line):\n`Name | img_url | synopsis | watch_url | alias1,alias2`")
 
+    # ── broadcast helper ───────────────────────────────
+    async def _do_broadcast(origin: Message, src: Message):
+        """Broadcast src message to all users of THIS bot's DB."""
+        users = await users_col.find({}, {"_id": 1}).to_list(None)
+        sm    = await origin.reply_text(f"📢 Broadcasting to {len(users)} users…")
+        sent = fail = 0
+        for u in users:
+            try:
+                await src.copy(u["_id"])
+                sent += 1
+            except Exception:
+                fail += 1
+            await asyncio.sleep(0.05)
+        await sm.edit_text(f"✅ **Broadcast Done!**\n\n📤 Sent: {sent}\n❌ Failed: {fail}")
+
     @app.on_message(filters.command("broadcast"))
     async def cmd_broadcast(_, msg: Message):
         if not msg.from_user: return
         if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
-        set_st(msg.from_user.id, "bcast")
-        await msg.reply_text("📢 Send the broadcast message:")
+        # If replying to a message — broadcast that directly
+        if msg.reply_to_message:
+            await _do_broadcast(msg, msg.reply_to_message)
+        else:
+            set_st(msg.from_user.id, "bcast")
+            await msg.reply_text(
+                "📢 **Broadcast**\n\n"
+                "Send the message to broadcast, or **reply** to any message with /broadcast to send that."
+            )
 
     @app.on_message(filters.command("set_start_img"))
     async def cmd_set_banner(_, msg: Message):
@@ -969,6 +1001,33 @@ def make_bot(cfg: dict) -> Client:
             await msg.reply_text("❌ Cannot remove the Super Owner!"); return
         r = await staff_col.delete_one({"_id": t.id, "role": "owner"})
         await msg.reply_text("✅ Removed from owners." if r.deleted_count else f"❌ `{t.id}` is not an owner.")
+
+    # ═══════════════════════════════════════════════════
+    #  /set_name  — owner-only, per-bot display name
+    # ═══════════════════════════════════════════════════
+    @app.on_message(filters.command("set_name"))
+    async def cmd_set_name(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_owner(msg.from_user.id): await msg.reply_text(BAKA); return
+        parts = (msg.text or "").split(None, 1)
+        if len(parts) < 2:
+            current = await bot_name()
+            await msg.reply_text(
+                f"🏷️ **Bot Display Name**\n\n"
+                f"Current: **{current}**\n\n"
+                f"Usage: `/set_name [new name]`\n"
+                f"Example: `/set_name Shane Anime`\n\n"
+                f"This name appears in welcome messages, help, and panel headers.\n"
+                f"Each bot has its own separate name!"
+            )
+            return
+        new_name = parts[1].strip()
+        await sset("bot_name", new_name)
+        await msg.reply_text(
+            f"✅ **Bot name updated!**\n\n"
+            f"🏷️ New name: **{new_name}**\n\n"
+            f"It will now appear in all bot messages."
+        )
 
     # ═══════════════════════════════════════════════════
     #  /ping  /id  /userinfo  /adminlist  /ban  /unban  /clones
@@ -1156,6 +1215,9 @@ def make_bot(cfg: dict) -> Client:
     @app.on_chat_member_updated()
     async def on_member(_, upd: ChatMemberUpdated):
         try:
+            # Only act in groups/supergroups — never in channels
+            if upd.chat.type not in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
+                return
             old = upd.old_chat_member.status if upd.old_chat_member else None
             new = upd.new_chat_member.status if upd.new_chat_member else None
             joined = (new in (enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR)
@@ -1164,6 +1226,7 @@ def make_bot(cfg: dict) -> Client:
                       and new in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED))
             if joined:
                 user   = upd.new_chat_member.user
+                if user.is_bot: return   # don't welcome bots
                 tmpl   = await gset("group_welcome", "👋 Welcome {mention} to **{chat}**!\n🎌 Type any anime name to search!")
                 text   = fmt(tmpl, user, upd.chat.title or "")
                 img    = await gset("welcome_img", None)
@@ -1174,6 +1237,7 @@ def make_bot(cfg: dict) -> Client:
                 await app.send_message(upd.chat.id, text, reply_markup=kb)
             elif left:
                 user = upd.old_chat_member.user
+                if user.is_bot: return   # don't goodbye bots
                 tmpl = await gset("group_goodbye", "👋 **{name}** left **{chat}**. Sayonara! 🎌")
                 text = fmt(tmpl, user, upd.chat.title or "")
                 img  = await gset("goodbye_img", None)
@@ -1209,8 +1273,8 @@ def make_bot(cfg: dict) -> Client:
         if d == "show_help":
             await q.answer()
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_start")]])
-            try:    await q.message.edit_text(HELP_TEXT, reply_markup=kb)
-            except Exception: await q.message.reply_text(HELP_TEXT, reply_markup=kb)
+            try:    await q.message.edit_text(await get_help_text(), reply_markup=kb)
+            except Exception: await q.message.reply_text(await get_help_text(), reply_markup=kb)
             return
 
         if d == "show_popular":
@@ -1230,7 +1294,8 @@ def make_bot(cfg: dict) -> Client:
                  InlineKeyboardButton("📋 Help", callback_data="show_help")],
                 [InlineKeyboardButton("🌟 Anime List", callback_data="show_popular")],
             ])
-            try: await q.message.edit_text("🎌 **Kenshin Anime Bot**\n\nType any anime name to search!", reply_markup=kb)
+            bn = await bot_name()
+            try: await q.message.edit_text(f"🎌 **{bn}**\n\nType any anime name to search!", reply_markup=kb)
             except Exception: pass
             return
 
@@ -1254,7 +1319,7 @@ def make_bot(cfg: dict) -> Client:
 
         if d == "inf_list":
             await q.answer()
-            links = await infinite_col.find({"owner_uid": uid, "channel_id": {"$gt": 0}}).to_list(None)
+            links = await infinite_col.find({"owner_uid": uid, "channel_id": {"$ne": 0}}).to_list(None)
             if not links: await q.answer("No links yet.", show_alert=True); return
             un    = await bot_un()
             lines = [f"• `{l['channel_id']}` [{l.get('mode','invite')}]" for l in links]
@@ -1314,7 +1379,7 @@ def make_bot(cfg: dict) -> Client:
             elif action == "stats":
                 ta=await anime_col.count_documents({}); tu=await users_col.count_documents({})
                 ad=await staff_col.count_documents({"role":"admin"}); ow=await staff_col.count_documents({"role":"owner"})
-                il=await infinite_col.count_documents({"channel_id":{"$gt":0}})
+                il=await infinite_col.count_documents({"channel_id":{"$ne":0}})
                 await q.message.reply_text(
                     f"📊 **Stats**\n\n🎌 {ta} | 👤 {tu} | 🛡️ {ad} | 👑 {ow+1} | 🔗 {il}",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📄 JSON",callback_data="export_json"),InlineKeyboardButton("📊 CSV",callback_data="export_csv")],[InlineKeyboardButton("🔙 Panel",callback_data="open_panel")]]))
@@ -1353,7 +1418,7 @@ def make_bot(cfg: dict) -> Client:
                 lines   = [f"{'🟢' if c['bot_id'] in running else '🔴'} @{c.get('bot_username','?')} `{c['bot_id']}`" for c in clones] if clones else ["No clones."]
                 await q.message.reply_text("🤖 **Clones:**\n\n" + "\n".join(lines))
             elif action == "infinite":
-                links = await infinite_col.find({"owner_uid":uid,"channel_id":{"$gt":0}}).to_list(None)
+                links = await infinite_col.find({"owner_uid":uid,"channel_id":{"$ne":0}}).to_list(None)
                 un    = await bot_un()
                 lines = [f"• `{l['channel_id']}` [{l.get('mode','invite')}]" for l in links] if links else ["No links yet."]
                 await q.message.reply_text("🔗 **Infinite Links:**\n\n"+"\n".join(lines)+"\n\n`/infinite [id]` or `/infinite req [id]`")
@@ -1361,6 +1426,13 @@ def make_bot(cfg: dict) -> Client:
                 if not await is_owner(uid): await q.message.reply_text(BAKA); return
                 cmd = "add_admin" if action=="add_admin" else "remove_admin"
                 await q.message.reply_text(f"Usage: `/{cmd} [user_id]`\nExample: `/{cmd} 838832834`")
+            elif action == "set_name":
+                if not await is_owner(uid): await q.message.reply_text(BAKA); return
+                current = await bot_name()
+                await q.message.reply_text(
+                    f"🏷️ **Bot Display Name**\n\nCurrent: **{current}**\n\n"
+                    f"Use: `/set_name [new name]`\nExample: `/set_name Shane Anime`"
+                )
             elif action in ("add_owner","remove_owner"):
                 if not await is_super(uid): await q.message.reply_text(BAKA); return
                 cmd = "addowner" if action=="add_owner" else "removeowner"
@@ -1481,8 +1553,11 @@ def make_bot(cfg: dict) -> Client:
                 d["img"] = None; d["name"] = ""
             elif msg.text and msg.text.strip().startswith("http"):
                 d["img"] = msg.text.strip(); d["name"] = ""
+            elif msg.text:
+                # User sent plain text — treat as anime name, skip image
+                d["img"] = None; d["name"] = msg.text.strip()
             else:
-                await msg.reply_text("Send a photo, URL, or SKIP."); return
+                await msg.reply_text("Send a photo, image URL, anime name, or SKIP."); return
             if d["name"]:
                 set_st(uid, "ani_synopsis", d)
                 await msg.reply_text(f"✅ Name: **{d['name']}**\n\n📝 **Step 2/4** — Send **synopsis**:")
@@ -1640,15 +1715,8 @@ def make_bot(cfg: dict) -> Client:
 
         # BROADCAST
         elif step == "bcast":
-            text  = msg.text or msg.caption or ""
-            users = await users_col.find({},{"_id":1}).to_list(None)
-            sm    = await msg.reply_text(f"📢 Broadcasting to {len(users)} users…")
-            sent = fail = 0
-            for u in users:
-                try: await app.send_message(u["_id"], text); sent += 1
-                except Exception: fail += 1
-                await asyncio.sleep(0.05)
-            clr_st(uid); await sm.edit_text(f"✅ Sent: {sent} | Failed: {fail}")
+            clr_st(uid)
+            await _do_broadcast(msg, msg)
 
         # SETTINGS STATES
         elif step == "set_start_img":
