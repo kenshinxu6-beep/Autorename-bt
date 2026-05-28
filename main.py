@@ -124,11 +124,11 @@ def make_bot(cfg: dict) -> Client:
             }}, upsert=True)
 
     # ── placeholder formatter ──────────────────────────
-    def fmt(tmpl, user, chat=""):
+def fmt(tmpl, user, chat=""):
     fn = getattr(user, "first_name", "") or ""
     ln = getattr(user, "last_name", "") or ""
     un = getattr(user, "username", None)
-
+    
     return (
         str(tmpl or "")
         .replace("{name}", f"{fn} {ln}".strip())
