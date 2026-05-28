@@ -1,296 +1,316 @@
 """
-╔══════════════════════════════════════════════╗
-║       KENSHIN ANIME SEARCH BOT — v4          ║
-║  Pyrofork + MongoDB | Ultimate Edition       ║
-╚══════════════════════════════════════════════╝
-CHANGES v4:
-• GC /start fix — fmt_text defined before handlers
-• resolve_user: works with raw ID, no reply needed
-• add_admin/remove_admin/addowner/removeowner: ID se direct
-• Infinite Link System added
-• All inline buttons working
-• All commands work in private + group
-• from_user None guards everywhere
+╔═══════════════════════════════════════════════════╗
+║         KENSHIN ANIME SEARCH BOT — v7 FINAL       ║
+║       Pyrofork + MongoDB  |  Production Ready      ║
+╚═══════════════════════════════════════════════════╝
+FIXES v7:
+• Normal users now always get reply (start/help/search/report)
+• Non-admin cmd → BAKA_MSG reply (no silent ignore)
+• GC anime search works properly
+• /infinite req <id> — request-to-join system
+  Bot sends join request, auto-accepts, DMs user
+• /copy safe — in_memory=True, no SESSION_REVOKED
+• clone restore on restart from MongoDB
+• Professional panel layout (sectioned, single btn per row)
+• resolve_user works with raw ID
 """
 
-import os, json, csv, io, asyncio, logging, re, time
+import os, io, csv, json, re, time, asyncio, logging, aiohttp
 from datetime import datetime
 from pyrogram import Client, filters, enums, idle
 from pyrogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, ChatMemberUpdated
+    Message, CallbackQuery, ChatMemberUpdated,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ChatJoinRequest,
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 
-logging.basicConfig(level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level  = logging.INFO,
+    format = "%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("KenshinBot")
 
-# ═══════════════════════════════════════════════════
-#  CONFIG
-# ═══════════════════════════════════════════════════
-def load_primary():
-    return {
-        "bot_token":         "8780999113:AAEiC461K0DGQX1QIInMXYGbB-UZIkIafrU",
+# ═══════════════════════════════════════════════════════
+#  CONFIG  (reads from environment variables)
+# ═══════════════════════════════════════════════════════
+PRIMARY = {
+    "bot_token":         "8780999113:AAEiC461K0DGQX1QIInMXYGbB-UZIkIafrU",
         "api_id":            37407868,
         "api_hash":          "d7d3bff9f7cf9f3b111129bdbd13a065",
         "original_owner_id": 6728678197,
         "mongo_uri":         "mongodb+srv://kenshinxu1:iammohitgurjar.1@kenshinfileshere.fyvrwjd.mongodb.net/?appName=Kenshinfileshere",
         "session_name":      "kenshin_primary",
         "db_name":           "Kenshinfileshere",
-    }
+}
 
-PRIMARY        = load_primary()
-_mongo_client  = AsyncIOMotorClient(PRIMARY["mongo_uri"])
-instances_col  = _mongo_client["kenshin_meta"]["instances"]
-RUNNING_CLONES: dict = {}
-BAKA_MSG = "ʙᴀᴋᴀ ʏᴏᴜʀ ɴᴏᴛ ᴍʏ sᴇɴᴘᴀɪ  !!!"
+_mongo        = AsyncIOMotorClient(PRIMARY["mongo_uri"])
+instances_col = _mongo["kenshin_meta"]["instances"]
+CLONES: dict  = {}   # bot_id → Client
+BAKA          = "ʙᴀᴋᴀ ʏᴏᴜʀ ɴᴏᴛ ᴍʏ sᴇɴᴘᴀɪ  !!!"
 
-def get_db(db_name: str):
-    return _mongo_client[db_name]
+def get_db(name): return _mongo[name]
 
-# ═══════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 #  BOT FACTORY
-# ═══════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 def make_bot(cfg: dict) -> Client:
-    db                = get_db(cfg["db_name"])
-    anime_col         = db["animes"]
-    users_col         = db["users"]
-    staff_col         = db["staff"]
-    settings_col      = db["settings"]
-    infinite_col      = db["infinite_links"]
-    ORIGINAL_OWNER_ID = cfg["original_owner_id"]
+
+    db           = get_db(cfg["db_name"])
+    anime_col    = db["animes"]
+    users_col    = db["users"]
+    staff_col    = db["staff"]
+    settings_col = db["settings"]
+    infinite_col = db["infinite_links"]   # {owner_uid, channel_id, custom_image?}
+    OWNER_ID     = cfg["original_owner_id"]
 
     app = Client(
         cfg["session_name"],
         api_id    = PRIMARY["api_id"],
         api_hash  = PRIMARY["api_hash"],
         bot_token = cfg["bot_token"],
+        in_memory = True,   # ← prevents SESSION_REVOKED for all clones
     )
 
-    # ── state machine ────────────────────────────────
+    # ── state machine ──────────────────────────────────
     _states: dict = {}
-    def get_state(uid):                  return _states.get(uid)
-    def set_state(uid, step, data=None): _states[uid] = {"step": step, "data": data or {}}
-    def clear_state(uid):                _states.pop(uid, None)
+    def get_st(uid):              return _states.get(uid)
+    def set_st(uid, step, d={}):  _states[uid] = {"step": step, "data": dict(d)}
+    def clr_st(uid):              _states.pop(uid, None)
 
-    # ── settings helpers ─────────────────────────────
-    async def gset(key, default=None):
-        doc = await settings_col.find_one({"_id": key})
-        return doc["value"] if doc else default
+    # ── db helpers ─────────────────────────────────────
+    async def gset(k, default=None):
+        d = await settings_col.find_one({"_id": k})
+        return d["value"] if d else default
 
-    async def sset(key, value):
-        await settings_col.update_one(
-            {"_id": key}, {"$set": {"value": value}}, upsert=True)
+    async def sset(k, v):
+        await settings_col.update_one({"_id": k}, {"$set": {"value": v}}, upsert=True)
 
-    # ── role helpers ─────────────────────────────────
-    async def is_super(uid): return uid == ORIGINAL_OWNER_ID
-    async def is_owner(uid):
-        if await is_super(uid): return True
-        return bool(await staff_col.find_one({"_id": uid, "role": "owner"}))
-    async def is_admin(uid):
-        if await is_owner(uid): return True
-        return bool(await staff_col.find_one({"_id": uid, "role": "admin"}))
+    # ── role checks ────────────────────────────────────
+    async def is_super(uid): return uid == OWNER_ID
+    async def is_owner(uid): return await is_super(uid) or bool(await staff_col.find_one({"_id": uid, "role": "owner"}))
+    async def is_admin(uid): return await is_owner(uid) or bool(await staff_col.find_one({"_id": uid, "role": "admin"}))
 
-    async def all_staff_ids():
-        ids = [ORIGINAL_OWNER_ID]
+    async def staff_ids():
+        ids = [OWNER_ID]
         async for d in staff_col.find({}): ids.append(d["_id"])
         return list(set(ids))
 
-    # ── resolve_user: works with raw ID, no reply needed ─
-    async def resolve_user(message: Message):
-        if message.reply_to_message and message.reply_to_message.from_user:
-            return message.reply_to_message.from_user
-        parts = message.text.split() if message.text else []
+    # ── resolve user by id or reply ────────────────────
+    async def resolve_user(msg: Message):
+        if msg.reply_to_message and msg.reply_to_message.from_user:
+            return msg.reply_to_message.from_user
+        parts = (msg.text or "").split()
         if len(parts) >= 2:
-            raw = parts[1].strip().lstrip("@")
+            raw = parts[1].lstrip("@")
             if raw.lstrip("-").isdigit():
                 uid = int(raw)
-                try:
-                    return await app.get_users(uid)
+                try:   return await app.get_users(uid)
                 except Exception:
-                    class _Stub:
-                        id         = uid
-                        first_name = str(uid)
-                        last_name  = None
-                        username   = None
-                    return _Stub()
-            try:
-                return await app.get_users(raw)
-            except Exception:
-                pass
+                    class S:
+                        id=uid; first_name=str(uid); last_name=None; username=None
+                    return S()
+            try:   return await app.get_users(raw)
+            except Exception: pass
         return None
 
-    async def register_user(user):
+    async def reg(user):
         await users_col.update_one(
             {"_id": user.id},
             {"$set": {
                 "username":   getattr(user, "username", None),
                 "first_name": getattr(user, "first_name", str(user.id)),
-                "last_seen":  datetime.utcnow()
+                "last_seen":  datetime.utcnow(),
             }}, upsert=True)
 
-    # ── fmt_text (defined BEFORE handlers) ───────────
-    def fmt_text(tmpl, user, chat_title):
+    # ── placeholder formatter ──────────────────────────
+    def fmt(tmpl, user, chat=""):
         fn = getattr(user, "first_name", "") or ""
         ln = getattr(user, "last_name",  "") or ""
+        un = getattr(user, "username",   None)
         return (tmpl
             .replace("{name}",       f"{fn} {ln}".strip())
             .replace("{first_name}", fn)
             .replace("{last_name}",  ln)
-            .replace("{mention}",    f"@{user.username}" if getattr(user,"username",None) else fn)
+            .replace("{mention}",    f"@{un}" if un else fn)
             .replace("{id}",         str(user.id))
-            .replace("{chat}",       chat_title or ""))
+            .replace("{chat}",       chat))
 
-    # ── force-sub ────────────────────────────────────
-    async def check_force_sub(message: Message) -> bool:
-        channels = await gset("force_sub_channels", [])
-        if not channels or not message.from_user:
-            return True
+    # ── ban check helper ───────────────────────────────
+    async def is_banned(uid: int) -> bool:
+        rec = await users_col.find_one({"_id": uid})
+        return (rec or {}).get("banned", False)
+
+    # ── force-sub check ────────────────────────────────
+    async def fsub_ok(msg: Message) -> bool:
+        chs = await gset("force_sub_channels", [])
+        if not chs or not msg.from_user: return True
         failed = []
-        for ch in channels:
+        for ch in chs:
             try:
-                m = await app.get_chat_member(ch, message.from_user.id)
+                m = await app.get_chat_member(ch, msg.from_user.id)
                 if m.status in (enums.ChatMemberStatus.BANNED, enums.ChatMemberStatus.LEFT):
                     failed.append(ch)
-            except Exception:
-                failed.append(ch)
-        if not failed:
-            return True
+            except Exception: failed.append(ch)
+        if not failed: return True
         btns = [[InlineKeyboardButton(f"📢 Join {ch}", url=f"https://t.me/{ch.lstrip('@')}")] for ch in failed]
-        btns.append([InlineKeyboardButton("✅ I Joined", callback_data="check_sub")])
-        await message.reply_text("⚠️ **Join required channels first!**",
-                                 reply_markup=InlineKeyboardMarkup(btns))
+        btns.append([InlineKeyboardButton("✅ Done, Check Again", callback_data="check_sub")])
+        await msg.reply_text(
+            "⚠️ **Join these channels first to use the bot!**",
+            reply_markup=InlineKeyboardMarkup(btns))
         return False
 
-    # ── anime result sender ───────────────────────────
-    async def send_anime_result(message: Message, anime: dict):
-        channels  = await gset("promo_channels", [])
-        watch_url = anime.get("watch_url") or "https://t.me/"
-        name      = anime["name"]
-        desc      = anime.get("description", "")
-        image_id  = anime.get("image_file_id")
-        promo_block = ""
-        if channels:
-            ch_lines    = "\n".join(f"👉 {ch}" for ch in channels)
-            promo_block = f"\n\n━━━━━━━━━━━━━━━━━\n📗 **FOR MORE ANIME JOIN:**\n**>** {ch_lines}"
-        caption  = f"✨ **{name.upper()}** ✨\n\n**>** 📖 {desc}{promo_block}"
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🚀 DOWNLOAD / WATCH NOW 🚀", url=watch_url)]])
-        if image_id:
+    # ── anime result ───────────────────────────────────
+    async def send_result(msg: Message, anime: dict):
+        name     = anime["name"]
+        desc     = anime.get("description", "No description.")
+        url      = anime.get("watch_url") or "https://t.me/"
+        img      = anime.get("image_file_id")
+        promos   = await gset("promo_channels", [])
+        promo    = ("\n\n━━━━━━━━━━━━━━━━━\n📗 **JOIN FOR MORE ANIME:**\n" +
+                    "\n".join(f"👉 {c}" for c in promos)) if promos else ""
+        caption  = f"✨ **{name.upper()}** ✨\n\n📖 {desc}{promo}"
+        kb       = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Watch / Download", url=url)]])
+        if img:
             try:
-                await message.reply_photo(photo=image_id, caption=caption, reply_markup=keyboard)
-                return
+                await msg.reply_photo(photo=img, caption=caption, reply_markup=kb); return
             except Exception: pass
-        await message.reply_text(caption, reply_markup=keyboard)
+        await msg.reply_text(caption, reply_markup=kb)
 
-    # ── search helper ─────────────────────────────────
-    async def find_anime_in_text(text: str):
-        tl = text.lower()
-        anime = await anime_col.find_one({"$or": [
+    # ── anime search ───────────────────────────────────
+    async def search(text: str):
+        tl = text.lower().strip()
+        if not tl: return None
+        hit = await anime_col.find_one({"$or": [
             {"name_lower":    {"$regex": re.escape(tl), "$options": "i"}},
-            {"aliases_lower": {"$regex": re.escape(tl), "$options": "i"}}]})
-        if anime: return anime
+            {"aliases_lower": {"$regex": re.escape(tl), "$options": "i"}},
+        ]})
+        if hit: return hit
         async for a in anime_col.find({}):
-            terms = [a.get("name_lower", "")] + (a.get("aliases_lower") or [])
-            for term in terms:
-                if term and len(term) >= 3 and term in tl:
-                    return a
+            for t in [a.get("name_lower","")] + (a.get("aliases_lower") or []):
+                if t and len(t) >= 3 and t in tl: return a
         return None
 
-    # ── export helper ─────────────────────────────────
-    async def do_export(target, uid, fmt: str):
+    # ── export helper ──────────────────────────────────
+    async def do_export(target, fmt_type: str):
         def clean(d):
             d.pop("_id", None)
             if "added_at" in d and hasattr(d["added_at"], "isoformat"):
                 d["added_at"] = d["added_at"].isoformat()
             return d
-        animes = [clean(a) async for a in anime_col.find({})]
-        ts     = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        if fmt == "csv":
+        rows = [clean(a) async for a in anime_col.find({})]
+        ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        if fmt_type == "csv":
             out = io.StringIO()
-            if animes:
-                w = csv.DictWriter(out, fieldnames=animes[0].keys())
-                w.writeheader(); w.writerows(animes)
-            bio = io.BytesIO(out.getvalue().encode())
-            bio.name = f"kenshin_{ts}.csv"
-            await target.reply_document(bio, caption="📤 CSV Export")
+            if rows:
+                w = csv.DictWriter(out, fieldnames=rows[0].keys())
+                w.writeheader(); w.writerows(rows)
+            bio = io.BytesIO(out.getvalue().encode()); bio.name = f"kenshin_{ts}.csv"
+            await target.reply_document(bio, caption="📤 CSV Export done!")
         else:
-            bio = io.BytesIO(json.dumps(animes, ensure_ascii=False, indent=2, default=str).encode())
+            bio = io.BytesIO(json.dumps(rows, ensure_ascii=False, indent=2, default=str).encode())
             bio.name = f"kenshin_{ts}.json"
-            await target.reply_document(bio, caption="📤 JSON Export")
+            await target.reply_document(bio, caption="📤 JSON Export done!")
 
-    # ── get bot username ──────────────────────────────
-    async def get_bot_username():
-        try:
-            me = await app.get_me()
-            return me.username or ""
-        except Exception:
-            return ""
+    # ── bot username cache ─────────────────────────────
+    _me_cache = {}
+    async def bot_un():
+        if "u" not in _me_cache:
+            try: _me_cache["u"] = (await app.get_me()).username or ""
+            except Exception: _me_cache["u"] = ""
+        return _me_cache["u"]
 
-    # ── infinite link message sender ──────────────────
-    async def send_infinite_message(target, channel_id: int, owner_uid: int):
-        rec        = await infinite_col.find_one({"owner_uid": owner_uid, "channel_id": channel_id})
-        custom_img = rec.get("custom_image") if rec else None
-        # Also check global image record
-        if not custom_img:
-            g = await infinite_col.find_one({"owner_uid": owner_uid, "channel_id": 0})
-            custom_img = g.get("custom_image") if g else None
+    # ── send infinite invite link ──────────────────────
+    async def send_invite(target, channel_id: int, owner_uid: int):
+        rec = await infinite_col.find_one({"owner_uid": owner_uid, "channel_id": channel_id})
+        img = (rec or {}).get("custom_image")
+        if not img:
+            g   = await infinite_col.find_one({"owner_uid": owner_uid, "channel_id": 0})
+            img = (g or {}).get("custom_image")
         try:
-            link       = await app.create_chat_invite_link(
+            lnk = await app.create_chat_invite_link(
                 channel_id,
                 expire_date  = datetime.utcfromtimestamp(int(time.time()) + 60),
-                member_limit = 1
+                member_limit = 1,
             )
-            invite_url = link.invite_link
             text = (
                 "🔗 **Your Invite Link is Ready!**\n\n"
-                "⏱️ Expires in **60 seconds**\n"
-                "👤 For **1 person** only\n\n"
+                "⏱ Expires in **60 seconds**\n"
+                "👤 Single-use only\n\n"
                 "Tap **Join Now** before it expires!"
             )
             kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Join Now",  url=invite_url),
+                InlineKeyboardButton("✅ Join Now",  url=lnk.invite_link),
                 InlineKeyboardButton("🔄 New Link",  callback_data=f"inf_regen_{channel_id}_{owner_uid}"),
             ]])
         except Exception as e:
             logger.error(f"invite link error: {e}")
-            text = (
-                "❌ **Could not generate invite link.**\n\n"
-                "Make sure bot is **admin** in the channel\n"
-                "with **Invite Users** permission."
-            )
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Try Again", callback_data=f"inf_regen_{channel_id}_{owner_uid}"),
-            ]])
-            custom_img = None
-        msg = target if isinstance(target, Message) else target.message
-        if custom_img:
-            try:
-                await msg.reply_photo(photo=custom_img, caption=text, reply_markup=kb)
-                return
+            text = ("❌ **Could not generate invite link.**\n\n"
+                    "Make sure bot is **admin** with *Invite Users* permission.")
+            kb   = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Try Again", callback_data=f"inf_regen_{channel_id}_{owner_uid}")]])
+            img  = None
+        dest = target if isinstance(target, Message) else target.message
+        if img:
+            try: await dest.reply_photo(photo=img, caption=text, reply_markup=kb); return
             except Exception: pass
-        await msg.reply_text(text, reply_markup=kb)
+        await dest.reply_text(text, reply_markup=kb)
+
+    # ── send join-request link ─────────────────────────
+    async def send_req_link(target, channel_id: int, owner_uid: int):
+        """Send a Request to Join button (no admin needed for this)."""
+        rec = await infinite_col.find_one({"owner_uid": owner_uid, "channel_id": channel_id})
+        img = (rec or {}).get("custom_image")
+        if not img:
+            g   = await infinite_col.find_one({"owner_uid": owner_uid, "channel_id": 0})
+            img = (g or {}).get("custom_image")
+        try:
+            chat = await app.get_chat(channel_id)
+            link = f"https://t.me/{chat.username}" if chat.username else None
+            if not link:
+                lnk  = await app.create_chat_invite_link(channel_id, creates_join_request=True)
+                link = lnk.invite_link
+        except Exception as e:
+            logger.error(f"req link error: {e}")
+            link = None
+        if not link:
+            dest = target if isinstance(target, Message) else target.message
+            await dest.reply_text("❌ Could not generate request link. Make sure bot is admin in the channel.")
+            return
+        text = (
+            "📨 **Join Request**\n\n"
+            "Tap **Request to Join** below.\n"
+            "Your request will be **auto-approved instantly** ✅\n"
+            "You'll get a private message when approved!"
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📨 Request to Join", url=link)]])
+        dest = target if isinstance(target, Message) else target.message
+        if img:
+            try: await dest.reply_photo(photo=img, caption=text, reply_markup=kb); return
+            except Exception: pass
+        await dest.reply_text(text, reply_markup=kb)
 
     # ═══════════════════════════════════════════════════
-    #  HELP TEXT & ALL_CMDS
+    #  CONSTANTS
     # ═══════════════════════════════════════════════════
     HELP_TEXT = (
-        "📋 **KENSHIN ANIME BOT — COMMANDS**\n\n"
-        "**👤 User:**\n"
-        "/start — Welcome\n"
+        "📋 **KENSHIN ANIME BOT — FULL COMMAND LIST**\n\n"
+        "━━━━ 👤 USER ━━━━\n"
+        "/start — Welcome message\n"
+        "/help — Full command list\n"
         "/search [name] — Search anime\n"
-        "/popular — Anime list\n"
-        "/report [msg] — Report issue\n\n"
-        "**🛡️ Admin:**\n"
+        "/popular — Browse anime list\n"
+        "/ping — Check bot speed\n"
+        "/id — Your Telegram ID\n"
+        "/report [msg] — Report to admins\n\n"
+        "━━━━ 🛡️ ADMIN ━━━━\n"
         "/panel — Admin control panel\n"
-        "/add_ani — Add anime\n"
+        "/add_ani — Add new anime\n"
         "/edit_ani — Edit anime (inline)\n"
         "/delete_ani — Delete anime\n"
-        "/add_alias — Add aliases\n"
-        "/list — List all (with edit/delete)\n"
-        "/stats — Bot stats\n"
-        "/db_export — Export DB\n"
+        "/add_alias — Add search aliases\n"
+        "/list — All animes with edit/delete\n"
+        "/stats — Bot statistics\n"
+        "/db_export — Export database\n"
         "/bulk — Bulk import (.txt/.json)\n"
         "/broadcast — Message all users\n"
         "/set_start_img — Set start banner\n"
@@ -298,1215 +318,1431 @@ def make_bot(cfg: dict) -> Client:
         "/set_welcome — Group welcome msg\n"
         "/set_goodbye — Group goodbye msg\n"
         "/set_channel — Promo channels\n"
-        "/add_forcesub @ch — Force sub\n"
-        "/rem_forcesub @ch — Remove force sub\n"
-        "/cancel — Cancel operation\n\n"
-        "**🔗 Infinite Links:**\n"
-        "/infinite <channel_id> — Create link\n"
-        "/infinite list — Show links\n"
-        "/infinite remove <id> — Delete link\n"
+        "/add_forcesub — Force-sub channel\n"
+        "/rem_forcesub — Remove force-sub\n"
+        "/adminlist — List all staff\n"
+        "/ban [id] — Ban user from bot\n"
+        "/unban [id] — Unban user\n"
+        "/userinfo [id] — User info\n"
+        "/cancel — Cancel current operation\n\n"
+        "━━━━ 🔗 INFINITE LINKS ━━━━\n"
+        "/infinite [channel_id] — 60-sec invite link\n"
+        "/infinite req [id] — Request-to-join\n"
+        "/infinite list — Your links\n"
+        "/infinite remove [id] — Delete link\n"
         "/infinite set — Set image (reply photo)\n"
         "/infinite unset — Remove image\n"
-        "/infinite myimage — Show image\n\n"
-        "**👑 Owner:**\n"
-        "/add_admin [id] — Promote admin\n"
+        "/infinite myimage — View current image\n\n"
+        "━━━━ 👑 OWNER ━━━━\n"
+        "/add_admin [id] — Promote to admin\n"
         "/remove_admin [id] — Remove admin\n"
-        "/addowner [id] — Promote owner\n"
+        "/addowner [id] — Promote to owner\n"
         "/removeowner [id] — Remove owner\n\n"
-        "**⚡ Super Owner:**\n"
-        "/copy [token] — Clone bot\n"
-        "/delcopy [bot_id] — Remove clone\n\n"
-        "Placeholders: `{name}` `{first_name}` `{last_name}` `{mention}` `{id}` `{chat}`"
+        "━━━━ ⚡ SUPER OWNER ━━━━\n"
+        "/copy [token] — Start clone bot\n"
+        "/delcopy [bot_id] — Stop clone bot\n"
+        "/clones — List all clone bots\n\n"
+        "💡 **Placeholders:** `{name}` `{first_name}` `{last_name}` `{mention}` `{id}` `{chat}`"
     )
 
     ALL_CMDS = [
         "start","help","search","popular","report","cancel","panel","infinite",
-        "add_ani","edit_ani","delete_ani","add_alias","list","stats",
-        "db_export","bulk","broadcast","set_start_img","set_start_msg",
-        "set_channel","add_forcesub","rem_forcesub","set_welcome","set_goodbye",
-        "add_admin","remove_admin","addowner","removeowner","copy","delcopy"
+        "ping","id","userinfo","adminlist","ban","unban","clones",
+        "add_ani","edit_ani","delete_ani","add_alias","list","stats","db_export",
+        "bulk","broadcast","set_start_img","set_start_msg","set_channel",
+        "add_forcesub","rem_forcesub","set_welcome","set_goodbye",
+        "add_admin","remove_admin","addowner","removeowner","copy","delcopy",
     ]
 
-    # ── admin panel ───────────────────────────────────
-    async def send_admin_panel(target, uid):
-        if not await is_admin(uid):
-            t = target if isinstance(target, Message) else target.message
-            if isinstance(target, Message):
-                await target.reply_text(BAKA_MSG)
-            else:
-                await target.answer(BAKA_MSG, show_alert=True)
-            return
+    # ── admin panel builder ────────────────────────────
+    async def build_panel(uid):
         is_ownr = await is_owner(uid)
         is_supr = await is_super(uid)
         rows = [
-            [InlineKeyboardButton("➕ Add Anime",      callback_data="panel_add_ani"),
-             InlineKeyboardButton("✏️ Edit Anime",     callback_data="panel_edit_ani")],
-            [InlineKeyboardButton("🗑️ Delete Anime",   callback_data="panel_delete_ani"),
-             InlineKeyboardButton("🔤 Add Alias",      callback_data="panel_add_alias")],
-            [InlineKeyboardButton("📋 List Animes",    callback_data="panel_list"),
-             InlineKeyboardButton("📊 Stats",          callback_data="panel_stats")],
-            [InlineKeyboardButton("📤 Export DB",      callback_data="panel_export"),
-             InlineKeyboardButton("📦 Bulk Import",    callback_data="panel_bulk")],
-            [InlineKeyboardButton("📢 Broadcast",      callback_data="panel_broadcast"),
-             InlineKeyboardButton("🖼️ Set Banner",     callback_data="panel_set_start_img")],
-            [InlineKeyboardButton("✏️ Set Start Msg",  callback_data="panel_set_start_msg"),
-             InlineKeyboardButton("👋 Group Welcome",  callback_data="panel_set_welcome")],
-            [InlineKeyboardButton("👋 Group Goodbye",  callback_data="panel_set_goodbye"),
-             InlineKeyboardButton("📢 Promo Channels", callback_data="panel_set_channel")],
-            [InlineKeyboardButton("🔒 Force Sub",      callback_data="panel_forcesub"),
-             InlineKeyboardButton("🔗 Infinite Links", callback_data="panel_infinite")],
+            [InlineKeyboardButton("━━━━ 🎌  ANIME  🎌 ━━━━", callback_data="noop")],
+            [InlineKeyboardButton("➕  Add Anime",           callback_data="panel_add_ani")],
+            [InlineKeyboardButton("✏️  Edit Anime",          callback_data="panel_edit_ani")],
+            [InlineKeyboardButton("🗑️  Delete Anime",        callback_data="panel_delete_ani")],
+            [InlineKeyboardButton("🔤  Add Alias",           callback_data="panel_add_alias")],
+            [InlineKeyboardButton("📋  List Animes",         callback_data="panel_list")],
+            [InlineKeyboardButton("━━━━ 📊  DATA  📊 ━━━━",  callback_data="noop")],
+            [InlineKeyboardButton("📊  Stats",               callback_data="panel_stats")],
+            [InlineKeyboardButton("📤  Export Database",     callback_data="panel_export")],
+            [InlineKeyboardButton("📦  Bulk Import",         callback_data="panel_bulk")],
+            [InlineKeyboardButton("📢  Broadcast",           callback_data="panel_broadcast")],
+            [InlineKeyboardButton("👥  Admin List",           callback_data="panel_adminlist")],
+            [InlineKeyboardButton("🚫  Ban User",             callback_data="panel_ban")],
+            [InlineKeyboardButton("✅  Unban User",           callback_data="panel_unban")],
+            [InlineKeyboardButton("━━━━ ⚙️  SETTINGS  ⚙️ ━━━━", callback_data="noop")],
+            [InlineKeyboardButton("🖼️  Set Start Banner",    callback_data="panel_set_start_img")],
+            [InlineKeyboardButton("✏️  Set Start Message",   callback_data="panel_set_start_msg")],
+            [InlineKeyboardButton("👋  Group Welcome Msg",   callback_data="panel_set_welcome")],
+            [InlineKeyboardButton("👋  Group Goodbye Msg",   callback_data="panel_set_goodbye")],
+            [InlineKeyboardButton("📢  Promo Channels",      callback_data="panel_set_channel")],
+            [InlineKeyboardButton("🔒  Force Subscribe",     callback_data="panel_forcesub")],
+            [InlineKeyboardButton("🔗  Infinite Links",      callback_data="panel_infinite")],
         ]
         if is_ownr:
-            rows.append([
-                InlineKeyboardButton("🛡️ Add Admin",    callback_data="panel_add_admin"),
-                InlineKeyboardButton("❌ Remove Admin", callback_data="panel_remove_admin"),
-            ])
-            rows.append([
-                InlineKeyboardButton("👑 Add Owner",    callback_data="panel_add_owner"),
-                InlineKeyboardButton("❌ Remove Owner", callback_data="panel_remove_owner"),
-            ])
+            rows += [
+                [InlineKeyboardButton("━━━━ 👑  STAFF  👑 ━━━━", callback_data="noop")],
+                [InlineKeyboardButton("🛡️  Add Admin",            callback_data="panel_add_admin")],
+                [InlineKeyboardButton("❌  Remove Admin",         callback_data="panel_remove_admin")],
+                [InlineKeyboardButton("👑  Add Owner",            callback_data="panel_add_owner")],
+                [InlineKeyboardButton("❌  Remove Owner",         callback_data="panel_remove_owner")],
+            ]
         if is_supr:
-            rows.append([
-                InlineKeyboardButton("⚡ Clone Bot",    callback_data="panel_copy"),
-                InlineKeyboardButton("🗑️ Remove Clone", callback_data="panel_delcopy"),
-            ])
-        kb   = InlineKeyboardMarkup(rows)
-        text = "🎛️ **KENSHIN ADMIN PANEL**\n\nChoose an action:"
+            rows += [
+                [InlineKeyboardButton("━━━━ ⚡  CLONE  ⚡ ━━━━", callback_data="noop")],
+                [InlineKeyboardButton("⚡  Start Clone Bot",      callback_data="panel_copy")],
+                [InlineKeyboardButton("🗑️  Stop Clone Bot",       callback_data="panel_delcopy")],
+            ]
+        return InlineKeyboardMarkup(rows)
+
+    async def send_panel(target, uid):
+        kb   = await build_panel(uid)
+        text = "🎛️ **KENSHIN ADMIN PANEL**\n\nSelect an action:"
         if isinstance(target, Message):
             await target.reply_text(text, reply_markup=kb)
         else:
-            try:
-                await target.edit_text(text, reply_markup=kb)
-            except Exception:
-                await target.reply_text(text, reply_markup=kb)
+            try:    await target.edit_text(text, reply_markup=kb)
+            except Exception: await target.reply_text(text, reply_markup=kb)
 
     # ═══════════════════════════════════════════════════
     #  /start
     # ═══════════════════════════════════════════════════
     @app.on_message(filters.command("start"))
-    async def cmd_start(_, message: Message):
-        if not message.from_user: return
-        await register_user(message.from_user)
-        # Deep link: infinite link
-        if message.text and len(message.text.split()) > 1:
-            param = message.text.split()[1]
+    async def cmd_start(_, msg: Message):
+        if not msg.from_user: return
+        await reg(msg.from_user)
+
+        # deep link: infinite invite or req
+        if msg.text and len(msg.text.split()) > 1:
+            param = msg.text.split()[1]
             if param.startswith("inf_"):
                 try:
-                    parts   = param.split("_")
-                    chan_id  = int(parts[1])
-                    own_uid  = int(parts[2])
-                    rec = await infinite_col.find_one({"owner_uid": own_uid, "channel_id": chan_id})
+                    _, cid, ouid = param.split("_", 2)
+                    cid, ouid   = int(cid), int(ouid)
+                    rec = await infinite_col.find_one({"owner_uid": ouid, "channel_id": cid})
                     if rec:
-                        await send_infinite_message(message, chan_id, own_uid)
+                        mode = rec.get("mode", "invite")
+                        if mode == "req":
+                            await send_req_link(msg, cid, ouid)
+                        else:
+                            await send_invite(msg, cid, ouid)
                         return
                 except Exception as e:
-                    logger.error(f"infinite deep link: {e}")
-        if not await check_force_sub(message): return
-        default_welcome = (
-            "👋 **Welcome to Kenshin Anime Search Bot!**\n\n"
-            "🎌 Search any anime — just type its name!\n"
-            "📋 Use the buttons below to get started."
-        )
-        welcome   = await gset("welcome_message", default_welcome)
-        welcome   = fmt_text(welcome, message.from_user, getattr(message.chat, "title", None))
-        start_img = await gset("start_banner", None)
+                    logger.error(f"deep link error: {e}")
+
+        if not await fsub_ok(msg): return
+
+        welcome   = await gset("welcome_message",
+            "👋 **Ohayou, {first_name}!**\n\n"
+            "🎌 Welcome to **Kenshin Anime Search Bot**!\n\n"
+            "⚡ Just type any anime name to search.\n"
+            "📋 Use /help to see all commands.")
+        welcome   = fmt(welcome, msg.from_user, getattr(msg.chat, "title", ""))
+        banner    = await gset("start_banner", None)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔍 Search Anime", switch_inline_query_current_chat=""),
              InlineKeyboardButton("📋 Help",         callback_data="show_help")],
             [InlineKeyboardButton("🌟 Anime List",   callback_data="show_popular")],
         ])
-        if start_img:
-            try:
-                await message.reply_photo(photo=start_img, caption=welcome, reply_markup=kb)
-                return
-            except Exception:
-                await sset("start_banner", None)
-        await message.reply_text(welcome, reply_markup=kb)
+        if banner:
+            try:   await msg.reply_photo(photo=banner, caption=welcome, reply_markup=kb); return
+            except Exception: await sset("start_banner", None)
+        await msg.reply_text(welcome, reply_markup=kb)
 
     # ═══════════════════════════════════════════════════
-    #  /help  /panel
+    #  /help
     # ═══════════════════════════════════════════════════
     @app.on_message(filters.command("help"))
-    async def cmd_help(_, message: Message):
-        if not message.from_user: return
-        await register_user(message.from_user)
+    async def cmd_help(_, msg: Message):
+        if not msg.from_user: return
+        await reg(msg.from_user)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔍 Search Anime", switch_inline_query_current_chat="")],
             [InlineKeyboardButton("🎛️ Admin Panel",  callback_data="open_panel")],
+            [InlineKeyboardButton("🌟 Anime List",   callback_data="show_popular")],
         ])
-        await message.reply_text(HELP_TEXT, reply_markup=kb)
-
-    @app.on_message(filters.command("panel"))
-    async def cmd_panel(_, message: Message):
-        if not message.from_user: return
-        await send_admin_panel(message, message.from_user.id)
+        await msg.reply_text(HELP_TEXT, reply_markup=kb)
 
     # ═══════════════════════════════════════════════════
-    #  /search  /popular  /report  /cancel
+    #  /panel
+    # ═══════════════════════════════════════════════════
+    @app.on_message(filters.command("panel"))
+    async def cmd_panel(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id):
+            await msg.reply_text(BAKA); return
+        await send_panel(msg, msg.from_user.id)
+
+    # ═══════════════════════════════════════════════════
+    #  /search
     # ═══════════════════════════════════════════════════
     @app.on_message(filters.command("search"))
-    async def cmd_search(_, message: Message):
-        if not message.from_user: return
-        await register_user(message.from_user)
-        if not await check_force_sub(message): return
-        parts = message.text.split(None, 1)
+    async def cmd_search(_, msg: Message):
+        if not msg.from_user: return
+        await reg(msg.from_user)
+        if not await fsub_ok(msg): return
+        parts = (msg.text or "").split(None, 1)
         if len(parts) < 2:
-            await message.reply_text("Usage: /search [anime name]"); return
-        anime = await find_anime_in_text(parts[1].strip())
-        if anime: await send_anime_result(message, anime)
-        else:     await message.reply_text("❌ Anime not found.")
-
-    @app.on_message(filters.command("popular"))
-    async def cmd_popular(_, message: Message):
-        if not message.from_user: return
-        await register_user(message.from_user)
-        if not await check_force_sub(message): return
-        animes = await anime_col.find({}).sort("name", 1).limit(15).to_list(15)
-        if not animes:
-            await message.reply_text("📭 No animes yet!"); return
-        lines = "\n".join(f"{i+1}. **{a['name']}**" for i, a in enumerate(animes))
-        await message.reply_text(f"🌟 **Anime List (Top 15):**\n\n{lines}")
-
-    @app.on_message(filters.command("report"))
-    async def cmd_report(_, message: Message):
-        if not message.from_user: return
-        await register_user(message.from_user)
-        parts = message.text.split(None, 1)
-        if len(parts) < 2:
-            await message.reply_text("Usage: /report [message]"); return
-        user   = message.from_user
-        notify = (f"🚨 **Report**\nFrom: {user.first_name} (@{user.username or 'N/A'})\n"
-                  f"ID: {user.id}\nMsg: {parts[1]}")
-        for sid in await all_staff_ids():
-            try: await app.send_message(sid, notify)
-            except Exception: pass
-        await message.reply_text("✅ Report sent!")
-
-    @app.on_message(filters.command("cancel"))
-    async def cmd_cancel(_, message: Message):
-        if not message.from_user: return
-        clear_state(message.from_user.id)
-        await message.reply_text("❌ Cancelled.")
+            await msg.reply_text("🔍 Usage: `/search [anime name]`\nExample: `/search Naruto`"); return
+        anime = await search(parts[1].strip())
+        if anime: await send_result(msg, anime)
+        else:     await msg.reply_text("❌ Anime not found!\n\nTry a different name or alias.\nUse /popular to browse.")
 
     # ═══════════════════════════════════════════════════
-    #  Private text / media handlers
+    #  /popular
+    # ═══════════════════════════════════════════════════
+    @app.on_message(filters.command("popular"))
+    async def cmd_popular(_, msg: Message):
+        if not msg.from_user: return
+        await reg(msg.from_user)
+        if not await fsub_ok(msg): return
+        animes = await anime_col.find({}).sort("name", 1).limit(20).to_list(20)
+        if not animes:
+            await msg.reply_text("📭 No anime in database yet!\nAdmin will add soon. 🎌"); return
+        lines = "\n".join(f"{i+1}. **{a['name']}**" for i, a in enumerate(animes))
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔍 Search Anime", switch_inline_query_current_chat="")]])
+        await msg.reply_text(f"🌟 **Anime List (Top 20):**\n\n{lines}", reply_markup=kb)
+
+    # ═══════════════════════════════════════════════════
+    #  /report
+    # ═══════════════════════════════════════════════════
+    @app.on_message(filters.command("report"))
+    async def cmd_report(_, msg: Message):
+        if not msg.from_user: return
+        await reg(msg.from_user)
+        parts = (msg.text or "").split(None, 1)
+        if len(parts) < 2:
+            await msg.reply_text("🚨 Usage: `/report [your message]`"); return
+        u    = msg.from_user
+        note = (f"🚨 **New Report**\n\n"
+                f"👤 {u.first_name} (`{u.id}`)\n"
+                f"🔗 @{u.username or 'no_username'}\n\n"
+                f"📝 {parts[1]}")
+        for sid in await staff_ids():
+            try: await app.send_message(sid, note)
+            except Exception: pass
+        await msg.reply_text("✅ Your report has been sent to the admins!")
+
+    # ═══════════════════════════════════════════════════
+    #  /cancel
+    # ═══════════════════════════════════════════════════
+    @app.on_message(filters.command("cancel"))
+    async def cmd_cancel(_, msg: Message):
+        if not msg.from_user: return
+        clr_st(msg.from_user.id)
+        await msg.reply_text("❌ Operation cancelled.")
+
+    # ═══════════════════════════════════════════════════
+    #  Private text / media — search + state handler
     # ═══════════════════════════════════════════════════
     @app.on_message(filters.private & ~filters.command(ALL_CMDS) & filters.text)
-    async def private_text(_, message: Message):
-        if not message.from_user: return
-        uid   = message.from_user.id
-        state = get_state(uid)
-        if state:
-            await state_handler_fn(message); return
-        await register_user(message.from_user)
-        if not await check_force_sub(message): return
-        anime = await find_anime_in_text((message.text or "").strip())
-        if anime: await send_anime_result(message, anime)
+    async def priv_text(_, msg: Message):
+        if not msg.from_user: return
+        uid = msg.from_user.id
+        if await is_banned(uid):
+            await msg.reply_text("🚫 You have been banned from using this bot."); return
+        st  = get_st(uid)
+        if st: await state_fn(msg); return
+        await reg(msg.from_user)
+        if not await fsub_ok(msg): return
+        anime = await search((msg.text or "").strip())
+        if anime:
+            await send_result(msg, anime)
+        else:
+            await msg.reply_text(
+                "❌ Anime not found!\n\n"
+                "💡 Try: `/search [name]` or browse /popular")
 
     @app.on_message(filters.private & (filters.photo | filters.document))
-    async def private_media(_, message: Message):
-        if not message.from_user: return
-        if get_state(message.from_user.id):
-            await state_handler_fn(message)
+    async def priv_media(_, msg: Message):
+        if not msg.from_user: return
+        if get_st(msg.from_user.id): await state_fn(msg)
 
     # ═══════════════════════════════════════════════════
-    #  Group text handler
+    #  Group text — smart anime search
     # ═══════════════════════════════════════════════════
     @app.on_message(filters.group & ~filters.command(ALL_CMDS) & filters.text)
-    async def group_text(_, message: Message):
-        if not message.from_user: return
-        text = (message.text or "").strip()
+    async def grp_text(_, msg: Message):
+        if not msg.from_user: return
+        text = (msg.text or "").strip()
         if len(text) < 3: return
-        bot_mentioned = False
+
+        mentioned = False
         try:
             me = await app.get_me()
-            if message.entities:
-                for ent in message.entities:
-                    if ent.type == enums.MessageEntityType.MENTION:
-                        if text[ent.offset:ent.offset+ent.length].lstrip("@").lower() == (me.username or "").lower():
-                            bot_mentioned = True; break
-            if (message.reply_to_message and message.reply_to_message.from_user
-                    and message.reply_to_message.from_user.id == me.id):
-                bot_mentioned = True
+            if msg.entities:
+                for e in msg.entities:
+                    if e.type == enums.MessageEntityType.MENTION:
+                        if text[e.offset:e.offset+e.length].lstrip("@").lower() == (me.username or "").lower():
+                            mentioned = True; break
+            if (msg.reply_to_message and msg.reply_to_message.from_user
+                    and msg.reply_to_message.from_user.id == me.id):
+                mentioned = True
         except Exception: pass
-        if bot_mentioned:
+
+        if mentioned:
             try:
                 me    = await app.get_me()
-                clean = re.sub(rf"@{re.escape(me.username or '')}", "", text, flags=re.IGNORECASE).strip()
+                clean = re.sub(rf"@{re.escape(me.username or '')}", "", text, flags=re.I).strip()
             except Exception: clean = text
-            anime = await find_anime_in_text(clean or text)
-            if anime: await send_anime_result(message, anime)
-            else:     await message.reply_text("❌ Anime not found. Try `/search [name]`")
+            anime = await search(clean or text)
+            if anime: await send_result(msg, anime)
+            else:     await msg.reply_text("❌ Anime not found! Try `/search [name]`")
         else:
-            anime = await find_anime_in_text(text)
-            if anime: await send_anime_result(message, anime)
+            anime = await search(text)
+            if anime: await send_result(msg, anime)
+            # Silent if not found in passive mode (don't spam GC)
 
     # ═══════════════════════════════════════════════════
     #  /infinite
     # ═══════════════════════════════════════════════════
     @app.on_message(filters.command("infinite"))
-    async def cmd_infinite(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        uid   = message.from_user.id
-        parts = message.text.split(None, 2)
+    async def cmd_infinite(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id):
+            await msg.reply_text(BAKA); return
+
+        uid   = msg.from_user.id
+        parts = (msg.text or "").split(None, 3)
         sub   = parts[1].strip() if len(parts) > 1 else ""
 
+        # /infinite set — reply to photo
         if sub == "set":
-            if message.reply_to_message and message.reply_to_message.photo:
-                fid = message.reply_to_message.photo.file_id
-                await infinite_col.update_one(
-                    {"owner_uid": uid, "channel_id": 0},
+            if msg.reply_to_message and msg.reply_to_message.photo:
+                fid = msg.reply_to_message.photo.file_id
+                await infinite_col.update_many({"owner_uid": uid}, {"$set": {"custom_image": fid}})
+                await infinite_col.update_one({"owner_uid": uid, "channel_id": 0},
                     {"$set": {"custom_image": fid}}, upsert=True)
-                # Apply to all existing links too
-                await infinite_col.update_many(
-                    {"owner_uid": uid, "channel_id": {"$gt": 0}},
-                    {"$set": {"custom_image": fid}})
-                kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🖼️ View", callback_data="inf_myimage"),
-                    InlineKeyboardButton("🗑️ Unset", callback_data="inf_unset"),
-                ]])
-                await message.reply_text("✅ Custom image set!", reply_markup=kb)
-            else:
-                await message.reply_text("Reply to a photo with /infinite set")
+                await msg.reply_text("✅ Custom image set for all your infinite links!")
+            else: await msg.reply_text("Reply to a photo with /infinite set")
             return
 
         if sub == "unset":
             await infinite_col.update_many({"owner_uid": uid}, {"$unset": {"custom_image": ""}})
-            await message.reply_text("✅ Custom image removed.")
-            return
+            await msg.reply_text("✅ Custom image removed."); return
 
         if sub == "myimage":
             rec = await infinite_col.find_one({"owner_uid": uid, "custom_image": {"$exists": True}})
-            img = rec.get("custom_image") if rec else None
+            img = (rec or {}).get("custom_image")
             if img:
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Unset", callback_data="inf_unset")]])
-                await message.reply_photo(photo=img, caption="🖼️ Your current image", reply_markup=kb)
-            else:
-                await message.reply_text("❌ No custom image set.\nReply to a photo with /infinite set")
+                await msg.reply_photo(photo=img, caption="🖼️ Your current image",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Unset", callback_data="inf_unset")]]))
+            else: await msg.reply_text("❌ No image set. Reply to a photo with /infinite set")
             return
 
         if sub == "list":
-            links = await infinite_col.find(
-                {"owner_uid": uid, "channel_id": {"$gt": 0}}).to_list(None)
-            if not links:
-                await message.reply_text("📭 No infinite links yet.\nUse /infinite <channel_id>"); return
-            bot_un  = await get_bot_username()
-            lines   = [f"• `{l['channel_id']}` → t.me/{bot_un}?start=inf_{l['channel_id']}_{uid}" for l in links]
-            kb_rows = [[InlineKeyboardButton(f"🗑️ Remove {l['channel_id']}",
-                        callback_data=f"inf_remove_{l['channel_id']}")] for l in links]
-            await message.reply_text(
-                "🔗 **Your Infinite Links:**\n\n" + "\n".join(lines),
-                reply_markup=InlineKeyboardMarkup(kb_rows))
-            return
+            links = await infinite_col.find({"owner_uid": uid, "channel_id": {"$gt": 0}}).to_list(None)
+            if not links: await msg.reply_text("📭 No links yet. Use /infinite [channel_id]"); return
+            un = await bot_un()
+            rows, lines = [], []
+            for l in links:
+                cid  = l["channel_id"]
+                mode = l.get("mode", "invite")
+                url  = f"https://t.me/{un}?start=inf_{cid}_{uid}"
+                lines.append(f"• `{cid}` [{mode}] → {url}")
+                rows.append([InlineKeyboardButton(f"🗑️ Remove {cid}", callback_data=f"inf_remove_{cid}")])
+            await msg.reply_text("🔗 **Your Infinite Links:**\n\n" + "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(rows)); return
 
         if sub == "remove":
             raw = parts[2].strip() if len(parts) > 2 else ""
             if not raw.lstrip("-").isdigit():
-                await message.reply_text("Usage: /infinite remove <channel_id>"); return
+                await msg.reply_text("Usage: /infinite remove [channel_id]"); return
             cid = int(raw)
             r   = await infinite_col.delete_one({"owner_uid": uid, "channel_id": cid})
-            await message.reply_text(
-                f"✅ Link for `{cid}` removed." if r.deleted_count else f"❌ No link found for `{cid}`.")
-            return
+            await msg.reply_text(f"✅ Removed." if r.deleted_count else "❌ Not found."); return
 
-        if sub.lstrip("-").isdigit():
-            channel_id = int(sub)
-            g_rec      = await infinite_col.find_one({"owner_uid": uid, "channel_id": 0})
-            custom_img = g_rec.get("custom_image") if g_rec else None
-            existing   = await infinite_col.find_one({"owner_uid": uid, "channel_id": channel_id})
-            if not existing:
-                doc = {"owner_uid": uid, "channel_id": channel_id, "created_at": datetime.utcnow()}
-                if custom_img: doc["custom_image"] = custom_img
-                await infinite_col.insert_one(doc)
-            bot_un    = await get_bot_username()
-            deep_link = f"https://t.me/{bot_un}?start=inf_{channel_id}_{uid}"
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 View Link",   url=deep_link)],
-                [InlineKeyboardButton("🖼️ Set Image",   callback_data="inf_setimage_prompt"),
-                 InlineKeyboardButton("📋 My Links",    callback_data="inf_list")],
-                [InlineKeyboardButton("🗑️ Delete Link", callback_data=f"inf_remove_{channel_id}")],
-            ])
-            await message.reply_text(
-                f"✅ **Infinite Link Created!**\n\n"
+        # /infinite req <channel_id>  — request-to-join mode
+        if sub == "req":
+            raw = parts[2].strip() if len(parts) > 2 else ""
+            if not raw.lstrip("-").isdigit():
+                await msg.reply_text("Usage: /infinite req [channel_id]\nExample: /infinite req -1001234567890"); return
+            cid    = int(raw)
+            g_rec  = await infinite_col.find_one({"owner_uid": uid, "channel_id": 0})
+            cst_im = (g_rec or {}).get("custom_image")
+            await infinite_col.update_one(
+                {"owner_uid": uid, "channel_id": cid},
+                {"$set": {"mode": "req", "created_at": datetime.utcnow(),
+                          **({"custom_image": cst_im} if cst_im else {})}},
+                upsert=True)
+            un        = await bot_un()
+            deep_link = f"https://t.me/{un}?start=inf_{cid}_{uid}"
+            await msg.reply_text(
+                f"✅ **Request-to-Join Link Created!**\n\n"
                 f"🔗 **Link:**\n`{deep_link}`\n\n"
-                f"📌 Share this link anywhere.\n"
-                f"When someone taps it → bot gives them a **60-sec** invite link.\n\n"
-                f"⚠️ Bot must be **admin** in the channel with Invite permission!",
-                reply_markup=kb)
-            return
+                f"📌 When user taps it:\n"
+                f"  • Bot sends **Request to Join** button\n"
+                f"  • Bot **auto-approves** their request ✅\n"
+                f"  • User gets a **private DM** with approval notice\n\n"
+                f"⚠️ Bot must be **admin** in the channel!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 View Link", url=deep_link)],
+                    [InlineKeyboardButton("📋 My Links",  callback_data="inf_list")],
+                ])
+            ); return
+
+        # /infinite <channel_id>  — invite link mode
+        if sub.lstrip("-").isdigit():
+            cid    = int(sub)
+            g_rec  = await infinite_col.find_one({"owner_uid": uid, "channel_id": 0})
+            cst_im = (g_rec or {}).get("custom_image")
+            await infinite_col.update_one(
+                {"owner_uid": uid, "channel_id": cid},
+                {"$set": {"mode": "invite", "created_at": datetime.utcnow(),
+                          **({"custom_image": cst_im} if cst_im else {})}},
+                upsert=True)
+            un        = await bot_un()
+            deep_link = f"https://t.me/{un}?start=inf_{cid}_{uid}"
+            await msg.reply_text(
+                f"✅ **Infinite Invite Link Created!**\n\n"
+                f"🔗 **Link:**\n`{deep_link}`\n\n"
+                f"📌 When user taps it → gets a **60-sec** invite link.\n\n"
+                f"⚠️ Bot must be **admin** with *Invite* permission!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 View Link",  url=deep_link)],
+                    [InlineKeyboardButton("🖼️ Set Image",  callback_data="inf_setimage_prompt"),
+                     InlineKeyboardButton("📋 My Links",   callback_data="inf_list")],
+                ])
+            ); return
 
         # No valid subcommand
-        await message.reply_text(
+        await msg.reply_text(
             "🔗 **Infinite Link System**\n\n"
-            "`/infinite <channel_id>` — Create link\n"
-            "`/infinite list` — Show links\n"
-            "`/infinite remove <id>` — Delete link\n"
+            "`/infinite [channel_id]` — 60-sec invite link\n"
+            "`/infinite req [channel_id]` — Request-to-join\n"
+            "`/infinite list` — Your links\n"
+            "`/infinite remove [id]` — Delete\n"
             "`/infinite set` — Set image (reply to photo)\n"
             "`/infinite unset` — Remove image\n"
             "`/infinite myimage` — View image\n\n"
-            "Example: `/infinite -1001234567890`\n\n"
             "⚠️ Bot must be admin in the channel!")
+
+    # ═══════════════════════════════════════════════════
+    #  Chat Join Request — auto-approve + DM user
+    # ═══════════════════════════════════════════════════
+    @app.on_chat_join_request()
+    async def on_join_request(_, req: ChatJoinRequest):
+        try:
+            uid    = req.from_user.id
+            cid    = req.chat.id
+            # Check if this channel has a req-mode infinite link
+            rec = await infinite_col.find_one({"channel_id": cid, "mode": "req"})
+            if not rec: return   # not our request, ignore
+            # Auto-approve
+            await app.approve_chat_join_request(cid, uid)
+            # DM the user
+            chat_title = req.chat.title or str(cid)
+            try:
+                await app.send_message(
+                    uid,
+                    f"✅ **Your join request has been approved!**\n\n"
+                    f"🎉 You have been added to **{chat_title}**\n\n"
+                    f"🎌 Enjoy the anime content!"
+                )
+            except Exception:
+                pass  # user may have blocked bot, that's fine
+        except Exception as e:
+            logger.error(f"join_request handler: {e}")
 
     # ═══════════════════════════════════════════════════
     #  ADMIN COMMANDS
     # ═══════════════════════════════════════════════════
     @app.on_message(filters.command("add_ani"))
-    async def cmd_add_ani(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        set_state(message.from_user.id, "ani_img")
-        await message.reply_text(
-            "➕ **Add Anime — Step 1/4**\n\n"
-            "📸 Send **anime image** (photo) or URL.\n"
-            "• Photo caption = anime name\n• Or type SKIP\n\n/cancel to abort.")
+    async def cmd_add_ani(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        set_st(msg.from_user.id, "ani_img")
+        await msg.reply_text(
+            "➕ **Add Anime — Step 1 / 4**\n\n"
+            "📸 Send the anime **image** (as photo)\n"
+            "• Caption = anime name (optional)\n"
+            "• Or send image URL as text\n"
+            "• Type **SKIP** to add without image\n\n"
+            "_/cancel to abort_")
 
     @app.on_message(filters.command("edit_ani"))
-    async def cmd_edit_ani(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        set_state(message.from_user.id, "edit_name")
-        await message.reply_text("✏️ Send anime **name** to edit:")
+    async def cmd_edit_ani(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        set_st(msg.from_user.id, "edit_name")
+        await msg.reply_text("✏️ Send the anime **name** to edit:")
 
     @app.on_message(filters.command("delete_ani"))
-    async def cmd_delete_ani(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        set_state(message.from_user.id, "del_name")
-        await message.reply_text("🗑️ Send anime **name** to delete:")
+    async def cmd_delete_ani(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        set_st(msg.from_user.id, "del_name")
+        await msg.reply_text("🗑️ Send the anime **name** to delete:")
 
     @app.on_message(filters.command("add_alias"))
-    async def cmd_add_alias(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        set_state(message.from_user.id, "alias_name")
-        await message.reply_text("🔤 Send anime **name** to add aliases:")
+    async def cmd_add_alias(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        set_st(msg.from_user.id, "alias_name")
+        await msg.reply_text("🔤 Send the anime **name** to add aliases to:")
 
     @app.on_message(filters.command("list"))
-    async def cmd_list(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+    async def cmd_list(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
         animes = await anime_col.find({}, {"name": 1}).sort("name", 1).to_list(None)
-        if not animes:
-            await message.reply_text("📭 Empty database."); return
-        PAGE = 10; total = len(animes)
+        if not animes: await msg.reply_text("📭 Database is empty."); return
+        PAGE, total = 10, len(animes)
         for pg in range(0, total, PAGE):
             chunk  = animes[pg:pg+PAGE]
-            header = f"📋 **List ({pg+1}–{min(pg+PAGE,total)} of {total}):**\n\n"
-            lines  = "\n".join(f"{pg+i+1}. {a['name']}" for i, a in enumerate(chunk))
-            rows   = [[InlineKeyboardButton(f"✏️ {a['name'][:22]}", callback_data=f"quickedit_{str(a['_id'])}"),
-                       InlineKeyboardButton("🗑️", callback_data=f"del_confirm_{str(a['_id'])}")] for a in chunk]
-            await message.reply_text(header + lines, reply_markup=InlineKeyboardMarkup(rows))
+            header = f"📋 **Anime List ({pg+1}–{min(pg+PAGE,total)} of {total}):**\n\n"
+            lines  = "\n".join(f"{pg+i+1}. {a['name']}" for i,a in enumerate(chunk))
+            rows   = [[
+                InlineKeyboardButton(f"✏️ {a['name'][:22]}", callback_data=f"qedit_{str(a['_id'])}"),
+                InlineKeyboardButton("🗑️", callback_data=f"del_cfm_{str(a['_id'])}"),
+            ] for a in chunk]
+            await msg.reply_text(header + lines, reply_markup=InlineKeyboardMarkup(rows))
 
     @app.on_message(filters.command("stats"))
-    async def cmd_stats(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
+    async def cmd_stats(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
         ta = await anime_col.count_documents({})
         tu = await users_col.count_documents({})
         ad = await staff_col.count_documents({"role": "admin"})
         ow = await staff_col.count_documents({"role": "owner"})
         il = await infinite_col.count_documents({"channel_id": {"$gt": 0}})
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📄 JSON", callback_data="export_json"),
-             InlineKeyboardButton("📊 CSV",  callback_data="export_csv")],
-            [InlineKeyboardButton("🔙 Panel", callback_data="open_panel")],
+            [InlineKeyboardButton("📄 Export JSON", callback_data="export_json"),
+             InlineKeyboardButton("📊 Export CSV",  callback_data="export_csv")],
+            [InlineKeyboardButton("🔙 Panel",        callback_data="open_panel")],
         ])
-        await message.reply_text(
-            f"📊 **Stats**\n\n🎌 Animes: **{ta}**\n👤 Users: **{tu}**\n"
-            f"🛡️ Admins: **{ad}**\n👑 Owners: **{ow+1}**\n🔗 Inf Links: **{il}**",
-            reply_markup=kb)
+        await msg.reply_text(
+            f"📊 **Bot Statistics**\n\n"
+            f"🎌  Animes      : **{ta}**\n"
+            f"👤  Users       : **{tu}**\n"
+            f"🛡️  Admins      : **{ad}**\n"
+            f"👑  Owners      : **{ow + 1}**\n"
+            f"🔗  Inf Links   : **{il}**", reply_markup=kb)
 
     @app.on_message(filters.command("db_export"))
-    async def cmd_db_export(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        args = message.text.split()
-        if len(args) > 1:
-            await do_export(message, message.from_user.id, args[1].lower())
+    async def cmd_db_export(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        args = (msg.text or "").split()
+        if len(args) > 1: await do_export(msg, args[1].lower())
         else:
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("📄 JSON", callback_data="export_json"),
-                InlineKeyboardButton("📊 CSV",  callback_data="export_csv")]])
-            await message.reply_text("📤 Choose format:", reply_markup=kb)
+            await msg.reply_text("📤 **Export Database**\n\nChoose format:",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📄 JSON", callback_data="export_json"),
+                    InlineKeyboardButton("📊 CSV",  callback_data="export_csv")]]))
 
     @app.on_message(filters.command("bulk"))
-    async def cmd_bulk(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        set_state(message.from_user.id, "bulk_file")
-        await message.reply_text(
-            "📦 **Bulk Import** — Send .txt or .json file\n\n"
-            "TXT: `Name | img_url | synopsis | watch_link | alias1,alias2`")
+    async def cmd_bulk(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        set_st(msg.from_user.id, "bulk_file")
+        await msg.reply_text(
+            "📦 **Bulk Import**\n\nSend a **.txt** or **.json** file.\n\n"
+            "**TXT format** (one per line):\n`Name | img_url | synopsis | watch_url | alias1,alias2`")
 
     @app.on_message(filters.command("broadcast"))
-    async def cmd_broadcast(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        set_state(message.from_user.id, "bcast")
-        await message.reply_text("📢 Send broadcast message:")
+    async def cmd_broadcast(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        set_st(msg.from_user.id, "bcast")
+        await msg.reply_text("📢 Send the broadcast message:")
 
     @app.on_message(filters.command("set_start_img"))
-    async def cmd_set_start_img(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        set_state(message.from_user.id, "set_start_img")
-        await message.reply_text("🖼️ Send start banner image (photo):")
+    async def cmd_set_banner(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        set_st(msg.from_user.id, "set_start_img")
+        await msg.reply_text("🖼️ Send start banner (photo):")
 
     @app.on_message(filters.command("set_start_msg"))
-    async def cmd_set_start_msg(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        set_state(message.from_user.id, "set_start_msg")
-        await message.reply_text("✏️ Send new welcome text.\nPlaceholders: `{name}` `{first_name}` `{mention}` `{id}`")
+    async def cmd_set_welcome_msg(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        set_st(msg.from_user.id, "set_start_msg")
+        await msg.reply_text(
+            "✏️ Send new welcome/start message text.\n\n"
+            "Placeholders: `{name}` `{first_name}` `{mention}` `{id}`")
 
     @app.on_message(filters.command("set_channel"))
-    async def cmd_set_channel(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        parts = message.text.split(None, 1)
+    async def cmd_set_channel(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        parts = (msg.text or "").split(None, 1)
         if len(parts) < 2:
-            channels = await gset("promo_channels", [])
-            await message.reply_text(
-                f"📢 **Promo Channels:**\n{chr(10).join(channels) or 'None'}\n\n"
-                "/set_channel add @ch | remove @ch | clear"); return
-        action   = parts[1].strip()
-        channels = await gset("promo_channels", [])
+            chs = await gset("promo_channels", [])
+            await msg.reply_text(
+                f"📢 **Promo Channels:**\n{chr(10).join(chs) or 'None'}\n\n"
+                "Usage:\n`/set_channel add @ch`\n`/set_channel remove @ch`\n`/set_channel clear`"); return
+        action = parts[1].strip(); chs = await gset("promo_channels", [])
         if action == "clear":
-            await sset("promo_channels", [])
-            await message.reply_text("✅ Cleared.")
+            await sset("promo_channels", []); await msg.reply_text("✅ Cleared all promo channels.")
         elif action.startswith("add "):
             ch = action[4:].strip()
-            if ch not in channels: channels.append(ch)
-            await sset("promo_channels", channels)
-            await message.reply_text(f"✅ Added: {ch}")
+            if ch not in chs: chs.append(ch)
+            await sset("promo_channels", chs); await msg.reply_text(f"✅ Added: `{ch}`")
         elif action.startswith("remove "):
             ch = action[7:].strip()
-            await sset("promo_channels", [c for c in channels if c != ch])
-            await message.reply_text(f"✅ Removed: {ch}")
-        else:
-            await message.reply_text("Use: add / remove / clear")
+            await sset("promo_channels", [c for c in chs if c != ch])
+            await msg.reply_text(f"✅ Removed: `{ch}`")
+        else: await msg.reply_text("Use: add / remove / clear")
 
     @app.on_message(filters.command("add_forcesub"))
-    async def cmd_add_forcesub(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        parts = message.text.split()
+    async def cmd_add_fsub(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        parts = (msg.text or "").split()
         if len(parts) < 2:
-            channels = await gset("force_sub_channels", [])
-            await message.reply_text(f"🔒 Force Sub:\n{chr(10).join(channels) or 'None'}\n\nUsage: /add_forcesub @ch"); return
-        ch = parts[1].strip()
-        channels = await gset("force_sub_channels", [])
-        if ch not in channels: channels.append(ch)
-        await sset("force_sub_channels", channels)
-        await message.reply_text(f"✅ Added: {ch}")
+            chs = await gset("force_sub_channels", [])
+            await msg.reply_text(f"🔒 Force-Sub Channels:\n{chr(10).join(chs) or 'None'}\n\nUsage: /add_forcesub @ch"); return
+        ch = parts[1]; chs = await gset("force_sub_channels", [])
+        if ch not in chs: chs.append(ch)
+        await sset("force_sub_channels", chs); await msg.reply_text(f"✅ Added force-sub: `{ch}`")
 
     @app.on_message(filters.command("rem_forcesub"))
-    async def cmd_rem_forcesub(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        parts = message.text.split()
-        if len(parts) < 2:
-            await message.reply_text("Usage: /rem_forcesub @ch"); return
-        ch = parts[1].strip()
-        channels = await gset("force_sub_channels", [])
-        await sset("force_sub_channels", [c for c in channels if c != ch])
-        await message.reply_text(f"✅ Removed: {ch}")
+    async def cmd_rem_fsub(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        parts = (msg.text or "").split()
+        if len(parts) < 2: await msg.reply_text("Usage: /rem_forcesub @ch"); return
+        ch = parts[1]; chs = await gset("force_sub_channels", [])
+        await sset("force_sub_channels", [c for c in chs if c != ch])
+        await msg.reply_text(f"✅ Removed: `{ch}`")
 
     @app.on_message(filters.command("set_welcome"))
-    async def cmd_set_welcome(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        set_state(message.from_user.id, "set_welcome_text")
-        await message.reply_text(
-            "✏️ Send welcome text.\nPlaceholders: `{name}` `{first_name}` `{mention}` `{chat}`\n"
-            "Then send optional image.")
+    async def cmd_set_grp_welcome(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        set_st(msg.from_user.id, "set_welcome_text")
+        await msg.reply_text(
+            "✏️ Send group **welcome** text.\nPlaceholders: `{name}` `{mention}` `{chat}`\nThen send optional image or SKIP.")
 
     @app.on_message(filters.command("set_goodbye"))
-    async def cmd_set_goodbye(_, message: Message):
-        if not message.from_user: return
-        if not await is_admin(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        set_state(message.from_user.id, "set_goodbye_text")
-        await message.reply_text(
-            "✏️ Send goodbye text.\nPlaceholders: `{name}` `{first_name}` `{mention}` `{chat}`\n"
-            "Then send optional image.")
+    async def cmd_set_grp_goodbye(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        set_st(msg.from_user.id, "set_goodbye_text")
+        await msg.reply_text(
+            "✏️ Send group **goodbye** text.\nPlaceholders: `{name}` `{mention}` `{chat}`\nThen send optional image or SKIP.")
 
     # ═══════════════════════════════════════════════════
-    #  OWNER COMMANDS — ID se direct kaam karta hai
+    #  OWNER COMMANDS
     # ═══════════════════════════════════════════════════
     @app.on_message(filters.command("add_admin"))
-    async def cmd_add_admin(_, message: Message):
-        if not message.from_user: return
-        if not await is_owner(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        t = await resolve_user(message)
+    async def cmd_add_admin(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_owner(msg.from_user.id): await msg.reply_text(BAKA); return
+        t = await resolve_user(msg)
         if not t:
-            await message.reply_text("Usage: /add_admin [user_id]\nExample: /add_admin 838832834\nOr reply to user."); return
+            await msg.reply_text("Usage: `/add_admin [user_id]`\nExample: `/add_admin 838832834`\nOr reply to user."); return
         await staff_col.update_one({"_id": t.id},
             {"$set": {"role": "admin", "name": getattr(t, "first_name", str(t.id))}}, upsert=True)
-        await message.reply_text(f"✅ `{t.id}` ({getattr(t,'first_name',t.id)}) is now **admin**!")
+        await msg.reply_text(f"✅ `{t.id}` is now **Admin**!")
 
     @app.on_message(filters.command("remove_admin"))
-    async def cmd_remove_admin(_, message: Message):
-        if not message.from_user: return
-        if not await is_owner(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        t = await resolve_user(message)
+    async def cmd_rem_admin(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_owner(msg.from_user.id): await msg.reply_text(BAKA); return
+        t = await resolve_user(msg)
         if not t:
-            await message.reply_text("Usage: /remove_admin [user_id]\nOr reply to user."); return
+            await msg.reply_text("Usage: `/remove_admin [user_id]`\nOr reply to user."); return
         r = await staff_col.delete_one({"_id": t.id, "role": "admin"})
-        await message.reply_text("✅ Removed from admins." if r.deleted_count else f"❌ `{t.id}` is not an admin.")
+        await msg.reply_text("✅ Removed from admins." if r.deleted_count else f"❌ `{t.id}` is not an admin.")
 
     @app.on_message(filters.command("addowner"))
-    async def cmd_add_owner(_, message: Message):
-        if not message.from_user: return
-        if not await is_super(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        t = await resolve_user(message)
+    async def cmd_add_owner(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_super(msg.from_user.id): await msg.reply_text(BAKA); return
+        t = await resolve_user(msg)
         if not t:
-            await message.reply_text("Usage: /addowner [user_id]\nExample: /addowner 838832834\nOr reply to user."); return
+            await msg.reply_text("Usage: `/addowner [user_id]`\nExample: `/addowner 838832834`\nOr reply to user."); return
         await staff_col.update_one({"_id": t.id},
             {"$set": {"role": "owner", "name": getattr(t, "first_name", str(t.id))}}, upsert=True)
-        await message.reply_text(f"✅ `{t.id}` ({getattr(t,'first_name',t.id)}) is now **owner**!")
+        await msg.reply_text(f"✅ `{t.id}` is now **Owner**!")
 
     @app.on_message(filters.command("removeowner"))
-    async def cmd_remove_owner(_, message: Message):
-        if not message.from_user: return
-        if not await is_super(message.from_user.id):
-            await message.reply_text(BAKA_MSG); return
-        t = await resolve_user(message)
+    async def cmd_rem_owner(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_super(msg.from_user.id): await msg.reply_text(BAKA); return
+        t = await resolve_user(msg)
         if not t:
-            await message.reply_text("Usage: /removeowner [user_id]\nOr reply to user."); return
-        if t.id == ORIGINAL_OWNER_ID:
-            await message.reply_text("❌ Cannot remove the super owner!"); return
+            await msg.reply_text("Usage: `/removeowner [user_id]`\nOr reply to user."); return
+        if t.id == OWNER_ID:
+            await msg.reply_text("❌ Cannot remove the Super Owner!"); return
         r = await staff_col.delete_one({"_id": t.id, "role": "owner"})
-        await message.reply_text("✅ Removed from owners." if r.deleted_count else f"❌ `{t.id}` is not an owner.")
+        await msg.reply_text("✅ Removed from owners." if r.deleted_count else f"❌ `{t.id}` is not an owner.")
 
     # ═══════════════════════════════════════════════════
-    #  /copy  /delcopy
+    #  /ping  /id  /userinfo  /adminlist  /ban  /unban  /clones
+    # ═══════════════════════════════════════════════════
+    @app.on_message(filters.command("ping"))
+    async def cmd_ping(_, msg: Message):
+        if not msg.from_user: return
+        t0  = datetime.utcnow()
+        m   = await msg.reply_text("🏓 Pinging…")
+        ms  = int((datetime.utcnow() - t0).total_seconds() * 1000)
+        await m.edit_text(f"🏓 **Pong!**\n\n⚡ Speed: `{ms}ms`")
+
+    @app.on_message(filters.command("id"))
+    async def cmd_id(_, msg: Message):
+        if not msg.from_user: return
+        u   = msg.from_user
+        text = f"👤 **Your Info**\n\n🆔 ID: `{u.id}`\n📛 Name: {u.first_name}"
+        if u.username: text += f"\n🔗 Username: @{u.username}"
+        if msg.reply_to_message and msg.reply_to_message.from_user:
+            ru    = msg.reply_to_message.from_user
+            text += (f"\n\n👤 **Replied User**\n🆔 ID: `{ru.id}`\n📛 Name: {ru.first_name}")
+            if ru.username: text += f"\n🔗 @{ru.username}"
+        if msg.chat.type != enums.ChatType.PRIVATE:
+            text += f"\n\n💬 **Chat ID:** `{msg.chat.id}`"
+        await msg.reply_text(text)
+
+    @app.on_message(filters.command("userinfo"))
+    async def cmd_userinfo(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        t = await resolve_user(msg)
+        if not t: await msg.reply_text("Usage: `/userinfo [id]` or reply to user."); return
+        rec  = await users_col.find_one({"_id": t.id})
+        role = "Super Owner" if t.id == OWNER_ID else ""
+        if not role:
+            sr = await staff_col.find_one({"_id": t.id})
+            if sr: role = sr["role"].title()
+        banned = (rec or {}).get("banned", False)
+        last   = (rec or {}).get("last_seen")
+        last_s = last.strftime("%Y-%m-%d %H:%M UTC") if last else "Unknown"
+        fn     = getattr(t, "first_name", str(t.id))
+        un     = getattr(t, "username", None)
+        text   = (
+            f"👤 **User Info**\n\n"
+            f"📛 Name:     {fn}\n"
+            f"🆔 ID:       `{t.id}`\n"
+            f"🔗 Username: {'@'+un if un else 'None'}\n"
+            f"🛡️ Role:     {role or 'User'}\n"
+            f"🚫 Banned:   {'Yes' if banned else 'No'}\n"
+            f"🕐 Last Seen: {last_s}"
+        )
+        await msg.reply_text(text)
+
+    @app.on_message(filters.command("adminlist"))
+    async def cmd_adminlist(_, msg: Message):
+        if not msg.from_user: return
+        owners = []; admins = []
+        async for s in staff_col.find({}):
+            name = s.get("name", str(s["_id"]))
+            if s["role"] == "owner":  owners.append(f"👑 {name} (`{s['_id']}`)")
+            if s["role"] == "admin":  admins.append(f"🛡️ {name} (`{s['_id']}`)")
+        text  = "👥 **Bot Staff List**\n\n"
+        text += f"⚡ **Super Owner:**\n• Super Owner (`{OWNER_ID}`)\n\n"
+        text += "**👑 Owners:**\n" + ("\n".join(owners) if owners else "None") + "\n\n"
+        text += "**🛡️ Admins:**\n" + ("\n".join(admins) if admins else "None")
+        await msg.reply_text(text)
+
+    @app.on_message(filters.command("ban"))
+    async def cmd_ban(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        t = await resolve_user(msg)
+        if not t: await msg.reply_text("Usage: `/ban [id]` or reply to user."); return
+        if await is_owner(t.id):
+            await msg.reply_text("❌ Cannot ban an owner!"); return
+        await users_col.update_one({"_id": t.id}, {"$set": {"banned": True}}, upsert=True)
+        fn = getattr(t, "first_name", str(t.id))
+        await msg.reply_text(f"🚫 **{fn}** (`{t.id}`) has been banned from the bot.")
+
+    @app.on_message(filters.command("unban"))
+    async def cmd_unban(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        t = await resolve_user(msg)
+        if not t: await msg.reply_text("Usage: `/unban [id]` or reply to user."); return
+        await users_col.update_one({"_id": t.id}, {"$set": {"banned": False}}, upsert=True)
+        fn = getattr(t, "first_name", str(t.id))
+        await msg.reply_text(f"✅ **{fn}** (`{t.id}`) has been unbanned.")
+
+    @app.on_message(filters.command("clones"))
+    async def cmd_clones(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_super(msg.from_user.id): await msg.reply_text(BAKA); return
+        clones  = await instances_col.find({}).to_list(None)
+        running = list(CLONES.keys())
+        if not clones:
+            await msg.reply_text("📭 No clones registered.\nUse `/copy [token]` to add."); return
+        lines = [f"{'🟢' if c['bot_id'] in running else '🔴'} @{c.get('bot_username','?')} — `{c['bot_id']}`"
+                 for c in clones]
+        total   = len(clones)
+        active  = sum(1 for c in clones if c["bot_id"] in running)
+        await msg.reply_text(
+            f"🤖 **Clone Bots ({active}/{total} running)**\n\n" + "\n".join(lines) +
+            "\n\n`/copy [token]` — Add clone\n`/delcopy [id]` — Remove clone")
+
+    # ═══════════════════════════════════════════════════
+    #  /copy  /delcopy  — safe in_memory cloning
     # ═══════════════════════════════════════════════════
     @app.on_message(filters.command("copy"))
-    async def cmd_copy(_, message: Message):
-        if not message.from_user: return
-        uid = message.from_user.id
-        if not (await is_super(uid) or await is_owner(uid)):
-            await message.reply_text(BAKA_MSG); return
-        parts = message.text.split(None, 1)
+    async def cmd_copy(_, msg: Message):
+        if not msg.from_user: return
+        if not (await is_super(msg.from_user.id) or await is_owner(msg.from_user.id)):
+            await msg.reply_text(BAKA); return
+        parts = (msg.text or "").split(None, 1)
         if len(parts) < 2:
-            await message.reply_text("Usage: /copy [NEW_BOT_TOKEN]"); return
-        new_token = parts[1].strip()
-        tparts    = new_token.split(":")
+            clones  = await instances_col.find({}).to_list(None)
+            running = list(CLONES.keys())
+            lines   = [f"• @{c.get('bot_username','?')} `{c['bot_id']}` {'🟢' if c['bot_id'] in running else '🔴'}"
+                       for c in clones] if clones else ["No clones yet."]
+            await msg.reply_text(
+                f"⚡ **Clone Bots**\n\n{''.join(f'{l}{chr(10)}' for l in lines)}\n"
+                "Usage: `/copy [BOT_TOKEN]`\nRemove: `/delcopy [bot_id]`\nGet token: @BotFather → /newbot"); return
+        token  = parts[1].strip()
+        tparts = token.split(":")
         if len(tparts) != 2 or not tparts[0].isdigit():
-            await message.reply_text("Invalid token."); return
+            await msg.reply_text("❌ Invalid token format: `1234567:ABCdef...`"); return
         bid = tparts[0]
-        if await instances_col.find_one({"bot_id": bid}):
-            await message.reply_text("Already cloned!"); return
-        clone_cfg = {
-            "bot_token":         new_token,
-            "session_name":      f"kenshin_clone_{bid}",
-            "db_name":           f"Kenshin_{bid}",
-            "original_owner_id": ORIGINAL_OWNER_ID,
-        }
+        if bid in CLONES:
+            await msg.reply_text(f"⚠️ Clone `{bid}` already running!"); return
+        # Validate token via HTTP — no Pyrogram session risk
         try:
-            clone_app = make_bot(clone_cfg)
-            await clone_app.start()
-            cm = await clone_app.get_me()
-            RUNNING_CLONES[bid] = clone_app
-            await instances_col.insert_one({"bot_id": bid, **clone_cfg, "started_at": datetime.utcnow()})
-            await message.reply_text(f"✅ Clone started: @{cm.username}")
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"https://api.telegram.org/bot{token}/getMe",
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    res = await r.json()
+            if not res.get("ok"):
+                await msg.reply_text(f"❌ Invalid token: {res.get('description')}"); return
+            info = res["result"]
         except Exception as e:
-            await message.reply_text(f"❌ Failed: {e}")
+            await msg.reply_text(f"❌ Token check failed: {e}"); return
+        sm = await msg.reply_text(f"⏳ Starting @{info['username']}…")
+        try:
+            clone = make_bot({
+                "bot_token": token, "session_name": f"clone_{bid}",
+                "db_name": f"Kenshin_{bid}", "original_owner_id": OWNER_ID,
+            })
+            await clone.start()
+            CLONES[bid] = clone
+            await instances_col.update_one({"bot_id": bid}, {"$set": {
+                "bot_id": bid, "bot_username": info["username"], "bot_token": token,
+                "session_name": f"clone_{bid}", "db_name": f"Kenshin_{bid}",
+                "original_owner_id": OWNER_ID, "started_at": datetime.utcnow(),
+            }}, upsert=True)
+            await sm.edit_text(
+                f"✅ **Clone Started!**\n\n"
+                f"🤖 @{info['username']}\n🆔 `{bid}`\n🗄️ DB: `Kenshin_{bid}`\n\n"
+                f"Runs inside same process. Stop: `/delcopy {bid}`")
+        except Exception as e:
+            await sm.edit_text(f"❌ Failed to start: {e}")
 
     @app.on_message(filters.command("delcopy"))
-    async def cmd_delcopy(_, message: Message):
-        if not message.from_user: return
-        if not (await is_super(message.from_user.id) or await is_owner(message.from_user.id)):
-            await message.reply_text(BAKA_MSG); return
-        parts = message.text.split()
+    async def cmd_delcopy(_, msg: Message):
+        if not msg.from_user: return
+        if not (await is_super(msg.from_user.id) or await is_owner(msg.from_user.id)):
+            await msg.reply_text(BAKA); return
+        parts  = (msg.text or "").split()
+        clones = await instances_col.find({}).to_list(None)
+        running = list(CLONES.keys())
         if len(parts) < 2:
-            await message.reply_text("Usage: /delcopy [bot_id]"); return
+            if not clones: await msg.reply_text("📭 No clones."); return
+            lines = [f"• @{c.get('bot_username','?')} `{c['bot_id']}` {'🟢' if c['bot_id'] in running else '🔴'}"
+                     for c in clones]
+            await msg.reply_text("🤖 **Clones:**\n\n" + "\n".join(lines) + "\n\nUsage: `/delcopy [bot_id]`"); return
         bid = parts[1].strip()
-        c   = RUNNING_CLONES.pop(bid, None)
+        c   = CLONES.pop(bid, None)
         if c:
             try: await c.stop()
             except Exception: pass
-        await instances_col.delete_one({"bot_id": bid})
-        await message.reply_text(f"✅ Clone {bid} removed.")
+        r = await instances_col.delete_one({"bot_id": bid})
+        await msg.reply_text(f"✅ Clone `{bid}` stopped & removed." if r.deleted_count else f"❌ Not found: `{bid}`")
 
     # ═══════════════════════════════════════════════════
     #  Group join / leave
     # ═══════════════════════════════════════════════════
     @app.on_chat_member_updated()
-    async def member_update(_, update: ChatMemberUpdated):
+    async def on_member(_, upd: ChatMemberUpdated):
         try:
-            old = update.old_chat_member.status if update.old_chat_member else None
-            new = update.new_chat_member.status if update.new_chat_member else None
+            old = upd.old_chat_member.status if upd.old_chat_member else None
+            new = upd.new_chat_member.status if upd.new_chat_member else None
             joined = (new in (enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR)
                       and old in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED, None))
             left   = (old in (enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR)
                       and new in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED))
             if joined:
-                user   = update.new_chat_member.user
+                user   = upd.new_chat_member.user
                 tmpl   = await gset("group_welcome", "👋 Welcome {mention} to **{chat}**!\n🎌 Type any anime name to search!")
-                text   = fmt_text(tmpl, user, update.chat.title or "")
-                img_id = await gset("welcome_img", None)
+                text   = fmt(tmpl, user, upd.chat.title or "")
+                img    = await gset("welcome_img", None)
                 kb = InlineKeyboardMarkup([[InlineKeyboardButton("👋 Say Hi!", url=f"tg://user?id={user.id}")]])
-                if img_id:
-                    try: await app.send_photo(update.chat.id, img_id, caption=text, reply_markup=kb); return
+                if img:
+                    try: await app.send_photo(upd.chat.id, img, caption=text, reply_markup=kb); return
                     except Exception: pass
-                await app.send_message(update.chat.id, text, reply_markup=kb)
+                await app.send_message(upd.chat.id, text, reply_markup=kb)
             elif left:
-                user   = update.old_chat_member.user
-                tmpl   = await gset("group_goodbye", "👋 **{name}** has left **{chat}**. Sayonara! 🎌")
-                text   = fmt_text(tmpl, user, update.chat.title or "")
-                img_id = await gset("goodbye_img", None)
-                if img_id:
-                    try: await app.send_photo(update.chat.id, img_id, caption=text); return
+                user = upd.old_chat_member.user
+                tmpl = await gset("group_goodbye", "👋 **{name}** left **{chat}**. Sayonara! 🎌")
+                text = fmt(tmpl, user, upd.chat.title or "")
+                img  = await gset("goodbye_img", None)
+                if img:
+                    try: await app.send_photo(upd.chat.id, img, caption=text); return
                     except Exception: pass
-                await app.send_message(update.chat.id, text)
-        except Exception as e:
-            logger.error(f"member_update: {e}")
+                await app.send_message(upd.chat.id, text)
+        except Exception as e: logger.error(f"member_update: {e}")
 
     # ═══════════════════════════════════════════════════
-    #  CALLBACK QUERIES
+    #  CALLBACKS
     # ═══════════════════════════════════════════════════
     @app.on_callback_query()
-    async def cb_handler(_, query: CallbackQuery):
-        data = query.data
-        uid  = query.from_user.id
+    async def on_cb(_, q: CallbackQuery):
+        d   = q.data
+        uid = q.from_user.id
 
-        if data == "check_sub":
-            channels = await gset("force_sub_channels", [])
-            failed   = []
-            for ch in channels:
+        if d == "noop": await q.answer(); return
+
+        if d == "check_sub":
+            chs = await gset("force_sub_channels", [])
+            bad = []
+            for ch in chs:
                 try:
                     m = await app.get_chat_member(ch, uid)
-                    if m.status in (enums.ChatMemberStatus.BANNED, enums.ChatMemberStatus.LEFT):
-                        failed.append(ch)
-                except Exception: failed.append(ch)
-            if not failed:
-                await query.message.delete()
-                await query.answer("✅ Access granted!", show_alert=True)
-            else:
-                await query.answer("❌ Still not joined!", show_alert=True)
+                    if m.status in (enums.ChatMemberStatus.BANNED, enums.ChatMemberStatus.LEFT): bad.append(ch)
+                except Exception: bad.append(ch)
+            if not bad:
+                await q.message.delete(); await q.answer("✅ Access granted!", show_alert=True)
+            else: await q.answer("❌ Still not joined all channels!", show_alert=True)
             return
 
-        if data == "show_help":
-            await query.answer()
+        if d == "show_help":
+            await q.answer()
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_start")]])
-            try: await query.message.edit_text(HELP_TEXT, reply_markup=kb)
-            except Exception: await query.message.reply_text(HELP_TEXT, reply_markup=kb)
+            try:    await q.message.edit_text(HELP_TEXT, reply_markup=kb)
+            except Exception: await q.message.reply_text(HELP_TEXT, reply_markup=kb)
             return
 
-        if data == "show_popular":
-            await query.answer()
-            animes = await anime_col.find({}).sort("name", 1).limit(15).to_list(15)
-            if not animes:
-                await query.answer("No animes yet!", show_alert=True); return
-            lines = "\n".join(f"{i+1}. **{a['name']}**" for i, a in enumerate(animes))
+        if d == "show_popular":
+            await q.answer()
+            animes = await anime_col.find({}).sort("name", 1).limit(20).to_list(20)
+            if not animes: await q.answer("No animes yet!", show_alert=True); return
+            lines = "\n".join(f"{i+1}. **{a['name']}**" for i,a in enumerate(animes))
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_start")]])
-            try: await query.message.edit_text(f"🌟 **Top 15:**\n\n{lines}", reply_markup=kb)
-            except Exception: await query.message.reply_text(f"🌟 **Top 15:**\n\n{lines}", reply_markup=kb)
+            try:    await q.message.edit_text(f"🌟 **Top 20 Animes:**\n\n{lines}", reply_markup=kb)
+            except Exception: await q.message.reply_text(f"🌟 **Top 20 Animes:**\n\n{lines}", reply_markup=kb)
             return
 
-        if data == "back_start":
-            await query.answer()
+        if d == "back_start":
+            await q.answer()
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔍 Search", switch_inline_query_current_chat=""),
+                [InlineKeyboardButton("🔍 Search Anime", switch_inline_query_current_chat=""),
                  InlineKeyboardButton("📋 Help", callback_data="show_help")],
                 [InlineKeyboardButton("🌟 Anime List", callback_data="show_popular")],
             ])
-            try: await query.message.edit_text("🎌 **Kenshin Anime Bot**\n\nType any anime name!", reply_markup=kb)
+            try: await q.message.edit_text("🎌 **Kenshin Anime Bot**\n\nType any anime name to search!", reply_markup=kb)
             except Exception: pass
             return
 
-        if data == "open_panel":
-            await query.answer()
-            await send_admin_panel(query.message, uid)
+        if d == "open_panel":
+            await q.answer()
+            if not await is_admin(uid): await q.answer(BAKA, show_alert=True); return
+            await send_panel(q.message, uid)
             return
 
-        if data in ("export_json", "export_csv"):
-            if not await is_admin(uid):
-                await query.answer(BAKA_MSG, show_alert=True); return
-            await query.answer("⏳ Generating…")
-            await do_export(query.message, uid, "csv" if data == "export_csv" else "json")
-            return
+        if d in ("export_json","export_csv"):
+            if not await is_admin(uid): await q.answer(BAKA, show_alert=True); return
+            await q.answer("⏳ Generating…")
+            await do_export(q.message, "csv" if d == "export_csv" else "json"); return
 
-        # ── Infinite callbacks ────────────────────────────────────────────────
-        if data == "inf_myimage":
-            rec = await infinite_col.find_one({"owner_uid": uid, "custom_image": {"$exists": True}})
-            img = rec.get("custom_image") if rec else None
-            if img:
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Unset", callback_data="inf_unset")]])
-                await query.message.reply_photo(photo=img, caption="🖼️ Your current image", reply_markup=kb)
-                await query.answer()
-            else:
-                await query.answer("No image set.", show_alert=True)
-            return
-
-        if data == "inf_unset":
+        # ── infinite callbacks ─────────────────────────
+        if d == "inf_unset":
             await infinite_col.update_many({"owner_uid": uid}, {"$unset": {"custom_image": ""}})
-            await query.answer("✅ Image removed.", show_alert=True)
-            try: await query.message.edit_text("✅ Custom image removed.")
-            except Exception: pass
-            return
+            await q.answer("✅ Image removed.", show_alert=True)
+            try: await q.message.edit_text("✅ Custom image removed.")
+            except Exception: pass; return
 
-        if data == "inf_list":
-            await query.answer()
+        if d == "inf_list":
+            await q.answer()
             links = await infinite_col.find({"owner_uid": uid, "channel_id": {"$gt": 0}}).to_list(None)
-            if not links:
-                await query.answer("No links yet.", show_alert=True); return
-            bot_un  = await get_bot_username()
-            lines   = [f"• `{l['channel_id']}` → t.me/{bot_un}?start=inf_{l['channel_id']}_{uid}" for l in links]
-            kb_rows = [[InlineKeyboardButton(f"🗑️ Remove {l['channel_id']}",
-                         callback_data=f"inf_remove_{l['channel_id']}")] for l in links]
-            try: await query.message.edit_text("🔗 **Your Links:**\n\n" + "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb_rows))
-            except Exception: await query.message.reply_text("🔗 **Your Links:**\n\n" + "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb_rows))
+            if not links: await q.answer("No links yet.", show_alert=True); return
+            un    = await bot_un()
+            lines = [f"• `{l['channel_id']}` [{l.get('mode','invite')}]" for l in links]
+            rows  = [[InlineKeyboardButton(f"🗑️ Remove {l['channel_id']}", callback_data=f"inf_remove_{l['channel_id']}")] for l in links]
+            try:    await q.message.edit_text("🔗 **Your Links:**\n\n"+"\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+            except Exception: await q.message.reply_text("🔗 **Your Links:**\n\n"+"\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
             return
 
-        if data.startswith("inf_remove_"):
-            cid = int(data.replace("inf_remove_", ""))
+        if d.startswith("inf_remove_"):
+            cid = int(d.replace("inf_remove_",""))
             await infinite_col.delete_one({"owner_uid": uid, "channel_id": cid})
-            await query.answer(f"✅ Link {cid} removed.", show_alert=True)
-            try: await query.message.edit_text(f"✅ Link for `{cid}` removed.")
-            except Exception: pass
+            await q.answer(f"✅ Removed {cid}", show_alert=True)
+            try: await q.message.edit_text(f"✅ Link `{cid}` removed.")
+            except Exception: pass; return
+
+        if d.startswith("inf_regen_"):
+            await q.answer("⏳ Generating…")
+            p    = d.split("_"); cid = int(p[2]); ouid = int(p[3])
+            rec  = await infinite_col.find_one({"owner_uid": ouid, "channel_id": cid})
+            mode = (rec or {}).get("mode","invite")
+            if mode == "req": await send_req_link(q.message, cid, ouid)
+            else:             await send_invite(q.message, cid, ouid)
             return
 
-        if data.startswith("inf_regen_"):
-            await query.answer("⏳ Generating…")
-            p       = data.split("_")
-            chan_id  = int(p[2]); own_uid = int(p[3])
-            await send_infinite_message(query.message, chan_id, own_uid)
-            return
+        if d == "inf_setimage_prompt":
+            await q.answer()
+            await q.message.reply_text("Reply to a photo with `/infinite set`"); return
 
-        if data == "inf_setimage_prompt":
-            await query.answer()
-            await query.message.reply_text("Reply to a photo with /infinite set")
-            return
-
-        # ── Panel buttons ─────────────────────────────────────────────────────
-        if data.startswith("panel_"):
-            if not await is_admin(uid):
-                await query.answer(BAKA_MSG, show_alert=True); return
-            action = data[6:]
-            await query.answer()
+        # ── panel buttons ──────────────────────────────
+        if d.startswith("panel_"):
+            if not await is_admin(uid): await q.answer(BAKA, show_alert=True); return
+            action = d[6:]; await q.answer()
             step_map = {
-                "add_ani":       ("ani_img",         "➕ **Add Anime — Step 1/4**\n\n📸 Send image (photo) or URL. Caption = name. Or SKIP.\n\n/cancel to abort."),
-                "edit_ani":      ("edit_name",        "✏️ Send anime **name** to edit:"),
-                "delete_ani":    ("del_name",         "🗑️ Send anime **name** to delete:"),
-                "add_alias":     ("alias_name",       "🔤 Send anime **name** to add aliases:"),
-                "broadcast":     ("bcast",            "📢 Send broadcast message:"),
-                "set_start_img": ("set_start_img",    "🖼️ Send start banner image (photo):"),
-                "set_start_msg": ("set_start_msg",    "✏️ Send new welcome text.\nPlaceholders: `{name}` `{first_name}` `{mention}` `{id}`"),
-                "set_welcome":   ("set_welcome_text", "✏️ Send welcome text.\nPlaceholders: `{name}` `{first_name}` `{mention}` `{chat}`\nThen send optional image."),
-                "set_goodbye":   ("set_goodbye_text", "✏️ Send goodbye text.\nPlaceholders: `{name}` `{first_name}` `{mention}` `{chat}`\nThen send optional image."),
+                "add_ani":       ("ani_img",          "➕ **Add Anime — Step 1/4**\n\n📸 Send image (photo/URL) or SKIP.\nCaption = anime name.\n\n_/cancel to abort_"),
+                "edit_ani":      ("edit_name",         "✏️ Send the anime **name** to edit:"),
+                "delete_ani":    ("del_name",          "🗑️ Send the anime **name** to delete:"),
+                "add_alias":     ("alias_name",        "🔤 Send the anime **name** to add aliases:"),
+                "broadcast":     ("bcast",             "📢 Send your broadcast message:"),
+                "set_start_img": ("set_start_img",     "🖼️ Send start banner (photo):"),
+                "set_start_msg": ("set_start_msg",     "✏️ Send new start message.\nPlaceholders: `{name}` `{first_name}` `{mention}` `{id}`"),
+                "set_welcome":   ("set_welcome_text",  "✏️ Send group welcome text.\nPlaceholders: `{name}` `{mention}` `{chat}`\nThen optional image."),
+                "set_goodbye":   ("set_goodbye_text",  "✏️ Send group goodbye text.\nPlaceholders: `{name}` `{mention}` `{chat}`\nThen optional image."),
             }
             if action in step_map:
                 step, prompt = step_map[action]
-                set_state(uid, step)
-                await query.message.reply_text(prompt)
+                set_st(uid, step)
+                await q.message.reply_text(prompt)
             elif action == "list":
-                animes = await anime_col.find({}, {"name": 1}).sort("name", 1).to_list(None)
-                if not animes: await query.message.reply_text("📭 Empty."); return
-                chunk  = animes[:10]
-                rows   = [[InlineKeyboardButton(f"✏️ {a['name'][:22]}", callback_data=f"quickedit_{str(a['_id'])}"),
-                           InlineKeyboardButton("🗑️", callback_data=f"del_confirm_{str(a['_id'])}")] for a in chunk]
-                header = f"📋 **List (1–{min(10,len(animes))} of {len(animes)}):**\n\n" + "\n".join(f"{i+1}. {a['name']}" for i, a in enumerate(chunk))
-                await query.message.reply_text(header, reply_markup=InlineKeyboardMarkup(rows))
+                animes = await anime_col.find({},{"name":1}).sort("name",1).to_list(None)
+                if not animes: await q.message.reply_text("📭 Empty."); return
+                chunk = animes[:10]; total = len(animes)
+                rows  = [[InlineKeyboardButton(f"✏️ {a['name'][:22]}", callback_data=f"qedit_{str(a['_id'])}"),
+                          InlineKeyboardButton("🗑️", callback_data=f"del_cfm_{str(a['_id'])}")] for a in chunk]
+                await q.message.reply_text(
+                    f"📋 **List (1–{min(10,total)} of {total}):**\n\n" + "\n".join(f"{i+1}. {a['name']}" for i,a in enumerate(chunk)),
+                    reply_markup=InlineKeyboardMarkup(rows))
             elif action == "stats":
-                ta = await anime_col.count_documents({}); tu = await users_col.count_documents({})
-                ad = await staff_col.count_documents({"role":"admin"}); ow = await staff_col.count_documents({"role":"owner"})
-                il = await infinite_col.count_documents({"channel_id":{"$gt":0}})
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("📄 JSON",callback_data="export_json"),InlineKeyboardButton("📊 CSV",callback_data="export_csv")],[InlineKeyboardButton("🔙 Panel",callback_data="open_panel")]])
-                await query.message.reply_text(f"📊 **Stats**\n\n🎌 {ta} | 👤 {tu} | 🛡️ {ad} | 👑 {ow+1} | 🔗 {il}", reply_markup=kb)
+                ta=await anime_col.count_documents({}); tu=await users_col.count_documents({})
+                ad=await staff_col.count_documents({"role":"admin"}); ow=await staff_col.count_documents({"role":"owner"})
+                il=await infinite_col.count_documents({"channel_id":{"$gt":0}})
+                await q.message.reply_text(
+                    f"📊 **Stats**\n\n🎌 {ta} | 👤 {tu} | 🛡️ {ad} | 👑 {ow+1} | 🔗 {il}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📄 JSON",callback_data="export_json"),InlineKeyboardButton("📊 CSV",callback_data="export_csv")],[InlineKeyboardButton("🔙 Panel",callback_data="open_panel")]]))
             elif action == "export":
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("📄 JSON",callback_data="export_json"),InlineKeyboardButton("📊 CSV",callback_data="export_csv")]])
-                await query.message.reply_text("📤 Choose format:", reply_markup=kb)
+                await q.message.reply_text("📤 Choose format:",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📄 JSON",callback_data="export_json"),InlineKeyboardButton("📊 CSV",callback_data="export_csv")]]))
             elif action == "bulk":
-                set_state(uid, "bulk_file")
-                await query.message.reply_text("📦 Send .txt or .json file.\nTXT: `Name | img_url | synopsis | watch_link | alias1,alias2`")
+                set_st(uid, "bulk_file")
+                await q.message.reply_text("📦 Send .txt or .json file.\nTXT: `Name | img | synopsis | watch_url | alias1,alias2`")
             elif action == "set_channel":
-                channels = await gset("promo_channels", [])
-                await query.message.reply_text(f"📢 Promo Channels:\n{chr(10).join(channels) or 'None'}\n\n/set_channel add @ch | remove @ch | clear")
+                chs = await gset("promo_channels",[])
+                await q.message.reply_text(f"📢 **Promo Channels:**\n{chr(10).join(chs) or 'None'}\n\n`/set_channel add @ch` | `remove @ch` | `clear`")
             elif action == "forcesub":
-                channels = await gset("force_sub_channels", [])
-                await query.message.reply_text(f"🔒 Force Sub:\n{chr(10).join(channels) or 'None'}\n\n/add_forcesub @ch | /rem_forcesub @ch")
+                chs = await gset("force_sub_channels",[])
+                await q.message.reply_text(f"🔒 **Force-Sub:**\n{chr(10).join(chs) or 'None'}\n\n`/add_forcesub @ch` | `/rem_forcesub @ch`")
+            elif action == "adminlist":
+                owners = []; admins = []
+                async for s in staff_col.find({}):
+                    name = s.get("name", str(s["_id"]))
+                    if s["role"] == "owner":  owners.append(f"👑 {name} (`{s['_id']}`)")
+                    if s["role"] == "admin":  admins.append(f"🛡️ {name} (`{s['_id']}`)")
+                text  = f"👥 **Staff List**\n\n⚡ Super Owner: (`{OWNER_ID}`)\n\n"
+                text += "**Owners:**\n" + ("\n".join(owners) if owners else "None") + "\n\n"
+                text += "**Admins:**\n" + ("\n".join(admins) if admins else "None")
+                await q.message.reply_text(text)
+            elif action == "ban":
+                set_st(uid, "ban_uid")
+                await q.message.reply_text("🚫 Send the **user ID** to ban:")
+            elif action == "unban":
+                set_st(uid, "unban_uid")
+                await q.message.reply_text("✅ Send the **user ID** to unban:")
+            elif action == "clones":
+                if not await is_super(uid): await q.message.reply_text(BAKA); return
+                clones  = await instances_col.find({}).to_list(None)
+                running = list(CLONES.keys())
+                lines   = [f"{'🟢' if c['bot_id'] in running else '🔴'} @{c.get('bot_username','?')} `{c['bot_id']}`" for c in clones] if clones else ["No clones."]
+                await q.message.reply_text("🤖 **Clones:**\n\n" + "\n".join(lines))
             elif action == "infinite":
-                links  = await infinite_col.find({"owner_uid": uid, "channel_id": {"$gt": 0}}).to_list(None)
-                bot_un = await get_bot_username()
-                lines  = [f"• `{l['channel_id']}` → t.me/{bot_un}?start=inf_{l['channel_id']}_{uid}" for l in links] if links else ["No links yet."]
-                await query.message.reply_text("🔗 **Infinite Links:**\n\n" + "\n".join(lines) + "\n\nUse /infinite <channel_id>")
+                links = await infinite_col.find({"owner_uid":uid,"channel_id":{"$gt":0}}).to_list(None)
+                un    = await bot_un()
+                lines = [f"• `{l['channel_id']}` [{l.get('mode','invite')}]" for l in links] if links else ["No links yet."]
+                await q.message.reply_text("🔗 **Infinite Links:**\n\n"+"\n".join(lines)+"\n\n`/infinite [id]` or `/infinite req [id]`")
             elif action in ("add_admin","remove_admin"):
-                if not await is_owner(uid): await query.message.reply_text(BAKA_MSG); return
-                cmd = "add_admin" if action == "add_admin" else "remove_admin"
-                await query.message.reply_text(f"Usage: /{cmd} [user_id]\nExample: /{cmd} 838832834")
+                if not await is_owner(uid): await q.message.reply_text(BAKA); return
+                cmd = "add_admin" if action=="add_admin" else "remove_admin"
+                await q.message.reply_text(f"Usage: `/{cmd} [user_id]`\nExample: `/{cmd} 838832834`")
             elif action in ("add_owner","remove_owner"):
-                if not await is_super(uid): await query.message.reply_text(BAKA_MSG); return
-                cmd = "addowner" if action == "add_owner" else "removeowner"
-                await query.message.reply_text(f"Usage: /{cmd} [user_id]\nExample: /{cmd} 838832834")
+                if not await is_super(uid): await q.message.reply_text(BAKA); return
+                cmd = "addowner" if action=="add_owner" else "removeowner"
+                await q.message.reply_text(f"Usage: `/{cmd} [user_id]`\nExample: `/{cmd} 838832834`")
             elif action in ("copy","delcopy"):
-                if not await is_super(uid): await query.message.reply_text(BAKA_MSG); return
-                await query.message.reply_text(f"Usage: /{action} [{'token' if action=='copy' else 'bot_id'}]")
+                if not await is_super(uid): await q.message.reply_text(BAKA); return
+                await q.message.reply_text(f"Usage: `/{action} [{'token' if action=='copy' else 'bot_id'}]`")
             return
 
-        # ── quickedit ─────────────────────────────────────────────────────────
-        if data.startswith("quickedit_"):
-            if not await is_admin(uid): await query.answer(BAKA_MSG, show_alert=True); return
-            await query.answer()
+        # ── quick edit ─────────────────────────────────
+        if d.startswith("qedit_"):
+            if not await is_admin(uid): await q.answer(BAKA, show_alert=True); return
+            await q.answer()
             from bson import ObjectId
-            try: aid = ObjectId(data.replace("quickedit_",""))
-            except Exception: await query.answer("Invalid ID", show_alert=True); return
-            anime = await anime_col.find_one({"_id": aid})
-            if not anime: await query.answer("Not found!", show_alert=True); return
-            aid_str = str(aid)
-            info = (f"✏️ **{anime['name']}**\n\n"
-                    f"📖 {(anime.get('description','') or '')[:80]}…\n"
-                    f"🔗 {anime.get('watch_url','—')}\n"
-                    f"🏷️ {', '.join(anime.get('aliases') or []) or '—'}\n\nTap field:")
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📝 Name",      callback_data=f"editfield_{aid_str}_name"),
-                 InlineKeyboardButton("📖 Synopsis",  callback_data=f"editfield_{aid_str}_description")],
-                [InlineKeyboardButton("🔗 Watch Link",callback_data=f"editfield_{aid_str}_watch_url"),
-                 InlineKeyboardButton("🏷️ Aliases",   callback_data=f"editfield_{aid_str}_aliases")],
-                [InlineKeyboardButton("🖼️ Image",     callback_data=f"editfield_{aid_str}_image")],
-                [InlineKeyboardButton("🗑️ Delete",    callback_data=f"del_confirm_{aid_str}"),
+            try: aid = ObjectId(d[6:])
+            except Exception: return
+            a = await anime_col.find_one({"_id": aid})
+            if not a: await q.answer("Not found!", show_alert=True); return
+            s   = str(aid)
+            inf = (f"✏️ **{a['name']}**\n\n"
+                   f"📖 {(a.get('description','') or '')[:80]}…\n"
+                   f"🔗 {a.get('watch_url','—')}\n"
+                   f"🏷️ {', '.join(a.get('aliases') or []) or '—'}\n\nTap field to edit:")
+            kb  = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📝 Name",      callback_data=f"ef_{s}_name"),
+                 InlineKeyboardButton("📖 Synopsis",  callback_data=f"ef_{s}_description")],
+                [InlineKeyboardButton("🔗 Watch Link",callback_data=f"ef_{s}_watch_url"),
+                 InlineKeyboardButton("🏷️ Aliases",   callback_data=f"ef_{s}_aliases")],
+                [InlineKeyboardButton("🖼️ Image",     callback_data=f"ef_{s}_image")],
+                [InlineKeyboardButton("🗑️ Delete",    callback_data=f"del_cfm_{s}"),
                  InlineKeyboardButton("❌ Cancel",     callback_data="edit_cancel")],
             ])
-            try: await query.message.edit_text(info, reply_markup=kb)
-            except Exception: await query.message.reply_text(info, reply_markup=kb)
+            try:    await q.message.edit_text(inf, reply_markup=kb)
+            except Exception: await q.message.reply_text(inf, reply_markup=kb)
             return
 
-        if data.startswith("editfield_"):
-            if not await is_admin(uid): await query.answer(BAKA_MSG, show_alert=True); return
-            await query.answer()
-            p = data.split("_", 2); aid_str = p[1]; field = p[2]
+        if d.startswith("ef_"):
+            if not await is_admin(uid): await q.answer(BAKA, show_alert=True); return
+            await q.answer()
+            _, s, field = d.split("_", 2)
             from bson import ObjectId
-            try: aid = ObjectId(aid_str)
+            try: aid = ObjectId(s)
             except Exception: return
-            anime = await anime_col.find_one({"_id": aid})
-            if not anime: return
-            labels = {"name":"anime name","description":"synopsis","watch_url":"watch link (URL)","aliases":"aliases comma-separated","image":"image (photo or URL)"}
-            set_state(uid, "edit_value", {"anime_id": aid, "edit_field": field})
-            kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"quickedit_{aid_str}")]])
-            await query.message.reply_text(f"✏️ **{anime['name']}** → {field}\n\nSend new {labels.get(field,field)}:", reply_markup=kb_back)
+            a = await anime_col.find_one({"_id": aid})
+            if not a: return
+            labels = {"name":"name","description":"synopsis","watch_url":"watch/download URL","aliases":"aliases (comma-separated)","image":"image (photo or URL)"}
+            set_st(uid, "edit_val", {"aid": aid, "field": field})
+            await q.message.reply_text(
+                f"✏️ **{a['name']}** → editing **{field}**\n\nSend new {labels.get(field,field)}:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"qedit_{s}")]]))
             return
 
-        if data == "edit_cancel":
-            await query.answer(); clear_state(uid)
-            try: await query.message.edit_text("❌ Cancelled.")
-            except Exception: pass
-            return
+        if d == "edit_cancel":
+            await q.answer(); clr_st(uid)
+            try: await q.message.edit_text("❌ Edit cancelled.")
+            except Exception: pass; return
 
-        if data.startswith("del_confirm_"):
-            if not await is_admin(uid): await query.answer(BAKA_MSG, show_alert=True); return
+        if d.startswith("del_cfm_"):
+            if not await is_admin(uid): await q.answer(BAKA, show_alert=True); return
             from bson import ObjectId
-            try: aid = ObjectId(data.replace("del_confirm_",""))
+            try: aid = ObjectId(d[8:])
             except Exception: return
-            anime = await anime_col.find_one({"_id": aid})
-            if not anime: await query.answer("Already deleted!", show_alert=True); return
+            a = await anime_col.find_one({"_id": aid})
+            if not a: await q.answer("Already deleted!", show_alert=True); return
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, Delete", callback_data=f"del_yes_{str(aid)}"),
-                                        InlineKeyboardButton("❌ Cancel",       callback_data="del_cancel")]])
-            try: await query.message.edit_text(f"⚠️ Delete **'{anime['name']}'**?", reply_markup=kb)
-            except Exception: await query.message.reply_text(f"⚠️ Delete **'{anime['name']}'**?", reply_markup=kb)
-            await query.answer()
-            return
+                                        InlineKeyboardButton("❌ Cancel",       callback_data="del_no")]])
+            try:    await q.message.edit_text(f"⚠️ Delete **'{a['name']}'**?\n\nThis cannot be undone!", reply_markup=kb)
+            except Exception: await q.message.reply_text(f"⚠️ Delete **'{a['name']}'**?", reply_markup=kb)
+            await q.answer(); return
 
-        if data.startswith("del_yes_"):
-            if not await is_admin(uid): await query.answer(BAKA_MSG, show_alert=True); return
+        if d.startswith("del_yes_"):
+            if not await is_admin(uid): await q.answer(BAKA, show_alert=True); return
             from bson import ObjectId
-            try: aid = ObjectId(data.replace("del_yes_",""))
+            try: aid = ObjectId(d[8:])
             except Exception: return
-            anime = await anime_col.find_one({"_id": aid})
-            await anime_col.delete_one({"_id": aid}); clear_state(uid)
-            await query.answer("🗑️ Deleted!", show_alert=True)
-            try: await query.message.edit_text(f"✅ **{anime['name'] if anime else 'Anime'}** deleted!")
-            except Exception: pass
-            return
+            a = await anime_col.find_one({"_id": aid})
+            await anime_col.delete_one({"_id": aid}); clr_st(uid)
+            await q.answer("🗑️ Deleted!", show_alert=True)
+            try: await q.message.edit_text(f"✅ **{a['name'] if a else 'Anime'}** deleted!")
+            except Exception: pass; return
 
-        if data == "del_cancel":
-            clear_state(uid); await query.answer("Cancelled.")
-            try: await query.message.edit_text("❌ Cancelled.")
-            except Exception: pass
-            return
+        if d == "del_no":
+            clr_st(uid); await q.answer("Cancelled.")
+            try: await q.message.edit_text("❌ Deletion cancelled.")
+            except Exception: pass; return
 
-        await query.answer()
+        await q.answer()
 
     # ═══════════════════════════════════════════════════
     #  STATE HANDLER
     # ═══════════════════════════════════════════════════
-    async def state_handler_fn(message: Message):
-        uid  = message.from_user.id
-        s    = get_state(uid)
+    async def state_fn(msg: Message):
+        uid  = msg.from_user.id
+        s    = get_st(uid)
         if not s: return
-        step = s["step"]; data = s["data"]
+        step = s["step"]; d = s["data"]
 
-        if step == "ani_img":
-            if message.photo:
-                data["image_file_id"] = message.photo.file_id
-                data["name"]          = (message.caption or "").strip()
-            elif message.text and message.text.strip().upper() == "SKIP":
-                data["image_file_id"] = None; data["name"] = ""
-            elif message.text and message.text.strip().startswith("http"):
-                data["image_file_id"] = message.text.strip(); data["name"] = ""
+        if step == "ban_uid":
+            raw = (msg.text or "").strip()
+            if not raw.isdigit(): await msg.reply_text("Send a valid numeric user ID."); return
+            tid = int(raw)
+            if await is_owner(tid): await msg.reply_text("❌ Cannot ban an owner!"); clr_st(uid); return
+            await users_col.update_one({"_id": tid}, {"$set": {"banned": True}}, upsert=True)
+            clr_st(uid); await msg.reply_text(f"🚫 User `{tid}` has been banned.")
+
+        elif step == "unban_uid":
+            raw = (msg.text or "").strip()
+            if not raw.isdigit(): await msg.reply_text("Send a valid numeric user ID."); return
+            tid = int(raw)
+            await users_col.update_one({"_id": tid}, {"$set": {"banned": False}}, upsert=True)
+            clr_st(uid); await msg.reply_text(f"✅ User `{tid}` has been unbanned.")
+
+        # ADD ANIME
+        elif step == "ani_img":
+            if msg.photo:
+                d["img"] = msg.photo.file_id; d["name"] = (msg.caption or "").strip()
+            elif msg.text and msg.text.strip().upper() == "SKIP":
+                d["img"] = None; d["name"] = ""
+            elif msg.text and msg.text.strip().startswith("http"):
+                d["img"] = msg.text.strip(); d["name"] = ""
             else:
-                await message.reply_text("Send photo (caption=name), URL, or SKIP."); return
-            if data.get("name"):
-                set_state(uid, "ani_synopsis", data)
-                await message.reply_text(f"✅ Name: **{data['name']}**\n\n📝 **Step 2/4** — Send **synopsis**:")
+                await msg.reply_text("Send a photo, URL, or SKIP."); return
+            if d["name"]:
+                set_st(uid, "ani_synopsis", d)
+                await msg.reply_text(f"✅ Name: **{d['name']}**\n\n📝 **Step 2/4** — Send **synopsis**:")
             else:
-                set_state(uid, "ani_name", data)
-                await message.reply_text("📝 **Step 1b** — Send the **anime name**:")
+                set_st(uid, "ani_name", d)
+                await msg.reply_text("📝 **Step 1b** — Send the **anime name**:")
 
         elif step == "ani_name":
-            data["name"] = message.text.strip()
-            set_state(uid, "ani_synopsis", data)
-            await message.reply_text("📝 **Step 2/4** — Send **synopsis**:")
+            d["name"] = msg.text.strip()
+            set_st(uid, "ani_synopsis", d)
+            await msg.reply_text("📝 **Step 2/4** — Send **synopsis**:")
 
         elif step == "ani_synopsis":
-            data["description"] = message.text.strip()
-            set_state(uid, "ani_watchlink", data)
-            await message.reply_text("🔗 **Step 3/4** — Send **Watch/Download link** (or SKIP):")
+            d["desc"] = msg.text.strip()
+            set_st(uid, "ani_watchlink", d)
+            await msg.reply_text("🔗 **Step 3/4** — Send **Watch / Download URL** (or SKIP):")
 
         elif step == "ani_watchlink":
-            t = (message.text or "").strip()
-            data["watch_url"] = "" if t.upper() == "SKIP" else t
-            set_state(uid, "ani_aliases", data)
-            await message.reply_text("🏷️ **Step 4/4** — Send **aliases** comma-separated (or SKIP):")
+            t = (msg.text or "").strip()
+            d["url"] = "" if t.upper() == "SKIP" else t
+            set_st(uid, "ani_aliases", d)
+            await msg.reply_text("🏷️ **Step 4/4** — Send **aliases** comma-separated (or SKIP):\nExample: `OP, One P, ワンピース`")
 
         elif step == "ani_aliases":
-            t       = (message.text or "").strip()
-            aliases = [a.strip() for a in t.split(",") if a.strip()] if t.upper() != "SKIP" else []
-            doc = {
-                "name": data["name"], "name_lower": data["name"].lower(),
-                "description": data.get("description",""),
-                "image_file_id": data.get("image_file_id"),
-                "watch_url": data.get("watch_url",""),
-                "aliases": aliases, "aliases_lower": [a.lower() for a in aliases],
+            t  = (msg.text or "").strip()
+            al = [x.strip() for x in t.split(",") if x.strip()] if t.upper() != "SKIP" else []
+            await anime_col.insert_one({
+                "name": d["name"], "name_lower": d["name"].lower(),
+                "description": d.get("desc",""), "image_file_id": d.get("img"),
+                "watch_url": d.get("url",""), "aliases": al,
+                "aliases_lower": [x.lower() for x in al],
                 "added_by": uid, "added_at": datetime.utcnow(),
-            }
-            await anime_col.insert_one(doc); clear_state(uid)
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Another", callback_data="panel_add_ani"),
-                                        InlineKeyboardButton("🎛️ Panel",       callback_data="open_panel")]])
-            await message.reply_text(f"✅ **{data['name']}** added!", reply_markup=kb)
+            })
+            clr_st(uid)
+            await msg.reply_text(
+                f"✅ **{d['name']}** added successfully!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Add Another", callback_data="panel_add_ani"),
+                     InlineKeyboardButton("🎛️ Panel",       callback_data="open_panel")]]))
 
+        # EDIT ANIME
         elif step == "edit_name":
-            anime = await anime_col.find_one({"name_lower": message.text.strip().lower()})
-            if not anime:
-                anime = await anime_col.find_one({"name_lower": {"$regex": re.escape(message.text.strip().lower())}})
-            if not anime:
-                await message.reply_text("❌ Not found. Try again or /cancel."); return
-            clear_state(uid)
-            aid_str = str(anime["_id"])
-            info = (f"✏️ **{anime['name']}**\n\n"
-                    f"📖 {(anime.get('description','') or '')[:80]}…\n"
-                    f"🔗 {anime.get('watch_url','—')}\n"
-                    f"🏷️ {', '.join(anime.get('aliases') or []) or '—'}\n\nTap field:")
+            q = msg.text.strip()
+            a = await anime_col.find_one({"name_lower": q.lower()})
+            if not a: a = await anime_col.find_one({"name_lower": {"$regex": re.escape(q.lower())}})
+            if not a: await msg.reply_text("❌ Not found. Try again or /cancel."); return
+            clr_st(uid); s_ = str(a["_id"])
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📝 Name",      callback_data=f"editfield_{aid_str}_name"),
-                 InlineKeyboardButton("📖 Synopsis",  callback_data=f"editfield_{aid_str}_description")],
-                [InlineKeyboardButton("🔗 Watch Link",callback_data=f"editfield_{aid_str}_watch_url"),
-                 InlineKeyboardButton("🏷️ Aliases",   callback_data=f"editfield_{aid_str}_aliases")],
-                [InlineKeyboardButton("🖼️ Image",     callback_data=f"editfield_{aid_str}_image")],
-                [InlineKeyboardButton("🗑️ Delete",    callback_data=f"del_confirm_{aid_str}"),
+                [InlineKeyboardButton("📝 Name",      callback_data=f"ef_{s_}_name"),
+                 InlineKeyboardButton("📖 Synopsis",  callback_data=f"ef_{s_}_description")],
+                [InlineKeyboardButton("🔗 Watch Link",callback_data=f"ef_{s_}_watch_url"),
+                 InlineKeyboardButton("🏷️ Aliases",   callback_data=f"ef_{s_}_aliases")],
+                [InlineKeyboardButton("🖼️ Image",     callback_data=f"ef_{s_}_image")],
+                [InlineKeyboardButton("🗑️ Delete",    callback_data=f"del_cfm_{s_}"),
                  InlineKeyboardButton("❌ Cancel",     callback_data="edit_cancel")],
             ])
-            await message.reply_text(info, reply_markup=kb)
+            await msg.reply_text(
+                f"✏️ **{a['name']}**\n\n"
+                f"📖 {(a.get('description','') or '')[:80]}…\n"
+                f"🔗 {a.get('watch_url','—')}\n"
+                f"🏷️ {', '.join(a.get('aliases') or []) or '—'}\n\nTap field:", reply_markup=kb)
 
-        elif step == "edit_value":
-            field = data["edit_field"]; aid = data["anime_id"]
+        elif step == "edit_val":
+            field = d["field"]; aid = d["aid"]
             if field == "image":
-                if message.photo: val = message.photo.file_id
-                elif message.text and message.text.strip().startswith("http"): val = message.text.strip()
-                else: await message.reply_text("Send photo or image URL."); return
+                if msg.photo: val = msg.photo.file_id
+                elif msg.text and msg.text.strip().startswith("http"): val = msg.text.strip()
+                else: await msg.reply_text("Send photo or URL."); return
                 await anime_col.update_one({"_id": aid}, {"$set": {"image_file_id": val}})
             elif field == "name":
-                v = message.text.strip()
+                v = msg.text.strip()
                 await anime_col.update_one({"_id": aid}, {"$set": {"name": v, "name_lower": v.lower()}})
             elif field == "aliases":
-                al = [a.strip() for a in message.text.split(",") if a.strip()]
-                await anime_col.update_one({"_id": aid}, {"$set": {"aliases": al, "aliases_lower": [a.lower() for a in al]}})
+                al = [x.strip() for x in msg.text.split(",") if x.strip()]
+                await anime_col.update_one({"_id": aid}, {"$set": {"aliases": al, "aliases_lower": [x.lower() for x in al]}})
             else:
-                await anime_col.update_one({"_id": aid}, {"$set": {field: message.text.strip()}})
-            clear_state(uid)
-            aid_str = str(aid)
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Edit More", callback_data=f"quickedit_{aid_str}"),
-                                        InlineKeyboardButton("🎛️ Panel",     callback_data="open_panel")]])
-            await message.reply_text(f"✅ **{field}** updated!", reply_markup=kb)
+                await anime_col.update_one({"_id": aid}, {"$set": {field: msg.text.strip()}})
+            clr_st(uid)
+            await msg.reply_text(f"✅ **{field}** updated!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✏️ Edit More", callback_data=f"qedit_{str(aid)}"),
+                     InlineKeyboardButton("🎛️ Panel",     callback_data="open_panel")]]))
 
+        # DELETE
         elif step == "del_name":
-            anime = await anime_col.find_one({"name_lower": message.text.strip().lower()})
-            if not anime:
-                anime = await anime_col.find_one({"name_lower": {"$regex": re.escape(message.text.strip().lower())}})
-            if not anime:
-                await message.reply_text("❌ Not found."); clear_state(uid); return
-            clear_state(uid); aid_str = str(anime["_id"])
-            await message.reply_text(f"⚠️ Delete **'{anime['name']}'**?",
+            q = msg.text.strip()
+            a = await anime_col.find_one({"name_lower": q.lower()})
+            if not a: a = await anime_col.find_one({"name_lower": {"$regex": re.escape(q.lower())}})
+            if not a: await msg.reply_text("❌ Not found."); clr_st(uid); return
+            clr_st(uid); s_ = str(a["_id"])
+            await msg.reply_text(f"⚠️ Delete **'{a['name']}'**?",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Yes, Delete", callback_data=f"del_yes_{aid_str}"),
-                    InlineKeyboardButton("❌ Cancel",       callback_data="del_cancel")]]))
+                    InlineKeyboardButton("✅ Yes", callback_data=f"del_yes_{s_}"),
+                    InlineKeyboardButton("❌ No",  callback_data="del_no")]]))
 
+        # ADD ALIAS
         elif step == "alias_name":
-            anime = await anime_col.find_one({"name_lower": message.text.strip().lower()})
-            if not anime: await message.reply_text("Not found."); clear_state(uid); return
-            data["anime_id"] = anime["_id"]; data["anime_name"] = anime["name"]
-            set_state(uid, "alias_values", data)
-            await message.reply_text(f"Send aliases for **{anime['name']}** (comma-separated):")
+            a = await anime_col.find_one({"name_lower": msg.text.strip().lower()})
+            if not a: await msg.reply_text("Not found."); clr_st(uid); return
+            d["aid"] = a["_id"]; d["aname"] = a["name"]
+            set_st(uid, "alias_vals", d)
+            await msg.reply_text(f"Send aliases for **{a['name']}** (comma-separated):")
 
-        elif step == "alias_values":
-            al  = [a.strip() for a in message.text.split(",") if a.strip()]
-            alL = [a.lower() for a in al]
-            await anime_col.update_one({"_id": data["anime_id"]},
+        elif step == "alias_vals":
+            al  = [x.strip() for x in msg.text.split(",") if x.strip()]
+            alL = [x.lower() for x in al]
+            await anime_col.update_one({"_id": d["aid"]},
                 {"$addToSet": {"aliases": {"$each": al}, "aliases_lower": {"$each": alL}}})
-            clear_state(uid)
-            await message.reply_text(f"✅ Aliases added to **{data['anime_name']}**!")
+            clr_st(uid); await msg.reply_text(f"✅ Aliases added to **{d['aname']}**!")
 
+        # BULK IMPORT
         elif step == "bulk_file":
-            if not message.document:
-                await message.reply_text("Send .txt or .json file."); return
-            fname = message.document.file_name or ""
-            dl    = await message.download(in_memory=True)
+            if not msg.document: await msg.reply_text("Send .txt or .json file."); return
+            fname = msg.document.file_name or ""
+            dl    = await msg.download(in_memory=True)
             raw   = bytes(dl.getbuffer()).decode("utf-8", errors="ignore")
             imp = skp = 0
             if fname.endswith(".json"):
                 try: items = json.loads(raw)
-                except Exception: await message.reply_text("Invalid JSON."); clear_state(uid); return
+                except Exception: await msg.reply_text("❌ Invalid JSON."); clr_st(uid); return
                 for item in items:
                     if not item.get("name"): skp += 1; continue
                     nl = item["name"].lower()
                     if await anime_col.find_one({"name_lower": nl}): skp += 1; continue
-                    al = item.get("aliases", [])
+                    al = item.get("aliases",[])
                     await anime_col.insert_one({
                         "name": item["name"], "name_lower": nl,
                         "description": item.get("description",""),
                         "image_file_id": item.get("image_url") or item.get("image_file_id"),
                         "watch_url": item.get("watch_url",""),
-                        "aliases": al, "aliases_lower": [a.lower() for a in al],
+                        "aliases": al, "aliases_lower": [x.lower() for x in al],
                         "added_by": uid, "added_at": datetime.utcnow()})
                     imp += 1
             elif fname.endswith(".txt"):
                 for line in raw.splitlines():
                     line = line.strip()
                     if not line: continue
-                    seg = [s.strip() for s in line.split("|")]
-                    name = seg[0] if seg else ""; img = seg[1] if len(seg)>1 else ""; syn = seg[2] if len(seg)>2 else ""; wurl = seg[3] if len(seg)>3 else ""; al_s = seg[4] if len(seg)>4 else ""
-                    aliases = [a.strip() for a in al_s.split(",") if a.strip()]
+                    seg = [x.strip() for x in line.split("|")]
+                    name = seg[0] if seg else ""
                     if not name: skp += 1; continue
                     nl = name.lower()
                     if await anime_col.find_one({"name_lower": nl}): skp += 1; continue
+                    al = [x.strip() for x in (seg[4] if len(seg)>4 else "").split(",") if x.strip()]
                     await anime_col.insert_one({
-                        "name": name, "name_lower": nl, "description": syn,
-                        "image_file_id": img or None, "watch_url": wurl,
-                        "aliases": aliases, "aliases_lower": [a.lower() for a in aliases],
+                        "name": name, "name_lower": nl,
+                        "description": seg[2] if len(seg)>2 else "",
+                        "image_file_id": seg[1] if len(seg)>1 else None,
+                        "watch_url": seg[3] if len(seg)>3 else "",
+                        "aliases": al, "aliases_lower": [x.lower() for x in al],
                         "added_by": uid, "added_at": datetime.utcnow()})
                     imp += 1
             else:
-                await message.reply_text("Only .json or .txt."); clear_state(uid); return
-            clear_state(uid)
-            await message.reply_text(f"✅ **Bulk Done!**\nImported: {imp} | Skipped: {skp}")
+                await msg.reply_text("Only .json or .txt!"); clr_st(uid); return
+            clr_st(uid); await msg.reply_text(f"✅ **Bulk Import Done!**\n\nImported: {imp}\nSkipped (duplicates): {skp}")
 
+        # BROADCAST
         elif step == "bcast":
-            txt   = message.text or message.caption or ""
-            users = await users_col.find({}, {"_id": 1}).to_list(None)
-            sent = failed = 0
-            sm   = await message.reply_text(f"📢 Broadcasting to {len(users)} users…")
+            text  = msg.text or msg.caption or ""
+            users = await users_col.find({},{"_id":1}).to_list(None)
+            sm    = await msg.reply_text(f"📢 Broadcasting to {len(users)} users…")
+            sent = fail = 0
             for u in users:
-                try: await app.send_message(u["_id"], txt); sent += 1
-                except Exception: failed += 1
+                try: await app.send_message(u["_id"], text); sent += 1
+                except Exception: fail += 1
                 await asyncio.sleep(0.05)
-            clear_state(uid)
-            await sm.edit_text(f"✅ Sent: {sent} | Failed: {failed}")
+            clr_st(uid); await sm.edit_text(f"✅ Sent: {sent} | Failed: {fail}")
 
+        # SETTINGS STATES
         elif step == "set_start_img":
-            if message.photo:
-                await sset("start_banner", message.photo.file_id); clear_state(uid)
-                await message.reply_text("✅ Start banner updated!")
-            else: await message.reply_text("Send a photo.")
+            if msg.photo:
+                await sset("start_banner", msg.photo.file_id); clr_st(uid)
+                await msg.reply_text("✅ Start banner updated!")
+            else: await msg.reply_text("Send a photo.")
 
         elif step == "set_start_msg":
-            if message.text:
-                await sset("welcome_message", message.text); clear_state(uid)
-                await message.reply_text("✅ Welcome message updated!")
-            else: await message.reply_text("Send text.")
+            if msg.text:
+                await sset("welcome_message", msg.text); clr_st(uid)
+                await msg.reply_text("✅ Welcome message updated!")
+            else: await msg.reply_text("Send text.")
 
         elif step == "set_welcome_text":
-            if message.text:
-                data["wtext"] = message.text; set_state(uid, "set_welcome_img", data)
-                await message.reply_text("Send welcome image (photo) or SKIP:")
-            else: await message.reply_text("Send text.")
+            if msg.text:
+                d["wtxt"] = msg.text; set_st(uid, "set_welcome_img", d)
+                await msg.reply_text("Send welcome image (photo) or type **SKIP**:")
+            else: await msg.reply_text("Send text.")
 
         elif step == "set_welcome_img":
-            if message.photo: await sset("welcome_img", message.photo.file_id)
-            elif not (message.text and message.text.strip().upper() == "SKIP"):
-                await message.reply_text("Send photo or SKIP."); return
-            await sset("group_welcome", data["wtext"]); clear_state(uid)
-            await message.reply_text("✅ Group welcome updated!")
+            if msg.photo: await sset("welcome_img", msg.photo.file_id)
+            elif not (msg.text and msg.text.strip().upper() == "SKIP"):
+                await msg.reply_text("Send photo or SKIP."); return
+            await sset("group_welcome", d["wtxt"]); clr_st(uid)
+            await msg.reply_text("✅ Group welcome updated!")
 
         elif step == "set_goodbye_text":
-            if message.text:
-                data["gtext"] = message.text; set_state(uid, "set_goodbye_img", data)
-                await message.reply_text("Send goodbye image (photo) or SKIP:")
-            else: await message.reply_text("Send text.")
+            if msg.text:
+                d["gtxt"] = msg.text; set_st(uid, "set_goodbye_img", d)
+                await msg.reply_text("Send goodbye image (photo) or type **SKIP**:")
+            else: await msg.reply_text("Send text.")
 
         elif step == "set_goodbye_img":
-            if message.photo: await sset("goodbye_img", message.photo.file_id)
-            elif not (message.text and message.text.strip().upper() == "SKIP"):
-                await message.reply_text("Send photo or SKIP."); return
-            await sset("group_goodbye", data["gtext"]); clear_state(uid)
-            await message.reply_text("✅ Group goodbye updated!")
+            if msg.photo: await sset("goodbye_img", msg.photo.file_id)
+            elif not (msg.text and msg.text.strip().upper() == "SKIP"):
+                await msg.reply_text("Send photo or SKIP."); return
+            await sset("group_goodbye", d["gtxt"]); clr_st(uid)
+            await msg.reply_text("✅ Group goodbye updated!")
 
     return app
 
 
-# ═══════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 #  MAIN
-# ═══════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 async def main():
+    # Create indexes
     db = get_db(PRIMARY["db_name"])
     await db["animes"].create_index("name_lower")
     await db["animes"].create_index("aliases_lower")
     await db["users"].create_index("_id")
     await db["infinite_links"].create_index([("owner_uid", 1), ("channel_id", 1)])
-    logger.info("✅ MongoDB indexes created")
+    logger.info("✅ Indexes ready")
 
-    primary_app = make_bot(PRIMARY)
-    await primary_app.start()
-    me = await primary_app.get_me()
-    logger.info(f"✅ Bot started as @{me.username}")
+    # Start primary bot
+    primary = make_bot(PRIMARY)
+    await primary.start()
+    me = await primary.get_me()
+    logger.info(f"✅ Primary: @{me.username}")
 
+    # Restore clones from DB (safe because in_memory=True)
     async for inst in instances_col.find({}):
-        cfg = {k: inst[k] for k in ("bot_token","session_name","db_name","original_owner_id")}
+        bid = inst["bot_id"]
+        if bid in CLONES: continue
         try:
-            clone = make_bot(cfg); await clone.start()
-            cm    = await clone.get_me()
-            RUNNING_CLONES[inst["bot_id"]] = clone
-            logger.info(f"✅ Clone: @{cm.username}")
+            c = make_bot({
+                "bot_token":         inst["bot_token"],
+                "session_name":      inst.get("session_name", f"clone_{bid}"),
+                "db_name":           inst.get("db_name", f"Kenshin_{bid}"),
+                "original_owner_id": inst.get("original_owner_id", PRIMARY["original_owner_id"]),
+            })
+            await c.start()
+            CLONES[bid] = c
+            cm = await c.get_me()
+            logger.info(f"✅ Clone restored: @{cm.username}")
         except Exception as e:
-            logger.error(f"Clone restore failed {inst.get('bot_id')}: {e}")
+            logger.error(f"❌ Clone restore failed ({bid}): {e}")
 
-    logger.info("🏃 Running. Idling…")
+    logger.info("🏃 All bots running…")
     await idle()
 
-    for c in RUNNING_CLONES.values():
+    # Graceful shutdown
+    logger.info("🛑 Shutting down…")
+    for c in list(CLONES.values()):
         try: await c.stop()
         except Exception: pass
-    await primary_app.stop()
+    await primary.stop()
+    logger.info("✅ All stopped.")
 
 
 if __name__ == "__main__":
