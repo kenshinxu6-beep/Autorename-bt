@@ -125,9 +125,10 @@ def make_bot(cfg: dict) -> Client:
 
     # ── placeholder formatter ──────────────────────────
     def fmt(tmpl, user, chat=""):
-        fn = getattr(user, "first_name", "") or ""
-        ln = getattr(user, "last_name",  "") or ""
-        un = getattr(user, "username",   None)
+        fn   = getattr(user, "first_name", "") or ""
+        ln   = getattr(user, "last_name",  "") or ""
+        un   = getattr(user, "username",   None)
+        chat = chat or ""          # guard against None
         return (tmpl
             .replace("{name}",       f"{fn} {ln}".strip())
             .replace("{first_name}", fn)
@@ -233,61 +234,52 @@ def make_bot(cfg: dict) -> Client:
                 expire_date  = datetime.utcfromtimestamp(int(time.time()) + 60),
                 member_limit = 1,
             )
-            text = (
-                "🔗 **Your Invite Link is Ready!**\n\n"
-                "⏱ Expires in **60 seconds**\n"
-                "👤 Single-use only\n\n"
-                "Tap **Join Now** before it expires!"
-            )
+            text = "<b><blockquote>Join Now the channel before link expires‼️</blockquote></b>"
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Join Now",  url=lnk.invite_link),
                 InlineKeyboardButton("🔄 New Link",  callback_data=f"inf_regen_{channel_id}_{owner_uid}"),
             ]])
         except Exception as e:
             logger.error(f"invite link error: {e}")
-            text = ("❌ **Could not generate invite link.**\n\n"
-                    "Make sure bot is **admin** with *Invite Users* permission.")
+            text = "❌ <b>Could not generate invite link.</b>\n\nMake sure bot is <b>admin</b> with <i>Invite Users</i> permission."
             kb   = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Try Again", callback_data=f"inf_regen_{channel_id}_{owner_uid}")]])
             img  = None
         dest = target if isinstance(target, Message) else target.message
         if img:
-            try: await dest.reply_photo(photo=img, caption=text, reply_markup=kb); return
+            try: await dest.reply_photo(photo=img, caption=text, reply_markup=kb, parse_mode=enums.ParseMode.HTML); return
             except Exception: pass
-        await dest.reply_text(text, reply_markup=kb)
+        await dest.reply_text(text, reply_markup=kb, parse_mode=enums.ParseMode.HTML)
 
     # ── send join-request link ─────────────────────────
     async def send_req_link(target, channel_id: int, owner_uid: int):
-        """Send a Request to Join button (no admin needed for this)."""
+        """Send a Request-to-Join button. Bot creates a 60-sec join-request invite link."""
         rec = await infinite_col.find_one({"owner_uid": owner_uid, "channel_id": channel_id})
         img = (rec or {}).get("custom_image")
         if not img:
             g   = await infinite_col.find_one({"owner_uid": owner_uid, "channel_id": 0})
             img = (g or {}).get("custom_image")
         try:
-            chat = await app.get_chat(channel_id)
-            link = f"https://t.me/{chat.username}" if chat.username else None
-            if not link:
-                lnk  = await app.create_chat_invite_link(channel_id, creates_join_request=True)
-                link = lnk.invite_link
+            lnk  = await app.create_chat_invite_link(
+                channel_id,
+                expire_date         = datetime.utcfromtimestamp(int(time.time()) + 60),
+                creates_join_request= True,
+            )
+            link = lnk.invite_link
+            text = "<b><blockquote>Join Now the channel before link expires‼️</blockquote></b>"
+            kb   = InlineKeyboardMarkup([[
+                InlineKeyboardButton("📨 Request to Join", url=link),
+                InlineKeyboardButton("🔄 New Link",        callback_data=f"inf_regen_{channel_id}_{owner_uid}"),
+            ]])
         except Exception as e:
             logger.error(f"req link error: {e}")
-            link = None
-        if not link:
-            dest = target if isinstance(target, Message) else target.message
-            await dest.reply_text("❌ Could not generate request link. Make sure bot is admin in the channel.")
-            return
-        text = (
-            "📨 **Join Request**\n\n"
-            "Tap **Request to Join** below.\n"
-            "Your request will be **auto-approved instantly** ✅\n"
-            "You'll get a private message when approved!"
-        )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📨 Request to Join", url=link)]])
+            text = "❌ <b>Could not generate request link.</b>\n\nMake sure bot is <b>admin</b> in the channel."
+            kb   = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Try Again", callback_data=f"inf_regen_{channel_id}_{owner_uid}")]])
+            img  = None
         dest = target if isinstance(target, Message) else target.message
         if img:
-            try: await dest.reply_photo(photo=img, caption=text, reply_markup=kb); return
+            try: await dest.reply_photo(photo=img, caption=text, reply_markup=kb, parse_mode=enums.ParseMode.HTML); return
             except Exception: pass
-        await dest.reply_text(text, reply_markup=kb)
+        await dest.reply_text(text, reply_markup=kb, parse_mode=enums.ParseMode.HTML)
 
     # ═══════════════════════════════════════════════════
     #  CONSTANTS
@@ -359,42 +351,42 @@ def make_bot(cfg: dict) -> Client:
         is_ownr = await is_owner(uid)
         is_supr = await is_super(uid)
         rows = [
-            [InlineKeyboardButton("━━━━ 🎌  ANIME  🎌 ━━━━", callback_data="noop")],
-            [InlineKeyboardButton("➕  Add Anime",           callback_data="panel_add_ani")],
-            [InlineKeyboardButton("✏️  Edit Anime",          callback_data="panel_edit_ani")],
-            [InlineKeyboardButton("🗑️  Delete Anime",        callback_data="panel_delete_ani")],
-            [InlineKeyboardButton("🔤  Add Alias",           callback_data="panel_add_alias")],
-            [InlineKeyboardButton("📋  List Animes",         callback_data="panel_list")],
-            [InlineKeyboardButton("━━━━ 📊  DATA  📊 ━━━━",  callback_data="noop")],
-            [InlineKeyboardButton("📊  Stats",               callback_data="panel_stats")],
-            [InlineKeyboardButton("📤  Export Database",     callback_data="panel_export")],
-            [InlineKeyboardButton("📦  Bulk Import",         callback_data="panel_bulk")],
-            [InlineKeyboardButton("📢  Broadcast",           callback_data="panel_broadcast")],
-            [InlineKeyboardButton("👥  Admin List",           callback_data="panel_adminlist")],
-            [InlineKeyboardButton("🚫  Ban User",             callback_data="panel_ban")],
-            [InlineKeyboardButton("✅  Unban User",           callback_data="panel_unban")],
-            [InlineKeyboardButton("━━━━ ⚙️  SETTINGS  ⚙️ ━━━━", callback_data="noop")],
-            [InlineKeyboardButton("🖼️  Set Start Banner",    callback_data="panel_set_start_img")],
-            [InlineKeyboardButton("✏️  Set Start Message",   callback_data="panel_set_start_msg")],
-            [InlineKeyboardButton("👋  Group Welcome Msg",   callback_data="panel_set_welcome")],
-            [InlineKeyboardButton("👋  Group Goodbye Msg",   callback_data="panel_set_goodbye")],
-            [InlineKeyboardButton("📢  Promo Channels",      callback_data="panel_set_channel")],
-            [InlineKeyboardButton("🔒  Force Subscribe",     callback_data="panel_forcesub")],
-            [InlineKeyboardButton("🔗  Infinite Links",      callback_data="panel_infinite")],
+            [InlineKeyboardButton("━━━━━ 🎌  ANIME  🎌 ━━━━━", callback_data="noop")],
+            [InlineKeyboardButton("➕ Add Anime",    callback_data="panel_add_ani"),
+             InlineKeyboardButton("✏️ Edit Anime",   callback_data="panel_edit_ani"),
+             InlineKeyboardButton("🗑️ Delete Anime", callback_data="panel_delete_ani")],
+            [InlineKeyboardButton("🔤 Add Alias",    callback_data="panel_add_alias"),
+             InlineKeyboardButton("📋 List Animes",  callback_data="panel_list")],
+            [InlineKeyboardButton("━━━━━ 📊  DATA  📊 ━━━━━",  callback_data="noop")],
+            [InlineKeyboardButton("📊 Stats",        callback_data="panel_stats"),
+             InlineKeyboardButton("📤 Export DB",    callback_data="panel_export"),
+             InlineKeyboardButton("📦 Bulk Import",  callback_data="panel_bulk")],
+            [InlineKeyboardButton("📢 Broadcast",    callback_data="panel_broadcast"),
+             InlineKeyboardButton("👥 Admin List",   callback_data="panel_adminlist")],
+            [InlineKeyboardButton("🚫 Ban User",     callback_data="panel_ban"),
+             InlineKeyboardButton("✅ Unban User",   callback_data="panel_unban")],
+            [InlineKeyboardButton("━━━━━ ⚙️  SETTINGS  ⚙️ ━━━━━", callback_data="noop")],
+            [InlineKeyboardButton("🖼️ Start Banner", callback_data="panel_set_start_img"),
+             InlineKeyboardButton("✏️ Start Message",callback_data="panel_set_start_msg")],
+            [InlineKeyboardButton("👋 Group Welcome",callback_data="panel_set_welcome"),
+             InlineKeyboardButton("👋 Group Goodbye",callback_data="panel_set_goodbye")],
+            [InlineKeyboardButton("📢 Promo Channels",callback_data="panel_set_channel"),
+             InlineKeyboardButton("🔒 Force Subscribe",callback_data="panel_forcesub")],
+            [InlineKeyboardButton("🔗 Infinite Links",callback_data="panel_infinite")],
         ]
         if is_ownr:
             rows += [
-                [InlineKeyboardButton("━━━━ 👑  STAFF  👑 ━━━━", callback_data="noop")],
-                [InlineKeyboardButton("🛡️  Add Admin",            callback_data="panel_add_admin")],
-                [InlineKeyboardButton("❌  Remove Admin",         callback_data="panel_remove_admin")],
-                [InlineKeyboardButton("👑  Add Owner",            callback_data="panel_add_owner")],
-                [InlineKeyboardButton("❌  Remove Owner",         callback_data="panel_remove_owner")],
+                [InlineKeyboardButton("━━━━━ 👑  STAFF  👑 ━━━━━", callback_data="noop")],
+                [InlineKeyboardButton("🛡️ Add Admin",   callback_data="panel_add_admin"),
+                 InlineKeyboardButton("❌ Rem Admin",   callback_data="panel_remove_admin")],
+                [InlineKeyboardButton("👑 Add Owner",   callback_data="panel_add_owner"),
+                 InlineKeyboardButton("❌ Rem Owner",   callback_data="panel_remove_owner")],
             ]
         if is_supr:
             rows += [
-                [InlineKeyboardButton("━━━━ ⚡  CLONE  ⚡ ━━━━", callback_data="noop")],
-                [InlineKeyboardButton("⚡  Start Clone Bot",      callback_data="panel_copy")],
-                [InlineKeyboardButton("🗑️  Stop Clone Bot",       callback_data="panel_delcopy")],
+                [InlineKeyboardButton("━━━━━ ⚡  CLONE  ⚡ ━━━━━", callback_data="noop")],
+                [InlineKeyboardButton("⚡ Start Clone",  callback_data="panel_copy"),
+                 InlineKeyboardButton("🗑️ Stop Clone",   callback_data="panel_delcopy")],
             ]
         return InlineKeyboardMarkup(rows)
 
@@ -440,12 +432,13 @@ def make_bot(cfg: dict) -> Client:
             "🎌 Welcome to **Kenshin Anime Search Bot**!\n\n"
             "⚡ Just type any anime name to search.\n"
             "📋 Use /help to see all commands.")
-        welcome   = fmt(welcome, msg.from_user, getattr(msg.chat, "title", ""))
+        welcome   = fmt(welcome, msg.from_user, getattr(msg.chat, "title", "") or "")
         banner    = await gset("start_banner", None)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔍 Search Anime", switch_inline_query_current_chat=""),
-             InlineKeyboardButton("📋 Help",         callback_data="show_help")],
-            [InlineKeyboardButton("🌟 Anime List",   callback_data="show_popular")],
+             InlineKeyboardButton("📋 Help",          callback_data="show_help")],
+            [InlineKeyboardButton("🌟 Anime List",    callback_data="show_popular"),
+             InlineKeyboardButton("🎛️ Panel",          callback_data="open_panel")],
         ])
         if banner:
             try:   await msg.reply_photo(photo=banner, caption=welcome, reply_markup=kb); return
@@ -671,13 +664,14 @@ def make_bot(cfg: dict) -> Client:
             un        = await bot_un()
             deep_link = f"https://t.me/{un}?start=inf_{cid}_{uid}"
             await msg.reply_text(
-                f"✅ **Request-to-Join Link Created!**\n\n"
-                f"🔗 **Link:**\n`{deep_link}`\n\n"
-                f"📌 When user taps it:\n"
-                f"  • Bot sends **Request to Join** button\n"
-                f"  • Bot **auto-approves** their request ✅\n"
-                f"  • User gets a **private DM** with approval notice\n\n"
-                f"⚠️ Bot must be **admin** in the channel!",
+                f"✅ <b>Request-to-Join Link Created!</b>\n\n"
+                f"🔗 <b>Share this link:</b>\n<code>{deep_link}</code>\n\n"
+                f"📌 <b>How it works:</b>\n"
+                f"  • User taps link → gets a <b>60-sec</b> join-request button\n"
+                f"  • Bot <b>auto-approves</b> their request ✅\n"
+                f"  • User gets a <b>DM</b>: <i>Your request was accepted of [channel]</i>\n\n"
+                f"⚠️ Bot must be <b>admin</b> in the channel!",
+                parse_mode=enums.ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔗 View Link", url=deep_link)],
                     [InlineKeyboardButton("📋 My Links",  callback_data="inf_list")],
@@ -738,12 +732,13 @@ def make_bot(cfg: dict) -> Client:
             try:
                 await app.send_message(
                     uid,
-                    f"✅ **Your join request has been approved!**\n\n"
-                    f"🎉 You have been added to **{chat_title}**\n\n"
-                    f"🎌 Enjoy the anime content!"
+                    f"✅ <b>Your request was accepted of <a href='https://t.me/c/{str(cid).replace('-100','')}'>{chat_title}</a>!</b>\n\n"
+                    f"🎉 You have been added to <b>{chat_title}</b>\n"
+                    f"🎌 Enjoy the anime content!",
+                    parse_mode=enums.ParseMode.HTML,
                 )
             except Exception:
-                pass  # user may have blocked bot, that's fine
+                pass  # user may have blocked bot
         except Exception as e:
             logger.error(f"join_request handler: {e}")
 
