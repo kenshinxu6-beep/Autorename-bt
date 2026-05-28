@@ -129,14 +129,15 @@ def make_bot(cfg: dict) -> Client:
     ln = getattr(user, "last_name", "") or ""
     un = getattr(user, "username", None)
 
-    return (str(tmpl or "")
+    return (
+        str(tmpl or "")
         .replace("{name}", f"{fn} {ln}".strip())
         .replace("{first_name}", fn)
         .replace("{last_name}", ln)
         .replace("{mention}", f"@{un}" if un else fn)
         .replace("{id}", str(user.id))
-        .replace("{chat}", str(chat or "")))
-
+        .replace("{chat}", str(chat or ""))
+    )
     # ── ban check helper ───────────────────────────────
     async def is_banned(uid: int) -> bool:
         rec = await users_col.find_one({"_id": uid})
