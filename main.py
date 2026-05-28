@@ -124,20 +124,18 @@ def make_bot(cfg: dict) -> Client:
             }}, upsert=True)
 
     # ── placeholder formatter ──────────────────────────
-def fmt(tmpl, user, chat=""):
-    fn = getattr(user, "first_name", "") or ""
-    ln = getattr(user, "last_name", "") or ""
-    un = getattr(user, "username", None)
-    
-    return (
-        str(tmpl or "")
-        .replace("{name}", f"{fn} {ln}".strip())
-        .replace("{first_name}", fn)
-        .replace("{last_name}", ln)
-        .replace("{mention}", f"@{un}" if un else fn)
-        .replace("{id}", str(user.id))
-        .replace("{chat}", str(chat or ""))
-    )
+    def fmt(tmpl, user, chat=""):
+        fn = getattr(user, "first_name", "") or ""
+        ln = getattr(user, "last_name",  "") or ""
+        un = getattr(user, "username",   None)
+        return (tmpl
+            .replace("{name}",       f"{fn} {ln}".strip())
+            .replace("{first_name}", fn)
+            .replace("{last_name}",  ln)
+            .replace("{mention}",    f"@{un}" if un else fn)
+            .replace("{id}",         str(user.id))
+            .replace("{chat}",       chat))
+
     # ── ban check helper ───────────────────────────────
     async def is_banned(uid: int) -> bool:
         rec = await users_col.find_one({"_id": uid})
@@ -357,88 +355,57 @@ def fmt(tmpl, user, chat=""):
     ]
 
     # ── admin panel builder ────────────────────────────
-async def build_panel(uid):
-    is_ownr = await is_owner(uid)
-    is_supr = await is_super(uid)
-
-    rows = [
-        [
-            InlineKeyboardButton("➕ Add Anime", callback_data="panel_add_ani"),
-            InlineKeyboardButton("✏️ Edit", callback_data="panel_edit_ani"),
-            InlineKeyboardButton("🗑 Delete", callback_data="panel_delete_ani"),
-        ],
-        [
-            InlineKeyboardButton("🔤 Alias", callback_data="panel_add_alias"),
-            InlineKeyboardButton("📋 List", callback_data="panel_list"),
-        ],
-        [
-            InlineKeyboardButton("📊 Stats", callback_data="panel_stats"),
-            InlineKeyboardButton("📤 Export", callback_data="panel_export"),
-        ],
-        [
-            InlineKeyboardButton("📦 Bulk", callback_data="panel_bulk"),
-            InlineKeyboardButton("📢 Broadcast", callback_data="panel_broadcast"),
-        ],
-        [
-            InlineKeyboardButton("👥 Admins", callback_data="panel_adminlist"),
-            InlineKeyboardButton("🚫 Ban", callback_data="panel_ban"),
-            InlineKeyboardButton("✅ Unban", callback_data="panel_unban"),
-        ],
-        [
-            InlineKeyboardButton("🖼 Banner", callback_data="panel_set_start_img"),
-            InlineKeyboardButton("✏️ Start Msg", callback_data="panel_set_start_msg"),
-        ],
-        [
-            InlineKeyboardButton("👋 Welcome", callback_data="panel_set_welcome"),
-            InlineKeyboardButton("👋 Goodbye", callback_data="panel_set_goodbye"),
-        ],
-        [
-            InlineKeyboardButton("📢 Channels", callback_data="panel_set_channel"),
-            InlineKeyboardButton("🔒 ForceSub", callback_data="panel_forcesub"),
-        ],
-        [
-            InlineKeyboardButton("🔗 Infinite Links", callback_data="panel_infinite"),
-        ],
-    ]
-
-    if is_ownr:
-        rows += [
-            [
-                InlineKeyboardButton("🛡 Add Admin", callback_data="panel_add_admin"),
-                InlineKeyboardButton("❌ Rem Admin", callback_data="panel_remove_admin"),
-            ],
-            [
-                InlineKeyboardButton("👑 Add Owner", callback_data="panel_add_owner"),
-                InlineKeyboardButton("❌ Rem Owner", callback_data="panel_remove_owner"),
-            ],
+    async def build_panel(uid):
+        is_ownr = await is_owner(uid)
+        is_supr = await is_super(uid)
+        rows = [
+            [InlineKeyboardButton("━━━━ 🎌  ANIME  🎌 ━━━━", callback_data="noop")],
+            [InlineKeyboardButton("➕  Add Anime",           callback_data="panel_add_ani")],
+            [InlineKeyboardButton("✏️  Edit Anime",          callback_data="panel_edit_ani")],
+            [InlineKeyboardButton("🗑️  Delete Anime",        callback_data="panel_delete_ani")],
+            [InlineKeyboardButton("🔤  Add Alias",           callback_data="panel_add_alias")],
+            [InlineKeyboardButton("📋  List Animes",         callback_data="panel_list")],
+            [InlineKeyboardButton("━━━━ 📊  DATA  📊 ━━━━",  callback_data="noop")],
+            [InlineKeyboardButton("📊  Stats",               callback_data="panel_stats")],
+            [InlineKeyboardButton("📤  Export Database",     callback_data="panel_export")],
+            [InlineKeyboardButton("📦  Bulk Import",         callback_data="panel_bulk")],
+            [InlineKeyboardButton("📢  Broadcast",           callback_data="panel_broadcast")],
+            [InlineKeyboardButton("👥  Admin List",           callback_data="panel_adminlist")],
+            [InlineKeyboardButton("🚫  Ban User",             callback_data="panel_ban")],
+            [InlineKeyboardButton("✅  Unban User",           callback_data="panel_unban")],
+            [InlineKeyboardButton("━━━━ ⚙️  SETTINGS  ⚙️ ━━━━", callback_data="noop")],
+            [InlineKeyboardButton("🖼️  Set Start Banner",    callback_data="panel_set_start_img")],
+            [InlineKeyboardButton("✏️  Set Start Message",   callback_data="panel_set_start_msg")],
+            [InlineKeyboardButton("👋  Group Welcome Msg",   callback_data="panel_set_welcome")],
+            [InlineKeyboardButton("👋  Group Goodbye Msg",   callback_data="panel_set_goodbye")],
+            [InlineKeyboardButton("📢  Promo Channels",      callback_data="panel_set_channel")],
+            [InlineKeyboardButton("🔒  Force Subscribe",     callback_data="panel_forcesub")],
+            [InlineKeyboardButton("🔗  Infinite Links",      callback_data="panel_infinite")],
         ]
-
-    if is_supr:
-        rows += [
-            [
-                InlineKeyboardButton("⚡ Clone", callback_data="panel_copy"),
-                InlineKeyboardButton("🗑 Del Clone", callback_data="panel_delcopy"),
+        if is_ownr:
+            rows += [
+                [InlineKeyboardButton("━━━━ 👑  STAFF  👑 ━━━━", callback_data="noop")],
+                [InlineKeyboardButton("🛡️  Add Admin",            callback_data="panel_add_admin")],
+                [InlineKeyboardButton("❌  Remove Admin",         callback_data="panel_remove_admin")],
+                [InlineKeyboardButton("👑  Add Owner",            callback_data="panel_add_owner")],
+                [InlineKeyboardButton("❌  Remove Owner",         callback_data="panel_remove_owner")],
             ]
-        ]
+        if is_supr:
+            rows += [
+                [InlineKeyboardButton("━━━━ ⚡  CLONE  ⚡ ━━━━", callback_data="noop")],
+                [InlineKeyboardButton("⚡  Start Clone Bot",      callback_data="panel_copy")],
+                [InlineKeyboardButton("🗑️  Stop Clone Bot",       callback_data="panel_delcopy")],
+            ]
+        return InlineKeyboardMarkup(rows)
 
-    return InlineKeyboardMarkup(rows)
-
-async def send_panel(target, uid):
-    kb = await build_panel(uid)
-
-    text = (
-        "🎛️ **CONTROL PANEL**\n\n"
-        "⚡ Fast • Clean • Professional\n"
-        "📂 Manage your bot easily"
-    )
-
-    if isinstance(target, Message):
-        await target.reply_text(text, reply_markup=kb)
-    else:
-        try:
-            await target.edit_text(text, reply_markup=kb)
-        except Exception:
+    async def send_panel(target, uid):
+        kb   = await build_panel(uid)
+        text = "🎛️ **KENSHIN ADMIN PANEL**\n\nSelect an action:"
+        if isinstance(target, Message):
             await target.reply_text(text, reply_markup=kb)
+        else:
+            try:    await target.edit_text(text, reply_markup=kb)
+            except Exception: await target.reply_text(text, reply_markup=kb)
 
     # ═══════════════════════════════════════════════════
     #  /start
