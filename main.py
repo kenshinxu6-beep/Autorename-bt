@@ -54,7 +54,7 @@ def get_db(name): return _mongo[name]
 # ═══════════════════════════════════════════════════════
 #  BOT FACTORY
 # ═══════════════════════════════════════════════════════
-def make_bot(cfg: dict) -> Client:
+def make_bot(cfg: dict) -> tuple:
 
     db           = get_db(cfg["db_name"])
     anime_col    = db["animes"]
@@ -146,24 +146,9 @@ def make_bot(cfg: dict) -> Client:
         rec = await users_col.find_one({"_id": uid})
         return (rec or {}).get("banned", False)
 
-    # ── force-sub check ────────────────────────────────
+    # ── force-sub check — DISABLED (all users pass freely) ───
     async def fsub_ok(msg: Message) -> bool:
-        chs = await gset("force_sub_channels", [])
-        if not chs or not msg.from_user: return True
-        failed = []
-        for ch in chs:
-            try:
-                m = await app.get_chat_member(ch, msg.from_user.id)
-                if m.status in (enums.ChatMemberStatus.BANNED, enums.ChatMemberStatus.LEFT):
-                    failed.append(ch)
-            except Exception: failed.append(ch)
-        if not failed: return True
-        btns = [[InlineKeyboardButton(f"📢 Join {ch}", url=f"https://t.me/{ch.lstrip('@')}")] for ch in failed]
-        btns.append([InlineKeyboardButton("✅ Done, Check Again", callback_data="check_sub")])
-        await msg.reply_text(
-            "⚠️ **Join these channels first to use the bot!**",
-            reply_markup=InlineKeyboardMarkup(btns))
-        return False
+        return True
 
     # ── anime result ───────────────────────────────────
     async def send_result(msg: Message, anime: dict):
@@ -183,18 +168,49 @@ def make_bot(cfg: dict) -> Client:
         await msg.reply_text(caption, reply_markup=kb)
 
     # ── anime search ───────────────────────────────────
+    # ── anime search ───────────────────────────────────
     async def search(text: str):
+        """
+        Smart search — finds anime even when name is inside a sentence.
+        e.g. "bhai solo leveling hai kya" → finds Solo Leveling
+        Priority:
+          1. Exact match on full text
+          2. DB regex match (query contains name or name contains query)
+          3. Sentence scan — longest anime name/alias found anywhere in text
+        """
         tl = text.lower().strip()
         if not tl: return None
+
+        # 1. Exact full-text match
+        hit = await anime_col.find_one({"$or": [
+            {"name_lower":    tl},
+            {"aliases_lower": tl},
+        ]})
+        if hit: return hit
+
+        # 2. Regex: does DB name match anywhere in the query or vice-versa
         hit = await anime_col.find_one({"$or": [
             {"name_lower":    {"$regex": re.escape(tl), "$options": "i"}},
             {"aliases_lower": {"$regex": re.escape(tl), "$options": "i"}},
         ]})
         if hit: return hit
+
+        # 3. Sentence scan — find anime name/alias inside the full message text
+        #    longest match wins (so "Attack on Titan" beats "Titan")
+        best_anime  = None
+        best_length = 0
         async for a in anime_col.find({}):
-            for t in [a.get("name_lower","")] + (a.get("aliases_lower") or []):
-                if t and len(t) >= 3 and t in tl: return a
-        return None
+            candidates = [a.get("name_lower", "")] + (a.get("aliases_lower") or [])
+            for token in candidates:
+                if not token or len(token) < 3:
+                    continue
+                # word-boundary aware: token must not be mid-word
+                pattern = r"(?<![a-z0-9])" + re.escape(token) + r"(?![a-z0-9])"
+                if re.search(pattern, tl, re.IGNORECASE):
+                    if len(token) > best_length:
+                        best_anime  = a
+                        best_length = len(token)
+        return best_anime
 
     # ── export helper ──────────────────────────────────
     async def do_export(target, fmt_type: str):
@@ -316,8 +332,6 @@ def make_bot(cfg: dict) -> Client:
             "/set_welcome — Group welcome msg\n"
             "/set_goodbye — Group goodbye msg\n"
             "/set_channel — Promo channels\n"
-            "/add_forcesub — Force-sub channel\n"
-            "/rem_forcesub — Remove force-sub\n"
             "/adminlist — List all staff\n"
             "/ban [id] — Ban user from bot\n"
             "/unban [id] — Unban user\n"
@@ -349,7 +363,7 @@ def make_bot(cfg: dict) -> Client:
         "ping","id","userinfo","adminlist","ban","unban","clones",
         "add_ani","edit_ani","delete_ani","add_alias","list","stats","db_export",
         "bulk","broadcast","set_start_img","set_start_msg","set_channel",
-        "add_forcesub","rem_forcesub","set_welcome","set_goodbye",
+        "set_welcome","set_goodbye",
         "add_admin","remove_admin","addowner","removeowner","copy","delcopy",
         "set_name",
     ]
@@ -378,8 +392,7 @@ def make_bot(cfg: dict) -> Client:
              InlineKeyboardButton("✏️ Start Message",callback_data="panel_set_start_msg")],
             [InlineKeyboardButton("👋 Group Welcome",callback_data="panel_set_welcome"),
              InlineKeyboardButton("👋 Group Goodbye",callback_data="panel_set_goodbye")],
-            [InlineKeyboardButton("📢 Promo Channels",callback_data="panel_set_channel"),
-             InlineKeyboardButton("🔒 Force Subscribe",callback_data="panel_forcesub")],
+            [InlineKeyboardButton("📢 Promo Channels",callback_data="panel_set_channel")],
             [InlineKeyboardButton("🔗 Infinite Links",callback_data="panel_infinite")],
         ]
         if is_ownr:
@@ -541,38 +554,59 @@ def make_bot(cfg: dict) -> Client:
     # ═══════════════════════════════════════════════════
     #  Private text / media — search + state handler
     # ═══════════════════════════════════════════════════
-    @app.on_message(filters.private & ~filters.command(ALL_CMDS) & filters.text, group=1)
+    @app.on_message(filters.private & filters.text & ~filters.command(ALL_CMDS))
     async def priv_text(_, msg: Message):
         if not msg.from_user: return
         uid = msg.from_user.id
         if await is_banned(uid):
             await msg.reply_text("🚫 You have been banned from using this bot."); return
-        st  = get_st(uid)
+        st = get_st(uid)
         if st: await state_fn(msg); return
         await reg(msg.from_user)
-        if not await fsub_ok(msg): return
-        anime = await search((msg.text or "").strip())
+        text = (msg.text or "").strip()
+        if not text: return
+        # Smart search — works even if anime name is inside a sentence
+        anime = await search(text)
         if anime:
             await send_result(msg, anime)
         else:
             await msg.reply_text(
-                "❌ Anime not found!\n\n"
-                "💡 Try: `/search [name]` or browse /popular")
+                "❌ **Anime not found!**\n\n"
+                "💡 Just type the anime name\n"
+                "Example: `Solo Leveling` or `Naruto`\n"
+                "Or use /popular to browse all anime")
 
-    @app.on_message(filters.private & (filters.photo | filters.document), group=1)
+    @app.on_message(filters.private & (filters.photo | filters.document | filters.video | filters.audio))
     async def priv_media(_, msg: Message):
         if not msg.from_user: return
-        if get_st(msg.from_user.id): await state_fn(msg)
+        uid = msg.from_user.id
+        if await is_banned(uid):
+            await msg.reply_text("🚫 You have been banned from using this bot."); return
+        if get_st(uid): await state_fn(msg)
 
     # ═══════════════════════════════════════════════════
     #  Group text — smart anime search
     # ═══════════════════════════════════════════════════
+    @app.on_message(filters.group & filters.command("search"))
+    async def grp_cmd_search(_, msg: Message):
+        """Handle /search command in groups — always reply."""
+        if not msg.from_user: return
+        await reg(msg.from_user)
+        parts = (msg.text or "").split(None, 1)
+        if len(parts) < 2:
+            await msg.reply_text("🔍 Usage: `/search [anime name]`\nExample: `/search Naruto`"); return
+        anime = await search(parts[1].strip())
+        if anime: await send_result(msg, anime)
+        else:     await msg.reply_text("❌ Anime not found! Try a different name.\nUse /popular to browse.")
+
     @app.on_message(filters.group & ~filters.command(ALL_CMDS) & filters.text)
     async def grp_text(_, msg: Message):
         if not msg.from_user: return
+        uid  = msg.from_user.id
         text = (msg.text or "").strip()
         if len(text) < 3: return
 
+        # Check if bot is mentioned or reply-to-bot
         mentioned = False
         try:
             me = await app.get_me()
@@ -586,18 +620,23 @@ def make_bot(cfg: dict) -> Client:
                 mentioned = True
         except Exception: pass
 
+        # Strip bot mention from text before searching
+        search_text = text
+        try:
+            me = await app.get_me()
+            search_text = re.sub(rf"@{re.escape(me.username or '')}", "", text, flags=re.I).strip()
+        except Exception: pass
+
         if mentioned:
-            try:
-                me    = await app.get_me()
-                clean = re.sub(rf"@{re.escape(me.username or '')}", "", text, flags=re.I).strip()
-            except Exception: clean = text
-            anime = await search(clean or text)
+            # Bot was mentioned — always reply
+            anime = await search(search_text or text)
             if anime: await send_result(msg, anime)
-            else:     await msg.reply_text("❌ Anime not found! Try `/search [name]`")
+            else:     await msg.reply_text("❌ Anime not found!\n\n💡 Try: `/search [name]` or /popular")
         else:
-            anime = await search(text)
+            # Passive mode — smart sentence scan, reply only if found
+            anime = await search(search_text or text)
             if anime: await send_result(msg, anime)
-            # Silent if not found in passive mode (don't spam GC)
+            # Silent if not found — don't spam the group
 
     # ═══════════════════════════════════════════════════
     #  /infinite
@@ -853,16 +892,32 @@ def make_bot(cfg: dict) -> Client:
     async def _do_broadcast(origin: Message, src: Message):
         """Broadcast src message to all users of THIS bot's DB."""
         users = await users_col.find({}, {"_id": 1}).to_list(None)
-        sm    = await origin.reply_text(f"📢 Broadcasting to {len(users)} users…")
-        sent = fail = 0
+        total = len(users)
+        if total == 0:
+            await origin.reply_text("📭 No users in database yet!"); return
+        sm = await origin.reply_text(f"📢 **Broadcasting to {total} users…**\n\nPlease wait…")
+        sent = fail = block = 0
         for u in users:
             try:
-                await src.copy(u["_id"])
+                await src.copy(chat_id=u["_id"])
                 sent += 1
-            except Exception:
-                fail += 1
+            except Exception as e:
+                err = str(e).lower()
+                if "blocked" in err or "deactivated" in err or "bot was blocked" in err:
+                    block += 1
+                else:
+                    fail += 1
             await asyncio.sleep(0.05)
-        await sm.edit_text(f"✅ **Broadcast Done!**\n\n📤 Sent: {sent}\n❌ Failed: {fail}")
+        try:
+            await sm.edit_text(
+                f"✅ **Broadcast Completed!**\n\n"
+                f"📤 Sent:    **{sent}**\n"
+                f"🚫 Blocked: **{block}**\n"
+                f"❌ Failed:  **{fail}**\n"
+                f"👥 Total:   **{total}**"
+            )
+        except Exception:
+            await origin.reply_text(f"✅ Broadcast done! Sent: {sent} | Blocked: {block} | Failed: {fail}")
 
     @app.on_message(filters.command("broadcast"))
     async def cmd_broadcast(_, msg: Message):
@@ -875,7 +930,10 @@ def make_bot(cfg: dict) -> Client:
             set_st(msg.from_user.id, "bcast")
             await msg.reply_text(
                 "📢 **Broadcast**\n\n"
-                "Send the message to broadcast, or **reply** to any message with /broadcast to send that."
+                "Send the message you want to broadcast to all users.\n"
+                "You can send text, photo, video, or document.\n\n"
+                "Or **reply** to any existing message with /broadcast to send that.\n\n"
+                "_/cancel to abort_"
             )
 
     @app.on_message(filters.command("set_start_img"))
@@ -917,28 +975,6 @@ def make_bot(cfg: dict) -> Client:
             await msg.reply_text(f"✅ Removed: `{ch}`")
         else: await msg.reply_text("Use: add / remove / clear")
 
-    @app.on_message(filters.command("add_forcesub"))
-    async def cmd_add_fsub(_, msg: Message):
-        if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
-        parts = (msg.text or "").split()
-        if len(parts) < 2:
-            chs = await gset("force_sub_channels", [])
-            await msg.reply_text(f"🔒 Force-Sub Channels:\n{chr(10).join(chs) or 'None'}\n\nUsage: /add_forcesub @ch"); return
-        ch = parts[1]; chs = await gset("force_sub_channels", [])
-        if ch not in chs: chs.append(ch)
-        await sset("force_sub_channels", chs); await msg.reply_text(f"✅ Added force-sub: `{ch}`")
-
-    @app.on_message(filters.command("rem_forcesub"))
-    async def cmd_rem_fsub(_, msg: Message):
-        if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
-        parts = (msg.text or "").split()
-        if len(parts) < 2: await msg.reply_text("Usage: /rem_forcesub @ch"); return
-        ch = parts[1]; chs = await gset("force_sub_channels", [])
-        await sset("force_sub_channels", [c for c in chs if c != ch])
-        await msg.reply_text(f"✅ Removed: `{ch}`")
-
     @app.on_message(filters.command("set_welcome"))
     async def cmd_set_grp_welcome(_, msg: Message):
         if not msg.from_user: return
@@ -965,9 +1001,10 @@ def make_bot(cfg: dict) -> Client:
         t = await resolve_user(msg)
         if not t:
             await msg.reply_text("Usage: `/add_admin [user_id]`\nExample: `/add_admin 838832834`\nOr reply to user."); return
+        fn = getattr(t, "first_name", None) or str(t.id)
         await staff_col.update_one({"_id": t.id},
-            {"$set": {"role": "admin", "name": getattr(t, "first_name", str(t.id))}}, upsert=True)
-        await msg.reply_text(f"✅ `{t.id}` is now **Admin**!")
+            {"$set": {"role": "admin", "name": fn}}, upsert=True)
+        await msg.reply_text(f"✅ **{fn}** was made Admin! (`{t.id}`)")
 
     @app.on_message(filters.command("remove_admin"))
     async def cmd_rem_admin(_, msg: Message):
@@ -977,7 +1014,8 @@ def make_bot(cfg: dict) -> Client:
         if not t:
             await msg.reply_text("Usage: `/remove_admin [user_id]`\nOr reply to user."); return
         r = await staff_col.delete_one({"_id": t.id, "role": "admin"})
-        await msg.reply_text("✅ Removed from admins." if r.deleted_count else f"❌ `{t.id}` is not an admin.")
+        fn = getattr(t, "first_name", None) or str(t.id)
+        await msg.reply_text(f"✅ **{fn}** was removed from admins." if r.deleted_count else f"❌ **{fn}** (`{t.id}`) is not an admin.")
 
     @app.on_message(filters.command("addowner"))
     async def cmd_add_owner(_, msg: Message):
@@ -986,9 +1024,10 @@ def make_bot(cfg: dict) -> Client:
         t = await resolve_user(msg)
         if not t:
             await msg.reply_text("Usage: `/addowner [user_id]`\nExample: `/addowner 838832834`\nOr reply to user."); return
+        fn = getattr(t, "first_name", None) or str(t.id)
         await staff_col.update_one({"_id": t.id},
-            {"$set": {"role": "owner", "name": getattr(t, "first_name", str(t.id))}}, upsert=True)
-        await msg.reply_text(f"✅ `{t.id}` is now **Owner**!")
+            {"$set": {"role": "owner", "name": fn}}, upsert=True)
+        await msg.reply_text(f"✅ **{fn}** was made Owner! (`{t.id}`)")
 
     @app.on_message(filters.command("removeowner"))
     async def cmd_rem_owner(_, msg: Message):
@@ -1000,7 +1039,8 @@ def make_bot(cfg: dict) -> Client:
         if t.id == OWNER_ID:
             await msg.reply_text("❌ Cannot remove the Super Owner!"); return
         r = await staff_col.delete_one({"_id": t.id, "role": "owner"})
-        await msg.reply_text("✅ Removed from owners." if r.deleted_count else f"❌ `{t.id}` is not an owner.")
+        fn = getattr(t, "first_name", None) or str(t.id)
+        await msg.reply_text(f"✅ **{fn}** was removed from owners." if r.deleted_count else f"❌ **{fn}** (`{t.id}`) is not an owner.")
 
     # ═══════════════════════════════════════════════════
     #  /set_name  — owner-only, per-bot display name
@@ -1170,11 +1210,12 @@ def make_bot(cfg: dict) -> Client:
             await msg.reply_text(f"❌ Token check failed: {e}"); return
         sm = await msg.reply_text(f"⏳ Starting @{info['username']}…")
         try:
-            clone = make_bot({
+            clone, clone_reg_cmds = make_bot({
                 "bot_token": token, "session_name": f"clone_{bid}",
                 "db_name": f"Kenshin_{bid}", "original_owner_id": OWNER_ID,
             })
             await clone.start()
+            await clone_reg_cmds()
             CLONES[bid] = clone
             await instances_col.update_one({"bot_id": bid}, {"$set": {
                 "bot_id": bid, "bot_username": info["username"], "bot_token": token,
@@ -1256,19 +1297,6 @@ def make_bot(cfg: dict) -> Client:
         uid = q.from_user.id
 
         if d == "noop": await q.answer(); return
-
-        if d == "check_sub":
-            chs = await gset("force_sub_channels", [])
-            bad = []
-            for ch in chs:
-                try:
-                    m = await app.get_chat_member(ch, uid)
-                    if m.status in (enums.ChatMemberStatus.BANNED, enums.ChatMemberStatus.LEFT): bad.append(ch)
-                except Exception: bad.append(ch)
-            if not bad:
-                await q.message.delete(); await q.answer("✅ Access granted!", show_alert=True)
-            else: await q.answer("❌ Still not joined all channels!", show_alert=True)
-            return
 
         if d == "show_help":
             await q.answer()
@@ -1392,9 +1420,6 @@ def make_bot(cfg: dict) -> Client:
             elif action == "set_channel":
                 chs = await gset("promo_channels",[])
                 await q.message.reply_text(f"📢 **Promo Channels:**\n{chr(10).join(chs) or 'None'}\n\n`/set_channel add @ch` | `remove @ch` | `clear`")
-            elif action == "forcesub":
-                chs = await gset("force_sub_channels",[])
-                await q.message.reply_text(f"🔒 **Force-Sub:**\n{chr(10).join(chs) or 'None'}\n\n`/add_forcesub @ch` | `/rem_forcesub @ch`")
             elif action == "adminlist":
                 owners = []; admins = []
                 async for s in staff_col.find({}):
@@ -1716,6 +1741,8 @@ def make_bot(cfg: dict) -> Client:
         # BROADCAST
         elif step == "bcast":
             clr_st(uid)
+            if not msg.text and not msg.photo and not msg.document and not msg.video and not msg.audio:
+                await msg.reply_text("❌ Please send a valid message to broadcast."); return
             await _do_broadcast(msg, msg)
 
         # SETTINGS STATES
@@ -1757,7 +1784,62 @@ def make_bot(cfg: dict) -> Client:
             await sset("group_goodbye", d["gtxt"]); clr_st(uid)
             await msg.reply_text("✅ Group goodbye updated!")
 
-    return app
+    # ── set BotFather commands ─────────────────────────
+    async def register_commands():
+        """Register bot commands with BotFather so they show in the menu."""
+        from pyrogram.types import BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+        user_cmds = [
+            BotCommand("start",   "👋 Welcome message"),
+            BotCommand("help",    "📋 Full command list"),
+            BotCommand("search",  "🔍 Search anime by name"),
+            BotCommand("popular", "🌟 Browse anime list"),
+            BotCommand("ping",    "🏓 Check bot speed"),
+            BotCommand("id",      "🆔 Your Telegram ID"),
+            BotCommand("report",  "🚨 Report to admins"),
+        ]
+        admin_cmds = user_cmds + [
+            BotCommand("panel",        "🎛️ Admin control panel"),
+            BotCommand("add_ani",      "➕ Add new anime"),
+            BotCommand("edit_ani",     "✏️ Edit anime"),
+            BotCommand("delete_ani",   "🗑️ Delete anime"),
+            BotCommand("add_alias",    "🔤 Add search alias"),
+            BotCommand("list",         "📋 List all animes"),
+            BotCommand("stats",        "📊 Bot statistics"),
+            BotCommand("db_export",    "📤 Export database"),
+            BotCommand("bulk",         "📦 Bulk import"),
+            BotCommand("broadcast",    "📢 Broadcast to all users"),
+            BotCommand("set_start_img","🖼️ Set start banner"),
+            BotCommand("set_start_msg","✏️ Set welcome text"),
+            BotCommand("set_welcome",  "👋 Set group welcome"),
+            BotCommand("set_goodbye",  "👋 Set group goodbye"),
+            BotCommand("set_channel",  "📢 Set promo channels"),
+            BotCommand("adminlist",    "👥 List all staff"),
+            BotCommand("ban",          "🚫 Ban a user"),
+            BotCommand("unban",        "✅ Unban a user"),
+            BotCommand("userinfo",     "👤 User info"),
+            BotCommand("cancel",       "❌ Cancel operation"),
+            BotCommand("infinite",     "🔗 Infinite link system"),
+            BotCommand("add_admin",    "🛡️ Add admin (owner only)"),
+            BotCommand("remove_admin", "❌ Remove admin (owner only)"),
+            BotCommand("addowner",     "👑 Add owner (super only)"),
+            BotCommand("removeowner",  "❌ Remove owner (super only)"),
+            BotCommand("set_name",     "🏷️ Set bot display name"),
+            BotCommand("copy",         "⚡ Start clone bot (super only)"),
+            BotCommand("delcopy",      "🗑️ Stop clone bot (super only)"),
+            BotCommand("clones",       "🤖 List clone bots (super only)"),
+        ]
+        try:
+            # Default scope — shows user commands to everyone
+            await app.set_bot_commands(user_cmds, scope=BotCommandScopeDefault())
+            # Private chats — same user commands
+            await app.set_bot_commands(user_cmds, scope=BotCommandScopeAllPrivateChats())
+            # Group chats — user commands
+            await app.set_bot_commands(user_cmds, scope=BotCommandScopeAllGroupChats())
+            logger.info("✅ Bot commands registered with BotFather")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not set bot commands: {e}")
+
+    return app, register_commands
 
 
 # ═══════════════════════════════════════════════════════
@@ -1773,25 +1855,29 @@ async def main():
     logger.info("✅ Indexes ready")
 
     # Start primary bot
-    primary = make_bot(PRIMARY)
+    primary, reg_cmds = make_bot(PRIMARY)
     await primary.start()
     me = await primary.get_me()
     logger.info(f"✅ Primary: @{me.username}")
+
+    # Register commands in BotFather
+    await reg_cmds()
 
     # Restore clones from DB (safe because in_memory=True)
     async for inst in instances_col.find({}):
         bid = inst["bot_id"]
         if bid in CLONES: continue
         try:
-            c = make_bot({
+            clone, clone_reg_cmds = make_bot({
                 "bot_token":         inst["bot_token"],
                 "session_name":      inst.get("session_name", f"clone_{bid}"),
                 "db_name":           inst.get("db_name", f"Kenshin_{bid}"),
                 "original_owner_id": inst.get("original_owner_id", PRIMARY["original_owner_id"]),
             })
-            await c.start()
-            CLONES[bid] = c
-            cm = await c.get_me()
+            await clone.start()
+            CLONES[bid] = clone
+            await clone_reg_cmds()
+            cm = await clone.get_me()
             logger.info(f"✅ Clone restored: @{cm.username}")
         except Exception as e:
             logger.error(f"❌ Clone restore failed ({bid}): {e}")
