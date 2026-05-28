@@ -119,13 +119,16 @@ def make_bot(cfg: dict) -> tuple:
         return None
 
     async def reg(user):
-        await users_col.update_one(
-            {"_id": user.id},
-            {"$set": {
-                "username":   getattr(user, "username", None),
-                "first_name": getattr(user, "first_name", str(user.id)),
-                "last_seen":  datetime.utcnow(),
-            }}, upsert=True)
+        try:
+            await users_col.update_one(
+                {"_id": user.id},
+                {"$set": {
+                    "username":   getattr(user, "username", None),
+                    "first_name": getattr(user, "first_name", str(user.id)),
+                    "last_seen":  datetime.utcnow(),
+                }}, upsert=True)
+        except Exception as e:
+            logger.warning(f"reg() error for {user.id}: {e}")
 
     # ── placeholder formatter ──────────────────────────
     def fmt(tmpl, user, chat=""):
@@ -1846,11 +1849,21 @@ def make_bot(cfg: dict) -> tuple:
 #  MAIN
 # ═══════════════════════════════════════════════════════
 async def main():
-    # Create indexes
+    # Create indexes — also drop any stale conflicting indexes from old schema
     db = get_db(PRIMARY["db_name"])
+    # Drop the old sparse user_id index that conflicts with our _id-based schema
+    try:
+        await db["users"].drop_index("user_id_1")
+        logger.info("🧹 Dropped stale user_id_1 index")
+    except Exception:
+        pass  # index didn't exist — that's fine
+    # Also drop any other null-keyed indexes on users to be safe
+    try:
+        await db["users"].drop_index("username_1")
+    except Exception:
+        pass
     await db["animes"].create_index("name_lower")
     await db["animes"].create_index("aliases_lower")
-    await db["users"].create_index("_id")
     await db["infinite_links"].create_index([("owner_uid", 1), ("channel_id", 1)])
     logger.info("✅ Indexes ready")
 
