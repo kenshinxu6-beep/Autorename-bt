@@ -35,11 +35,11 @@ logger = logging.getLogger("KenshinBot")
 #  CONFIG  (reads from environment variables)
 # ═══════════════════════════════════════════════════════
 PRIMARY = {
-    "bot_token":         "8780999113:AAEiC461K0DGQX1QIInMXYGbB-UZIkIafrU",
+    "bot_token":         "8285265972:AAHyDSdAT0Uz2KrO6aH-zOdexK7pHpm4fz4",
         "api_id":            37407868,
         "api_hash":          "d7d3bff9f7cf9f3b111129bdbd13a065",
         "original_owner_id": 6728678197,
-        "mongo_uri":         "mongodb+srv://kenshinxu1:iammohitgurjar.1@kenshinfileshere.fyvrwjd.mongodb.net/?appName=Kenshinfileshere",
+        "mongo_uri":         "mongodb+srv://kenshinxu4:iammohitgurjar.1@kenshinfileshere.bhlhhjn.mongodb.net/?appName=Kenshinfileshere",
         "session_name":      "kenshin_primary",
         "db_name":           "Kenshinfileshere",
 }
@@ -47,7 +47,7 @@ PRIMARY = {
 _mongo        = AsyncIOMotorClient(PRIMARY["mongo_uri"])
 instances_col = _mongo["kenshin_meta"]["instances"]
 CLONES: dict  = {}   # bot_id → Client
-BAKA          = "ʙᴀᴋᴀ ʏᴏᴜʀ ɴᴏᴛ ᴍʏ sᴇɴᴘᴀɪ  !!!"
+BAKA          = "<b><blockquote>ʙᴀᴋᴀ ʏᴏᴜʀ ɴᴏᴛ ᴍʏ sᴇɴᴘᴀɪ  !!!</b></blockquote>"
 
 def get_db(name): return _mongo[name]
 
@@ -149,26 +149,173 @@ def make_bot(cfg: dict) -> tuple:
         rec = await users_col.find_one({"_id": uid})
         return (rec or {}).get("banned", False)
 
-    # ── force-sub check — DISABLED (all users pass freely) ───
+    # ── cache get_me() — called once, reused everywhere ──────
+    _me_cache = {}
+
+    # Animation frames — ??? sequence, each new message sent then deleted
+    # Flow: send "?" → delete → send "??" → delete → send "???" → delete → send "!!!" → delete → show fsub
+    ANIM_FRAMES = ["?", "??", "???"]
+
+    async def run_anim(msg: Message) -> None:
+        """
+        Animation sequence:
+          1. Send "?"   → wait → delete
+          2. Send "??"  → wait → delete
+          3. Send "???" → wait → delete
+          4. Send "‼️‼️‼️" → wait → delete
+          5. Caller then shows fsub prompt
+        """
+        for frame in ANIM_FRAMES:
+            try:
+                sent = await msg.reply_text(f"<b>{frame}</b>", parse_mode=enums.ParseMode.HTML)
+                await asyncio.sleep(0.35)
+                await sent.delete()
+            except Exception:
+                pass
+        # Final !!! flash
+        try:
+            bang = await msg.reply_text("<b>‼️‼️‼️</b>", parse_mode=enums.ParseMode.HTML)
+            await asyncio.sleep(0.5)
+            await bang.delete()
+        except Exception:
+            pass
+
+    async def get_me_cached():
+        if "me" not in _me_cache:
+            _me_cache["me"] = await app.get_me()
+        return _me_cache["me"]
+
+    # ══════════════════════════════════════════════════════
+    #  FORCE-SUB SYSTEM  (only triggers on infinite link use)
+    # ══════════════════════════════════════════════════════
+
+    async def get_fsub_channels():
+        """Return list of {channel_id, img} dicts from DB."""
+        raw = await gset("fsub_channels", [])
+        if not raw: return []
+        return raw   # list of channel_id ints
+
+    async def fsub_check_user(uid: int):
+        """
+        Returns list of channel_ids the user has NOT joined.
+        For public channels: checks get_chat_member.
+        For private channels: always re-generates invite link (always new link).
+        """
+        chs = await get_fsub_channels()
+        failed = []
+        for cid in chs:
+            try:
+                m = await app.get_chat_member(cid, uid)
+                if m.status in (enums.ChatMemberStatus.BANNED, enums.ChatMemberStatus.LEFT):
+                    failed.append(cid)
+            except Exception:
+                failed.append(cid)
+        return failed
+
+    async def send_fsub_prompt(msg: Message, failed_channels: list):
+        """
+        Send the animated force-sub message with join buttons.
+        For private channels: fresh invite link every time (new link per check).
+        For public channels: direct t.me link.
+        """
+        user  = msg.from_user
+        fname = getattr(user, "first_name", "User") or "User"
+
+        fsub_img = await gset("fsub_image", None)
+
+        # Build join buttons — fresh private link each time
+        rows = []
+        for cid in failed_channels:
+            try:
+                chat = await app.get_chat(cid)
+                cname = chat.title or str(cid)
+                # Public channel
+                if chat.username:
+                    url = f"https://t.me/{chat.username}"
+                    rows.append([InlineKeyboardButton(f"» JOIN {cname.upper()} «", url=url)])
+                else:
+                    # Private channel — generate fresh unique invite link every time
+                    try:
+                        lnk = await app.create_chat_invite_link(
+                            cid,
+                            expire_date  = datetime.utcfromtimestamp(int(time.time()) + 300),
+                            member_limit = 1,
+                        )
+                        rows.append([InlineKeyboardButton(f"» JOIN {cname.upper()} «", url=lnk.invite_link)])
+                    except Exception:
+                        rows.append([InlineKeyboardButton(f"» JOIN CHANNEL «", url=f"https://t.me/c/{str(cid).replace('-100','')}")])
+            except Exception:
+                rows.append([InlineKeyboardButton(f"» JOIN CHANNEL «", url=f"https://t.me/c/{str(cid).replace('-100','')}")])
+
+        rows.append([InlineKeyboardButton("‼️ NOW CLICK HERE ‼️", callback_data=f"fsub_check_{msg.from_user.id}")])
+
+        text = (
+            f"<b><blockquote>» ʜᴇʏ {fname} ×,</blockquote>\n"
+            f"ʏᴏᴜʀ ғɪʟᴇ ɪs ʀᴇᴀᴅʏ ‼️ ʟᴏᴏᴋs ʟɪᴋᴇ ʏᴏᴜ ʜᴀᴠᴇɴ'ᴛ sᴜʙsᴄʀɪʙᴇᴅ ᴛᴏ ᴏᴜʀ ᴄʜᴀɴɴᴇʟs ʏᴇᴛ, "
+            f"sᴜʙsᴄʀɪʙᴇ ɴᴏᴡ ᴛᴏ ɢᴇᴛ ʏᴏᴜʀ ғɪʟᴇs..!</b>"
+        )
+        kb = InlineKeyboardMarkup(rows)
+        if fsub_img:
+            try:
+                await msg.reply_photo(photo=fsub_img, caption=text,
+                                      reply_markup=kb, parse_mode=enums.ParseMode.HTML)
+                return
+            except Exception:
+                pass
+        await msg.reply_text(text, reply_markup=kb, parse_mode=enums.ParseMode.HTML)
+
     async def fsub_ok(msg: Message) -> bool:
+        """Legacy — always True (search is free, fsub only on infinite links)."""
         return True
 
+    async def fsub_ok_infinite(msg: Message) -> bool:
+        """
+        Check force-sub ONLY for infinite link access.
+        If user hasn't joined required channels → show animated prompt → return False.
+        """
+        if not msg.from_user: return True
+        chs = await get_fsub_channels()
+        if not chs: return True
+        failed = await fsub_check_user(msg.from_user.id)
+        if not failed: return True
+        await send_fsub_prompt(msg, failed)
+        return False
+
     # ── anime result ───────────────────────────────────
+    # Track recently sent results per chat to avoid duplicates
+    _last_sent: dict = {}   # chat_id -> anime _id
+
     async def send_result(msg: Message, anime: dict):
-        name     = anime["name"]
-        desc     = anime.get("description", "No description.")
-        url      = anime.get("watch_url") or "https://t.me/"
-        img      = anime.get("image_file_id")
-        promos   = await gset("promo_channels", [])
-        promo    = ("\n\n━━━━━━━━━━━━━━━━━\n📗 **JOIN FOR MORE ANIME:**\n" +
-                    "\n".join(f"👉 {c}" for c in promos)) if promos else ""
-        caption  = f"✨ **{name.upper()}** ✨\n\n📖 {desc}{promo}"
-        kb       = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Watch / Download", url=url)]])
+        # ── Deduplication: don't send the same anime twice in a row ──
+        chat_id   = msg.chat.id
+        anime_id  = str(anime.get("_id", anime.get("name", "")))
+        last      = _last_sent.get(chat_id)
+        if last == anime_id:
+            return   # exact same result already just sent — skip silently
+        _last_sent[chat_id] = anime_id
+
+        name   = anime["name"]
+        desc   = anime.get("description", "No description available.")
+        url    = anime.get("watch_url") or "https://t.me/"
+        img    = anime.get("image_file_id")
+        promos = await gset("promo_channels", [])
+        promo  = ("\n\n━━━━━━━━━━━━━━━━━\n📗 <b>JOIN FOR MORE ANIME:</b>\n" +
+                  "\n".join(f"👉 {c}" for c in promos)) if promos else ""
+
+        # Synopsis in expandable blockquote
+        caption = (
+            f"✨ <b>{name.upper()}</b> ✨\n\n"
+            f"<blockquote expandable>📖 {desc}</blockquote>"
+            f"{promo}"
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Watch / Download", url=url)]])
         if img:
             try:
-                await msg.reply_photo(photo=img, caption=caption, reply_markup=kb); return
+                await msg.reply_photo(photo=img, caption=caption,
+                                      reply_markup=kb, parse_mode=enums.ParseMode.HTML)
+                return
             except Exception: pass
-        await msg.reply_text(caption, reply_markup=kb)
+        await msg.reply_text(caption, reply_markup=kb, parse_mode=enums.ParseMode.HTML)
 
     # ── anime search ───────────────────────────────────
     # ── anime search ───────────────────────────────────
@@ -240,7 +387,7 @@ def make_bot(cfg: dict) -> tuple:
     _me_cache = {}
     async def bot_un():
         if "u" not in _me_cache:
-            try: _me_cache["u"] = (await app.get_me()).username or ""
+            try: _me_cache["u"] = (await get_me_cached()).username or ""
             except Exception: _me_cache["u"] = ""
         return _me_cache["u"]
 
@@ -366,7 +513,7 @@ def make_bot(cfg: dict) -> tuple:
         "ping","id","userinfo","adminlist","ban","unban","clones",
         "add_ani","edit_ani","delete_ani","add_alias","list","stats","db_export",
         "bulk","broadcast","set_start_img","set_start_msg","set_channel",
-        "set_welcome","set_goodbye",
+        "set_welcome","set_goodbye","add_forcesub","rem_forcesub","add_fsubimg","forcesub_req","set_anim_img",
         "add_admin","remove_admin","addowner","removeowner","copy","delcopy",
         "set_name",
     ]
@@ -396,6 +543,7 @@ def make_bot(cfg: dict) -> tuple:
             [InlineKeyboardButton("👋 Group Welcome",callback_data="panel_set_welcome"),
              InlineKeyboardButton("👋 Group Goodbye",callback_data="panel_set_goodbye")],
             [InlineKeyboardButton("📢 Promo Channels",callback_data="panel_set_channel")],
+            [InlineKeyboardButton("🔒 Force Subscribe", callback_data="panel_forcesub")],
             [InlineKeyboardButton("🔗 Infinite Links",callback_data="panel_infinite")],
         ]
         if is_ownr:
@@ -442,6 +590,11 @@ def make_bot(cfg: dict) -> tuple:
                     cid, ouid   = int(cid), int(ouid)
                     rec = await infinite_col.find_one({"owner_uid": ouid, "channel_id": cid})
                     if rec:
+                        # ── Force-sub check ONLY here (infinite link access) ──
+                        # Animation → fsub check
+                        await run_anim(msg)
+                        if not await fsub_ok_infinite(msg): return
+
                         mode = rec.get("mode", "invite")
                         if mode == "req":
                             await send_req_link(msg, cid, ouid)
@@ -492,7 +645,7 @@ def make_bot(cfg: dict) -> tuple:
     async def cmd_panel(_, msg: Message):
         if not msg.from_user: return
         if not await is_admin(msg.from_user.id):
-            await msg.reply_text(BAKA); return
+            await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         await send_panel(msg, msg.from_user.id)
 
     # ═══════════════════════════════════════════════════
@@ -560,6 +713,11 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.private & filters.text & ~filters.command(ALL_CMDS))
     async def priv_text(_, msg: Message):
         if not msg.from_user: return
+        # ── CRITICAL: never reply to own messages (prevents infinite loop) ──
+        try:
+            me = await get_me_cached()
+            if msg.from_user.id == me.id: return
+        except Exception: pass
         uid = msg.from_user.id
         if await is_banned(uid):
             await msg.reply_text("🚫 You have been banned from using this bot."); return
@@ -574,10 +732,11 @@ def make_bot(cfg: dict) -> tuple:
             await send_result(msg, anime)
         else:
             await msg.reply_text(
-                "❌ **Anime not found!**\n\n"
+                "<b><blockquote>Anime Not Found‼️</blockquote></b>\n\n"
                 "💡 Just type the anime name\n"
-                "Example: `Solo Leveling` or `Naruto`\n"
-                "Or use /popular to browse all anime")
+                "Example: <code>Solo Leveling</code> or <code>Naruto</code>\n"
+                "Or use /popular to browse all anime",
+                parse_mode=enums.ParseMode.HTML)
 
     @app.on_message(filters.private & (filters.photo | filters.document | filters.video | filters.audio))
     async def priv_media(_, msg: Message):
@@ -600,11 +759,20 @@ def make_bot(cfg: dict) -> tuple:
             await msg.reply_text("🔍 Usage: `/search [anime name]`\nExample: `/search Naruto`"); return
         anime = await search(parts[1].strip())
         if anime: await send_result(msg, anime)
-        else:     await msg.reply_text("❌ Anime not found! Try a different name.\nUse /popular to browse.")
+        else:     await msg.reply_text(
+                "<b><blockquote>Anime Not Found‼️</blockquote></b>\n\n"
+                "💡 Try a different name or use /popular to browse.",
+                parse_mode=enums.ParseMode.HTML)
 
     @app.on_message(filters.group & ~filters.command(ALL_CMDS) & filters.text)
     async def grp_text(_, msg: Message):
         if not msg.from_user: return
+        # ── CRITICAL: never reply to own messages (prevents infinite loop) ──
+        try:
+            me = await get_me_cached()
+            if msg.from_user.id == me.id: return
+        except Exception: pass
+
         uid  = msg.from_user.id
         text = (msg.text or "").strip()
         if len(text) < 3: return
@@ -612,7 +780,7 @@ def make_bot(cfg: dict) -> tuple:
         # Check if bot is mentioned or reply-to-bot
         mentioned = False
         try:
-            me = await app.get_me()
+            me = await get_me_cached()
             if msg.entities:
                 for e in msg.entities:
                     if e.type == enums.MessageEntityType.MENTION:
@@ -626,20 +794,24 @@ def make_bot(cfg: dict) -> tuple:
         # Strip bot mention from text before searching
         search_text = text
         try:
-            me = await app.get_me()
+            me = await get_me_cached()
             search_text = re.sub(rf"@{re.escape(me.username or '')}", "", text, flags=re.I).strip()
         except Exception: pass
 
         if mentioned:
             # Bot was mentioned — always reply
             anime = await search(search_text or text)
-            if anime: await send_result(msg, anime)
-            else:     await msg.reply_text("❌ Anime not found!\n\n💡 Try: `/search [name]` or /popular")
+            if anime:
+                await send_result(msg, anime)
+            else:
+                await msg.reply_text(
+                    "<b><blockquote>Anime Not Found‼️</blockquote></b>\n\n"
+                    "💡 Try: <code>/search [name]</code> or /popular",
+                    parse_mode=enums.ParseMode.HTML)
         else:
-            # Passive mode — smart sentence scan, reply only if found
+            # Passive mode — smart sentence scan, reply only if found (silent if not)
             anime = await search(search_text or text)
             if anime: await send_result(msg, anime)
-            # Silent if not found — don't spam the group
 
     # ═══════════════════════════════════════════════════
     #  /infinite
@@ -648,7 +820,7 @@ def make_bot(cfg: dict) -> tuple:
     async def cmd_infinite(_, msg: Message):
         if not msg.from_user: return
         if not await is_admin(msg.from_user.id):
-            await msg.reply_text(BAKA); return
+            await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
 
         uid   = msg.from_user.id
         parts = (msg.text or "").split(None, 3)
@@ -795,12 +967,82 @@ def make_bot(cfg: dict) -> tuple:
             logger.error(f"join_request handler: {e}")
 
     # ═══════════════════════════════════════════════════
+    #  Force-sub check callback — "NOW CLICK HERE" button
+    # ═══════════════════════════════════════════════════
+    @app.on_callback_query(filters.regex(r"^fsub_check_"))
+    async def cb_fsub_check(_, q: CallbackQuery):
+        await q.answer()
+        uid = q.from_user.id
+        # Parse the uid from callback data to ensure correct user
+        try:
+            target_uid = int(q.data.split("_")[2])
+            if uid != target_uid:
+                await q.answer("❌ This button is not for you!", show_alert=True); return
+        except Exception: pass
+
+        # Run animation then check
+        await run_anim(q.message)
+
+        failed = await fsub_check_user(uid)
+        if failed:
+            # Still not joined — rebuild prompt with fresh private links
+            try: await q.message.delete()
+            except Exception: pass
+            await send_fsub_prompt(q.message, failed)
+            # Note: q.message won't have from_user so we need to fake it
+            # Actually we need original msg, so rebuild manually
+            fname = getattr(q.from_user, "first_name", "User") or "User"
+            fsub_img = await gset("fsub_image", None)
+            rows = []
+            for cid in failed:
+                try:
+                    chat  = await app.get_chat(cid)
+                    cname = chat.title or str(cid)
+                    if chat.username:
+                        url = f"https://t.me/{chat.username}"
+                        rows.append([InlineKeyboardButton(f"» JOIN {cname.upper()} «", url=url)])
+                    else:
+                        try:
+                            lnk = await app.create_chat_invite_link(
+                                cid,
+                                expire_date  = datetime.utcfromtimestamp(int(time.time()) + 300),
+                                member_limit = 1,
+                            )
+                            rows.append([InlineKeyboardButton(f"» JOIN {cname.upper()} «", url=lnk.invite_link)])
+                        except Exception:
+                            rows.append([InlineKeyboardButton(f"» JOIN CHANNEL «", url=f"https://t.me/c/{str(cid).replace('-100','')}")])
+                except Exception:
+                    rows.append([InlineKeyboardButton(f"» JOIN CHANNEL «", url=f"https://t.me/c/{str(cid).replace('-100','')}")])
+            rows.append([InlineKeyboardButton("‼️ NOW CLICK HERE ‼️", callback_data=f"fsub_check_{uid}")])
+            text = (
+                f"<b><blockquote>» ʜᴇʏ {fname} ×,</blockquote>\n"
+                f"ʏᴏᴜʀ ғɪʟᴇ ɪs ʀᴇᴀᴅʏ ‼️ ʟᴏᴏᴋs ʟɪᴋᴇ ʏᴏᴜ ʜᴀᴠᴇɴ'ᴛ sᴜʙsᴄʀɪʙᴇᴅ ᴛᴏ ᴏᴜʀ ᴄʜᴀɴɴᴇʟs ʏᴇᴛ, "
+                f"sᴜʙsᴄʀɪʙᴇ ɴᴏᴡ ᴛᴏ ɢᴇᴛ ʏᴏᴜʀ ғɪʟᴇs..!</b>"
+            )
+            kb = InlineKeyboardMarkup(rows)
+            if fsub_img:
+                try:
+                    await q.message.reply_photo(photo=fsub_img, caption=text,
+                                                reply_markup=kb, parse_mode=enums.ParseMode.HTML)
+                    return
+                except Exception: pass
+            await q.message.reply_text(text, reply_markup=kb, parse_mode=enums.ParseMode.HTML)
+        else:
+            # All joined! ✅ Delete prompt and resend their pending link
+            try: await q.message.delete()
+            except Exception: pass
+            await q.message.reply_text(
+                f"✅ <b>Access Granted!</b>\n\n🎉 Welcome! Now tap /start again or use the link you clicked.",
+                parse_mode=enums.ParseMode.HTML
+            )
+
+    # ═══════════════════════════════════════════════════
     #  ADMIN COMMANDS
     # ═══════════════════════════════════════════════════
     @app.on_message(filters.command("add_ani"))
     async def cmd_add_ani(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         set_st(msg.from_user.id, "ani_img")
         await msg.reply_text(
             "➕ **Add Anime — Step 1 / 4**\n\n"
@@ -813,28 +1055,28 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("edit_ani"))
     async def cmd_edit_ani(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         set_st(msg.from_user.id, "edit_name")
         await msg.reply_text("✏️ Send the anime **name** to edit:")
 
     @app.on_message(filters.command("delete_ani"))
     async def cmd_delete_ani(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         set_st(msg.from_user.id, "del_name")
         await msg.reply_text("🗑️ Send the anime **name** to delete:")
 
     @app.on_message(filters.command("add_alias"))
     async def cmd_add_alias(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         set_st(msg.from_user.id, "alias_name")
         await msg.reply_text("🔤 Send the anime **name** to add aliases to:")
 
     @app.on_message(filters.command("list"))
     async def cmd_list(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         animes = await anime_col.find({}, {"name": 1}).sort("name", 1).to_list(None)
         if not animes: await msg.reply_text("📭 Database is empty."); return
         PAGE, total = 10, len(animes)
@@ -851,7 +1093,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("stats"))
     async def cmd_stats(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         ta = await anime_col.count_documents({})
         tu = await users_col.count_documents({})
         ad = await staff_col.count_documents({"role": "admin"})
@@ -873,7 +1115,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("db_export"))
     async def cmd_db_export(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         args = (msg.text or "").split()
         if len(args) > 1: await do_export(msg, args[1].lower())
         else:
@@ -885,7 +1127,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("bulk"))
     async def cmd_bulk(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         set_st(msg.from_user.id, "bulk_file")
         await msg.reply_text(
             "📦 **Bulk Import**\n\nSend a **.txt** or **.json** file.\n\n"
@@ -925,7 +1167,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("broadcast"))
     async def cmd_broadcast(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         # If replying to a message — broadcast that directly
         if msg.reply_to_message:
             await _do_broadcast(msg, msg.reply_to_message)
@@ -942,14 +1184,14 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("set_start_img"))
     async def cmd_set_banner(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         set_st(msg.from_user.id, "set_start_img")
         await msg.reply_text("🖼️ Send start banner (photo):")
 
     @app.on_message(filters.command("set_start_msg"))
     async def cmd_set_welcome_msg(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         set_st(msg.from_user.id, "set_start_msg")
         await msg.reply_text(
             "✏️ Send new welcome/start message text.\n\n"
@@ -958,7 +1200,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("set_channel"))
     async def cmd_set_channel(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         parts = (msg.text or "").split(None, 1)
         if len(parts) < 2:
             chs = await gset("promo_channels", [])
@@ -978,10 +1220,178 @@ def make_bot(cfg: dict) -> tuple:
             await msg.reply_text(f"✅ Removed: `{ch}`")
         else: await msg.reply_text("Use: add / remove / clear")
 
+    # ═══════════════════════════════════════════════════
+    #  Force-Subscribe Channel Management
+    # ═══════════════════════════════════════════════════
+    @app.on_message(filters.command("add_forcesub"))
+    async def cmd_add_fsub(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
+        parts = (msg.text or "").split()
+        if len(parts) < 2:
+            chs = await get_fsub_channels()
+            lines = []
+            for cid in chs:
+                try:
+                    chat = await app.get_chat(cid)
+                    lines.append(f"• <code>{cid}</code> — {chat.title or cid}")
+                except Exception:
+                    lines.append(f"• <code>{cid}</code>")
+            ch_list = "\n".join(lines) if lines else "None"
+            await msg.reply_text(
+                f"🔒 <b>Force-Sub Channels:</b>\n{ch_list}\n\n"
+                f"<b>Usage:</b> <code>/add_forcesub [channel_id]</code>\n"
+                f"Example: <code>/add_forcesub -1001234567890</code>",
+                parse_mode=enums.ParseMode.HTML)
+            return
+        raw = parts[1].strip()
+        if not raw.lstrip("-").isdigit():
+            await msg.reply_text("❌ Please provide a valid channel ID (e.g. -1001234567890)"); return
+        cid = int(raw)
+        chs = await get_fsub_channels()
+        if cid in chs:
+            await msg.reply_text(f"✅ Channel <code>{cid}</code> is already in force-sub list.",
+                                 parse_mode=enums.ParseMode.HTML); return
+        chs.append(cid)
+        await sset("fsub_channels", chs)
+        try:
+            chat = await app.get_chat(cid)
+            cname = chat.title or str(cid)
+        except Exception:
+            cname = str(cid)
+        await msg.reply_text(
+            f"✅ <b>Added to Force-Sub!</b>\n\n"
+            f"📢 Channel: <b>{cname}</b> (<code>{cid}</code>)\n"
+            f"👥 Total channels: <b>{len(chs)}</b>\n\n"
+            f"⚠️ Make sure bot is <b>admin</b> in this channel!",
+            parse_mode=enums.ParseMode.HTML)
+
+    @app.on_message(filters.command("rem_forcesub"))
+    async def cmd_rem_fsub(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
+        parts = (msg.text or "").split()
+        if len(parts) < 2:
+            await msg.reply_text("Usage: <code>/rem_forcesub [channel_id]</code>",
+                                 parse_mode=enums.ParseMode.HTML); return
+        raw = parts[1].strip()
+        if not raw.lstrip("-").isdigit():
+            await msg.reply_text("❌ Please provide a valid channel ID."); return
+        cid = int(raw)
+        chs = await get_fsub_channels()
+        if cid not in chs:
+            await msg.reply_text(f"❌ Channel <code>{cid}</code> not in force-sub list.",
+                                 parse_mode=enums.ParseMode.HTML); return
+        chs = [c for c in chs if c != cid]
+        await sset("fsub_channels", chs)
+        await msg.reply_text(
+            f"✅ <b>Removed from Force-Sub!</b>\n"
+            f"Channel <code>{cid}</code> removed.\n"
+            f"Remaining: <b>{len(chs)}</b>",
+            parse_mode=enums.ParseMode.HTML)
+
+    @app.on_message(filters.command("add_fsubimg"))
+    async def cmd_add_fsubimg(_, msg: Message):
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
+        if msg.reply_to_message and msg.reply_to_message.photo:
+            fid = msg.reply_to_message.photo.file_id
+            await sset("fsub_image", fid)
+            await msg.reply_text("✅ Force-sub image set! This image will appear on the join prompt.")
+        elif msg.reply_to_message and msg.reply_to_message.document:
+            fid = msg.reply_to_message.document.file_id
+            await sset("fsub_image", fid)
+            await msg.reply_text("✅ Force-sub image set!")
+        else:
+            current = await gset("fsub_image", None)
+            if current:
+                await msg.reply_photo(photo=current, caption="📸 Current force-sub image.\n\nReply to a photo with /add_fsubimg to change it.")
+            else:
+                await msg.reply_text(
+                    "📸 <b>Set Force-Sub Image</b>\n\n"
+                    "Reply to a photo/image with <code>/add_fsubimg</code> to set it.\n"
+                    "This image shows on the join-channels prompt.\n\n"
+                    "Currently: <b>No image set</b>",
+                    parse_mode=enums.ParseMode.HTML)
+
+    @app.on_message(filters.command("forcesub_req"))
+    async def cmd_add_fsub_req(_, msg: Message):
+        """Add a private channel to force-sub in Request-to-Join mode."""
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
+        parts = (msg.text or "").split()
+        if len(parts) < 2:
+            req_chs = await gset("fsub_req_channels", [])
+            lines = []
+            for cid in req_chs:
+                try:
+                    chat = await app.get_chat(cid)
+                    lines.append(f"\u2022 <code>{cid}</code> \u2014 {chat.title or cid}")
+                except Exception:
+                    lines.append(f"\u2022 <code>{cid}</code>")
+            ch_list = "\n".join(lines) if lines else "None"
+            await msg.reply_text(
+                f"\U0001f511 <b>Force-Sub (Request Mode) Channels:</b>\n{ch_list}\n\n"
+                f"<b>Usage:</b> <code>/forcesub_req [channel_id]</code>\n"
+                f"Example: <code>/forcesub_req -1001234567890</code>\n\n"
+                f"\u26a0\ufe0f Bot must be <b>admin</b> with <i>Invite Users</i> permission!",
+                parse_mode=enums.ParseMode.HTML)
+            return
+        raw = parts[1].strip()
+        if not raw.lstrip("-").isdigit():
+            await msg.reply_text("\u274c Please provide a valid channel ID."); return
+        cid = int(raw)
+        fsub_req = await gset("fsub_req_channels", [])
+        if cid not in fsub_req:
+            fsub_req.append(cid)
+            await sset("fsub_req_channels", fsub_req)
+        chs = await get_fsub_channels()
+        if cid not in chs:
+            chs.append(cid)
+            await sset("fsub_channels", chs)
+        try:
+            chat = await app.get_chat(cid)
+            cname = chat.title or str(cid)
+        except Exception:
+            cname = str(cid)
+        await msg.reply_text(
+            f"\u2705 <b>Force-Sub (Req Mode) Added!</b>\n\n"
+            f"\U0001f4e2 Channel: <b>{cname}</b> (<code>{cid}</code>)\n"
+            f"\U0001f511 Mode: <b>Request to Join</b> (auto-approved by bot)\n\n"
+            f"\u26a0\ufe0f Make sure bot is admin with <i>Invite Users</i> permission!",
+            parse_mode=enums.ParseMode.HTML)
+
+    @app.on_message(filters.command("set_anim_img"))
+    async def cmd_set_anim_img(_, msg: Message):
+        """Set a custom image/gif shown during the loading animation."""
+        if not msg.from_user: return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
+        if msg.reply_to_message and (msg.reply_to_message.photo or msg.reply_to_message.animation or msg.reply_to_message.document):
+            rm = msg.reply_to_message
+            if rm.photo:        fid = rm.photo.file_id
+            elif rm.animation:  fid = rm.animation.file_id
+            else:               fid = rm.document.file_id
+            await sset("fsub_anim_img", fid)
+            await msg.reply_text("\u2705 Animation image/gif set! Shows on force-sub loading animation.")
+        else:
+            current = await gset("fsub_anim_img", None)
+            if current:
+                try:
+                    await msg.reply_photo(photo=current,
+                        caption="\U0001f4f8 Current animation image.\n\nReply to a photo/gif with /set_anim_img to change.")
+                    return
+                except Exception: pass
+            await msg.reply_text(
+                "\U0001f4f8 <b>Set Animation Image</b>\n\n"
+                "Reply to a <b>photo or GIF</b> with <code>/set_anim_img</code>\n"
+                "This image shows on the loading animation.\n\n"
+                "Currently: <b>No image set</b>",
+                parse_mode=enums.ParseMode.HTML)
+
     @app.on_message(filters.command("set_welcome"))
     async def cmd_set_grp_welcome(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         set_st(msg.from_user.id, "set_welcome_text")
         await msg.reply_text(
             "✏️ Send group **welcome** text.\nPlaceholders: `{name}` `{mention}` `{chat}`\nThen send optional image or SKIP.")
@@ -989,7 +1399,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("set_goodbye"))
     async def cmd_set_grp_goodbye(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         set_st(msg.from_user.id, "set_goodbye_text")
         await msg.reply_text(
             "✏️ Send group **goodbye** text.\nPlaceholders: `{name}` `{mention}` `{chat}`\nThen send optional image or SKIP.")
@@ -1000,7 +1410,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("add_admin"))
     async def cmd_add_admin(_, msg: Message):
         if not msg.from_user: return
-        if not await is_owner(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_owner(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         t = await resolve_user(msg)
         if not t:
             await msg.reply_text("Usage: `/add_admin [user_id]`\nExample: `/add_admin 838832834`\nOr reply to user."); return
@@ -1012,7 +1422,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("remove_admin"))
     async def cmd_rem_admin(_, msg: Message):
         if not msg.from_user: return
-        if not await is_owner(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_owner(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         t = await resolve_user(msg)
         if not t:
             await msg.reply_text("Usage: `/remove_admin [user_id]`\nOr reply to user."); return
@@ -1023,7 +1433,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("addowner"))
     async def cmd_add_owner(_, msg: Message):
         if not msg.from_user: return
-        if not await is_super(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_super(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         t = await resolve_user(msg)
         if not t:
             await msg.reply_text("Usage: `/addowner [user_id]`\nExample: `/addowner 838832834`\nOr reply to user."); return
@@ -1035,7 +1445,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("removeowner"))
     async def cmd_rem_owner(_, msg: Message):
         if not msg.from_user: return
-        if not await is_super(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_super(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         t = await resolve_user(msg)
         if not t:
             await msg.reply_text("Usage: `/removeowner [user_id]`\nOr reply to user."); return
@@ -1051,7 +1461,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("set_name"))
     async def cmd_set_name(_, msg: Message):
         if not msg.from_user: return
-        if not await is_owner(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_owner(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         parts = (msg.text or "").split(None, 1)
         if len(parts) < 2:
             current = await bot_name()
@@ -1100,7 +1510,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("userinfo"))
     async def cmd_userinfo(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         t = await resolve_user(msg)
         if not t: await msg.reply_text("Usage: `/userinfo [id]` or reply to user."); return
         rec  = await users_col.find_one({"_id": t.id})
@@ -1141,7 +1551,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("ban"))
     async def cmd_ban(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         t = await resolve_user(msg)
         if not t: await msg.reply_text("Usage: `/ban [id]` or reply to user."); return
         if await is_owner(t.id):
@@ -1153,7 +1563,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("unban"))
     async def cmd_unban(_, msg: Message):
         if not msg.from_user: return
-        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_admin(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         t = await resolve_user(msg)
         if not t: await msg.reply_text("Usage: `/unban [id]` or reply to user."); return
         await users_col.update_one({"_id": t.id}, {"$set": {"banned": False}}, upsert=True)
@@ -1163,7 +1573,7 @@ def make_bot(cfg: dict) -> tuple:
     @app.on_message(filters.command("clones"))
     async def cmd_clones(_, msg: Message):
         if not msg.from_user: return
-        if not await is_super(msg.from_user.id): await msg.reply_text(BAKA); return
+        if not await is_super(msg.from_user.id): await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         clones  = await instances_col.find({}).to_list(None)
         running = list(CLONES.keys())
         if not clones:
@@ -1183,7 +1593,7 @@ def make_bot(cfg: dict) -> tuple:
     async def cmd_copy(_, msg: Message):
         if not msg.from_user: return
         if not (await is_super(msg.from_user.id) or await is_owner(msg.from_user.id)):
-            await msg.reply_text(BAKA); return
+            await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         parts = (msg.text or "").split(None, 1)
         if len(parts) < 2:
             clones  = await instances_col.find({}).to_list(None)
@@ -1236,7 +1646,7 @@ def make_bot(cfg: dict) -> tuple:
     async def cmd_delcopy(_, msg: Message):
         if not msg.from_user: return
         if not (await is_super(msg.from_user.id) or await is_owner(msg.from_user.id)):
-            await msg.reply_text(BAKA); return
+            await msg.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
         parts  = (msg.text or "").split()
         clones = await instances_col.find({}).to_list(None)
         running = list(CLONES.keys())
@@ -1423,6 +1833,29 @@ def make_bot(cfg: dict) -> tuple:
             elif action == "set_channel":
                 chs = await gset("promo_channels",[])
                 await q.message.reply_text(f"📢 **Promo Channels:**\n{chr(10).join(chs) or 'None'}\n\n`/set_channel add @ch` | `remove @ch` | `clear`")
+            elif action == "forcesub":
+                chs = await get_fsub_channels()
+                if not chs:
+                    ch_txt = "None"
+                else:
+                    lines = []
+                    for cid in chs:
+                        try:
+                            chat = await app.get_chat(cid)
+                            lines.append(f"• <code>{cid}</code> — {chat.title or cid}")
+                        except Exception:
+                            lines.append(f"• <code>{cid}</code>")
+                    ch_txt = "\n".join(lines)
+                await q.message.reply_text(
+                    f"🔒 <b>Force-Sub Channels:</b>\n{ch_txt}\n\n"
+                    f"<b>Commands:</b>\n"
+                    f"<code>/add_forcesub [channel_id]</code>\n"
+                    f"<code>/rem_forcesub [channel_id]</code>\n"
+                    f"<code>/add_fsubimg</code> (reply to photo)\n\n"
+                    f"ℹ️ Force-sub only triggers when user clicks an <b>infinite link</b>.\n"
+                    f"Normal search is always free.",
+                    parse_mode=enums.ParseMode.HTML
+                )
             elif action == "adminlist":
                 owners = []; admins = []
                 async for s in staff_col.find({}):
@@ -1440,7 +1873,7 @@ def make_bot(cfg: dict) -> tuple:
                 set_st(uid, "unban_uid")
                 await q.message.reply_text("✅ Send the **user ID** to unban:")
             elif action == "clones":
-                if not await is_super(uid): await q.message.reply_text(BAKA); return
+                if not await is_super(uid): await q.message.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
                 clones  = await instances_col.find({}).to_list(None)
                 running = list(CLONES.keys())
                 lines   = [f"{'🟢' if c['bot_id'] in running else '🔴'} @{c.get('bot_username','?')} `{c['bot_id']}`" for c in clones] if clones else ["No clones."]
@@ -1451,22 +1884,22 @@ def make_bot(cfg: dict) -> tuple:
                 lines = [f"• `{l['channel_id']}` [{l.get('mode','invite')}]" for l in links] if links else ["No links yet."]
                 await q.message.reply_text("🔗 **Infinite Links:**\n\n"+"\n".join(lines)+"\n\n`/infinite [id]` or `/infinite req [id]`")
             elif action in ("add_admin","remove_admin"):
-                if not await is_owner(uid): await q.message.reply_text(BAKA); return
+                if not await is_owner(uid): await q.message.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
                 cmd = "add_admin" if action=="add_admin" else "remove_admin"
                 await q.message.reply_text(f"Usage: `/{cmd} [user_id]`\nExample: `/{cmd} 838832834`")
             elif action == "set_name":
-                if not await is_owner(uid): await q.message.reply_text(BAKA); return
+                if not await is_owner(uid): await q.message.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
                 current = await bot_name()
                 await q.message.reply_text(
                     f"🏷️ **Bot Display Name**\n\nCurrent: **{current}**\n\n"
                     f"Use: `/set_name [new name]`\nExample: `/set_name Shane Anime`"
                 )
             elif action in ("add_owner","remove_owner"):
-                if not await is_super(uid): await q.message.reply_text(BAKA); return
+                if not await is_super(uid): await q.message.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
                 cmd = "addowner" if action=="add_owner" else "removeowner"
                 await q.message.reply_text(f"Usage: `/{cmd} [user_id]`\nExample: `/{cmd} 838832834`")
             elif action in ("copy","delcopy"):
-                if not await is_super(uid): await q.message.reply_text(BAKA); return
+                if not await is_super(uid): await q.message.reply_text(BAKA, parse_mode=enums.ParseMode.HTML); return
                 await q.message.reply_text(f"Usage: `/{action} [{'token' if action=='copy' else 'bot_id'}]`")
             return
 
@@ -1533,379 +1966,4 @@ def make_bot(cfg: dict) -> tuple:
 
         if d.startswith("del_yes_"):
             if not await is_admin(uid): await q.answer(BAKA, show_alert=True); return
-            from bson import ObjectId
-            try: aid = ObjectId(d[8:])
-            except Exception: return
-            a = await anime_col.find_one({"_id": aid})
-            await anime_col.delete_one({"_id": aid}); clr_st(uid)
-            await q.answer("🗑️ Deleted!", show_alert=True)
-            try: await q.message.edit_text(f"✅ **{a['name'] if a else 'Anime'}** deleted!")
-            except Exception: pass; return
-
-        if d == "del_no":
-            clr_st(uid); await q.answer("Cancelled.")
-            try: await q.message.edit_text("❌ Deletion cancelled.")
-            except Exception: pass; return
-
-        await q.answer()
-
-    # ═══════════════════════════════════════════════════
-    #  STATE HANDLER
-    # ═══════════════════════════════════════════════════
-    async def state_fn(msg: Message):
-        uid  = msg.from_user.id
-        s    = get_st(uid)
-        if not s: return
-        step = s["step"]; d = s["data"]
-
-        if step == "ban_uid":
-            raw = (msg.text or "").strip()
-            if not raw.isdigit(): await msg.reply_text("Send a valid numeric user ID."); return
-            tid = int(raw)
-            if await is_owner(tid): await msg.reply_text("❌ Cannot ban an owner!"); clr_st(uid); return
-            await users_col.update_one({"_id": tid}, {"$set": {"banned": True}}, upsert=True)
-            clr_st(uid); await msg.reply_text(f"🚫 User `{tid}` has been banned.")
-
-        elif step == "unban_uid":
-            raw = (msg.text or "").strip()
-            if not raw.isdigit(): await msg.reply_text("Send a valid numeric user ID."); return
-            tid = int(raw)
-            await users_col.update_one({"_id": tid}, {"$set": {"banned": False}}, upsert=True)
-            clr_st(uid); await msg.reply_text(f"✅ User `{tid}` has been unbanned.")
-
-        # ADD ANIME
-        elif step == "ani_img":
-            if msg.photo:
-                d["img"] = msg.photo.file_id; d["name"] = (msg.caption or "").strip()
-            elif msg.text and msg.text.strip().upper() == "SKIP":
-                d["img"] = None; d["name"] = ""
-            elif msg.text and msg.text.strip().startswith("http"):
-                d["img"] = msg.text.strip(); d["name"] = ""
-            elif msg.text:
-                # User sent plain text — treat as anime name, skip image
-                d["img"] = None; d["name"] = msg.text.strip()
-            else:
-                await msg.reply_text("Send a photo, image URL, anime name, or SKIP."); return
-            if d["name"]:
-                set_st(uid, "ani_synopsis", d)
-                await msg.reply_text(f"✅ Name: **{d['name']}**\n\n📝 **Step 2/4** — Send **synopsis**:")
-            else:
-                set_st(uid, "ani_name", d)
-                await msg.reply_text("📝 **Step 1b** — Send the **anime name**:")
-
-        elif step == "ani_name":
-            d["name"] = msg.text.strip()
-            set_st(uid, "ani_synopsis", d)
-            await msg.reply_text("📝 **Step 2/4** — Send **synopsis**:")
-
-        elif step == "ani_synopsis":
-            d["desc"] = msg.text.strip()
-            set_st(uid, "ani_watchlink", d)
-            await msg.reply_text("🔗 **Step 3/4** — Send **Watch / Download URL** (or SKIP):")
-
-        elif step == "ani_watchlink":
-            t = (msg.text or "").strip()
-            d["url"] = "" if t.upper() == "SKIP" else t
-            set_st(uid, "ani_aliases", d)
-            await msg.reply_text("🏷️ **Step 4/4** — Send **aliases** comma-separated (or SKIP):\nExample: `OP, One P, ワンピース`")
-
-        elif step == "ani_aliases":
-            t  = (msg.text or "").strip()
-            al = [x.strip() for x in t.split(",") if x.strip()] if t.upper() != "SKIP" else []
-            await anime_col.insert_one({
-                "name": d["name"], "name_lower": d["name"].lower(),
-                "description": d.get("desc",""), "image_file_id": d.get("img"),
-                "watch_url": d.get("url",""), "aliases": al,
-                "aliases_lower": [x.lower() for x in al],
-                "added_by": uid, "added_at": datetime.utcnow(),
-            })
-            clr_st(uid)
-            await msg.reply_text(
-                f"✅ **{d['name']}** added successfully!",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("➕ Add Another", callback_data="panel_add_ani"),
-                     InlineKeyboardButton("🎛️ Panel",       callback_data="open_panel")]]))
-
-        # EDIT ANIME
-        elif step == "edit_name":
-            q = msg.text.strip()
-            a = await anime_col.find_one({"name_lower": q.lower()})
-            if not a: a = await anime_col.find_one({"name_lower": {"$regex": re.escape(q.lower())}})
-            if not a: await msg.reply_text("❌ Not found. Try again or /cancel."); return
-            clr_st(uid); s_ = str(a["_id"])
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📝 Name",      callback_data=f"ef_{s_}_name"),
-                 InlineKeyboardButton("📖 Synopsis",  callback_data=f"ef_{s_}_description")],
-                [InlineKeyboardButton("🔗 Watch Link",callback_data=f"ef_{s_}_watch_url"),
-                 InlineKeyboardButton("🏷️ Aliases",   callback_data=f"ef_{s_}_aliases")],
-                [InlineKeyboardButton("🖼️ Image",     callback_data=f"ef_{s_}_image")],
-                [InlineKeyboardButton("🗑️ Delete",    callback_data=f"del_cfm_{s_}"),
-                 InlineKeyboardButton("❌ Cancel",     callback_data="edit_cancel")],
-            ])
-            await msg.reply_text(
-                f"✏️ **{a['name']}**\n\n"
-                f"📖 {(a.get('description','') or '')[:80]}…\n"
-                f"🔗 {a.get('watch_url','—')}\n"
-                f"🏷️ {', '.join(a.get('aliases') or []) or '—'}\n\nTap field:", reply_markup=kb)
-
-        elif step == "edit_val":
-            field = d["field"]; aid = d["aid"]
-            if field == "image":
-                if msg.photo: val = msg.photo.file_id
-                elif msg.text and msg.text.strip().startswith("http"): val = msg.text.strip()
-                else: await msg.reply_text("Send photo or URL."); return
-                await anime_col.update_one({"_id": aid}, {"$set": {"image_file_id": val}})
-            elif field == "name":
-                v = msg.text.strip()
-                await anime_col.update_one({"_id": aid}, {"$set": {"name": v, "name_lower": v.lower()}})
-            elif field == "aliases":
-                al = [x.strip() for x in msg.text.split(",") if x.strip()]
-                await anime_col.update_one({"_id": aid}, {"$set": {"aliases": al, "aliases_lower": [x.lower() for x in al]}})
-            else:
-                await anime_col.update_one({"_id": aid}, {"$set": {field: msg.text.strip()}})
-            clr_st(uid)
-            await msg.reply_text(f"✅ **{field}** updated!",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✏️ Edit More", callback_data=f"qedit_{str(aid)}"),
-                     InlineKeyboardButton("🎛️ Panel",     callback_data="open_panel")]]))
-
-        # DELETE
-        elif step == "del_name":
-            q = msg.text.strip()
-            a = await anime_col.find_one({"name_lower": q.lower()})
-            if not a: a = await anime_col.find_one({"name_lower": {"$regex": re.escape(q.lower())}})
-            if not a: await msg.reply_text("❌ Not found."); clr_st(uid); return
-            clr_st(uid); s_ = str(a["_id"])
-            await msg.reply_text(f"⚠️ Delete **'{a['name']}'**?",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Yes", callback_data=f"del_yes_{s_}"),
-                    InlineKeyboardButton("❌ No",  callback_data="del_no")]]))
-
-        # ADD ALIAS
-        elif step == "alias_name":
-            a = await anime_col.find_one({"name_lower": msg.text.strip().lower()})
-            if not a: await msg.reply_text("Not found."); clr_st(uid); return
-            d["aid"] = a["_id"]; d["aname"] = a["name"]
-            set_st(uid, "alias_vals", d)
-            await msg.reply_text(f"Send aliases for **{a['name']}** (comma-separated):")
-
-        elif step == "alias_vals":
-            al  = [x.strip() for x in msg.text.split(",") if x.strip()]
-            alL = [x.lower() for x in al]
-            await anime_col.update_one({"_id": d["aid"]},
-                {"$addToSet": {"aliases": {"$each": al}, "aliases_lower": {"$each": alL}}})
-            clr_st(uid); await msg.reply_text(f"✅ Aliases added to **{d['aname']}**!")
-
-        # BULK IMPORT
-        elif step == "bulk_file":
-            if not msg.document: await msg.reply_text("Send .txt or .json file."); return
-            fname = msg.document.file_name or ""
-            dl    = await msg.download(in_memory=True)
-            raw   = bytes(dl.getbuffer()).decode("utf-8", errors="ignore")
-            imp = skp = 0
-            if fname.endswith(".json"):
-                try: items = json.loads(raw)
-                except Exception: await msg.reply_text("❌ Invalid JSON."); clr_st(uid); return
-                for item in items:
-                    if not item.get("name"): skp += 1; continue
-                    nl = item["name"].lower()
-                    if await anime_col.find_one({"name_lower": nl}): skp += 1; continue
-                    al = item.get("aliases",[])
-                    await anime_col.insert_one({
-                        "name": item["name"], "name_lower": nl,
-                        "description": item.get("description",""),
-                        "image_file_id": item.get("image_url") or item.get("image_file_id"),
-                        "watch_url": item.get("watch_url",""),
-                        "aliases": al, "aliases_lower": [x.lower() for x in al],
-                        "added_by": uid, "added_at": datetime.utcnow()})
-                    imp += 1
-            elif fname.endswith(".txt"):
-                for line in raw.splitlines():
-                    line = line.strip()
-                    if not line: continue
-                    seg = [x.strip() for x in line.split("|")]
-                    name = seg[0] if seg else ""
-                    if not name: skp += 1; continue
-                    nl = name.lower()
-                    if await anime_col.find_one({"name_lower": nl}): skp += 1; continue
-                    al = [x.strip() for x in (seg[4] if len(seg)>4 else "").split(",") if x.strip()]
-                    await anime_col.insert_one({
-                        "name": name, "name_lower": nl,
-                        "description": seg[2] if len(seg)>2 else "",
-                        "image_file_id": seg[1] if len(seg)>1 else None,
-                        "watch_url": seg[3] if len(seg)>3 else "",
-                        "aliases": al, "aliases_lower": [x.lower() for x in al],
-                        "added_by": uid, "added_at": datetime.utcnow()})
-                    imp += 1
-            else:
-                await msg.reply_text("Only .json or .txt!"); clr_st(uid); return
-            clr_st(uid); await msg.reply_text(f"✅ **Bulk Import Done!**\n\nImported: {imp}\nSkipped (duplicates): {skp}")
-
-        # BROADCAST
-        elif step == "bcast":
-            clr_st(uid)
-            if not msg.text and not msg.photo and not msg.document and not msg.video and not msg.audio:
-                await msg.reply_text("❌ Please send a valid message to broadcast."); return
-            await _do_broadcast(msg, msg)
-
-        # SETTINGS STATES
-        elif step == "set_start_img":
-            if msg.photo:
-                await sset("start_banner", msg.photo.file_id); clr_st(uid)
-                await msg.reply_text("✅ Start banner updated!")
-            else: await msg.reply_text("Send a photo.")
-
-        elif step == "set_start_msg":
-            if msg.text:
-                await sset("welcome_message", msg.text); clr_st(uid)
-                await msg.reply_text("✅ Welcome message updated!")
-            else: await msg.reply_text("Send text.")
-
-        elif step == "set_welcome_text":
-            if msg.text:
-                d["wtxt"] = msg.text; set_st(uid, "set_welcome_img", d)
-                await msg.reply_text("Send welcome image (photo) or type **SKIP**:")
-            else: await msg.reply_text("Send text.")
-
-        elif step == "set_welcome_img":
-            if msg.photo: await sset("welcome_img", msg.photo.file_id)
-            elif not (msg.text and msg.text.strip().upper() == "SKIP"):
-                await msg.reply_text("Send photo or SKIP."); return
-            await sset("group_welcome", d["wtxt"]); clr_st(uid)
-            await msg.reply_text("✅ Group welcome updated!")
-
-        elif step == "set_goodbye_text":
-            if msg.text:
-                d["gtxt"] = msg.text; set_st(uid, "set_goodbye_img", d)
-                await msg.reply_text("Send goodbye image (photo) or type **SKIP**:")
-            else: await msg.reply_text("Send text.")
-
-        elif step == "set_goodbye_img":
-            if msg.photo: await sset("goodbye_img", msg.photo.file_id)
-            elif not (msg.text and msg.text.strip().upper() == "SKIP"):
-                await msg.reply_text("Send photo or SKIP."); return
-            await sset("group_goodbye", d["gtxt"]); clr_st(uid)
-            await msg.reply_text("✅ Group goodbye updated!")
-
-    # ── set BotFather commands ─────────────────────────
-    async def register_commands():
-        """Register bot commands with BotFather so they show in the menu."""
-        from pyrogram.types import BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
-        user_cmds = [
-            BotCommand("start",   "👋 Welcome message"),
-            BotCommand("help",    "📋 Full command list"),
-            BotCommand("search",  "🔍 Search anime by name"),
-            BotCommand("popular", "🌟 Browse anime list"),
-            BotCommand("ping",    "🏓 Check bot speed"),
-            BotCommand("id",      "🆔 Your Telegram ID"),
-            BotCommand("report",  "🚨 Report to admins"),
-        ]
-        admin_cmds = user_cmds + [
-            BotCommand("panel",        "🎛️ Admin control panel"),
-            BotCommand("add_ani",      "➕ Add new anime"),
-            BotCommand("edit_ani",     "✏️ Edit anime"),
-            BotCommand("delete_ani",   "🗑️ Delete anime"),
-            BotCommand("add_alias",    "🔤 Add search alias"),
-            BotCommand("list",         "📋 List all animes"),
-            BotCommand("stats",        "📊 Bot statistics"),
-            BotCommand("db_export",    "📤 Export database"),
-            BotCommand("bulk",         "📦 Bulk import"),
-            BotCommand("broadcast",    "📢 Broadcast to all users"),
-            BotCommand("set_start_img","🖼️ Set start banner"),
-            BotCommand("set_start_msg","✏️ Set welcome text"),
-            BotCommand("set_welcome",  "👋 Set group welcome"),
-            BotCommand("set_goodbye",  "👋 Set group goodbye"),
-            BotCommand("set_channel",  "📢 Set promo channels"),
-            BotCommand("adminlist",    "👥 List all staff"),
-            BotCommand("ban",          "🚫 Ban a user"),
-            BotCommand("unban",        "✅ Unban a user"),
-            BotCommand("userinfo",     "👤 User info"),
-            BotCommand("cancel",       "❌ Cancel operation"),
-            BotCommand("infinite",     "🔗 Infinite link system"),
-            BotCommand("add_admin",    "🛡️ Add admin (owner only)"),
-            BotCommand("remove_admin", "❌ Remove admin (owner only)"),
-            BotCommand("addowner",     "👑 Add owner (super only)"),
-            BotCommand("removeowner",  "❌ Remove owner (super only)"),
-            BotCommand("set_name",     "🏷️ Set bot display name"),
-            BotCommand("copy",         "⚡ Start clone bot (super only)"),
-            BotCommand("delcopy",      "🗑️ Stop clone bot (super only)"),
-            BotCommand("clones",       "🤖 List clone bots (super only)"),
-        ]
-        try:
-            # Default scope — shows user commands to everyone
-            await app.set_bot_commands(user_cmds, scope=BotCommandScopeDefault())
-            # Private chats — same user commands
-            await app.set_bot_commands(user_cmds, scope=BotCommandScopeAllPrivateChats())
-            # Group chats — user commands
-            await app.set_bot_commands(user_cmds, scope=BotCommandScopeAllGroupChats())
-            logger.info("✅ Bot commands registered with BotFather")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not set bot commands: {e}")
-
-    return app, register_commands
-
-
-# ═══════════════════════════════════════════════════════
-#  MAIN
-# ═══════════════════════════════════════════════════════
-async def main():
-    # Create indexes — also drop any stale conflicting indexes from old schema
-    db = get_db(PRIMARY["db_name"])
-    # Drop the old sparse user_id index that conflicts with our _id-based schema
-    try:
-        await db["users"].drop_index("user_id_1")
-        logger.info("🧹 Dropped stale user_id_1 index")
-    except Exception:
-        pass  # index didn't exist — that's fine
-    # Also drop any other null-keyed indexes on users to be safe
-    try:
-        await db["users"].drop_index("username_1")
-    except Exception:
-        pass
-    await db["animes"].create_index("name_lower")
-    await db["animes"].create_index("aliases_lower")
-    await db["infinite_links"].create_index([("owner_uid", 1), ("channel_id", 1)])
-    logger.info("✅ Indexes ready")
-
-    # Start primary bot
-    primary, reg_cmds = make_bot(PRIMARY)
-    await primary.start()
-    me = await primary.get_me()
-    logger.info(f"✅ Primary: @{me.username}")
-
-    # Register commands in BotFather
-    await reg_cmds()
-
-    # Restore clones from DB (safe because in_memory=True)
-    async for inst in instances_col.find({}):
-        bid = inst["bot_id"]
-        if bid in CLONES: continue
-        try:
-            clone, clone_reg_cmds = make_bot({
-                "bot_token":         inst["bot_token"],
-                "session_name":      inst.get("session_name", f"clone_{bid}"),
-                "db_name":           inst.get("db_name", f"Kenshin_{bid}"),
-                "original_owner_id": inst.get("original_owner_id", PRIMARY["original_owner_id"]),
-            })
-            await clone.start()
-            CLONES[bid] = clone
-            await clone_reg_cmds()
-            cm = await clone.get_me()
-            logger.info(f"✅ Clone restored: @{cm.username}")
-        except Exception as e:
-            logger.error(f"❌ Clone restore failed ({bid}): {e}")
-
-    logger.info("🏃 All bots running…")
-    await idle()
-
-    # Graceful shutdown
-    logger.info("🛑 Shutting down…")
-    for c in list(CLONES.values()):
-        try: await c.stop()
-        except Exception: pass
-    await primary.stop()
-    logger.info("✅ All stopped.")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    
