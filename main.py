@@ -35,13 +35,13 @@ logger = logging.getLogger("KenshinBot")
 #  CONFIG  (reads from environment variables)
 # ═══════════════════════════════════════════════════════
 PRIMARY = {
-    "bot_token":         os.environ["BOT_TOKEN"],
-    "api_id":            int(os.environ["API_ID"]),
-    "api_hash":          os.environ["API_HASH"],
-    "original_owner_id": int(os.environ.get("OWNER_ID", "6728678197")),
-    "mongo_uri":         os.environ["MONGO_URI"],
-    "session_name":      "kenshin_primary",
-    "db_name":           "Kenshinfileshere",
+    "bot_token":         "8285265972:AAHyDSdAT0Uz2KrO6aH-zOdexK7pHpm4fz4",
+        "api_id":            37407868,
+        "api_hash":          "d7d3bff9f7cf9f3b111129bdbd13a065",
+        "original_owner_id": 6728678197,
+        "mongo_uri":         "mongodb+srv://kenshinxu4:iammohitgurjar.1@kenshinfileshere.bhlhhjn.mongodb.net/?appName=Kenshinfileshere",
+        "session_name":      "kenshin_primary",
+        "db_name":           "Kenshinfileshere",
 }
 
 _mongo        = AsyncIOMotorClient(PRIMARY["mongo_uri"])
