@@ -35,11 +35,11 @@ logger = logging.getLogger("KenshinBot")
 #  CONFIG  (reads from environment variables)
 # ═══════════════════════════════════════════════════════
 PRIMARY = {
-    "bot_token":         "8780999113:AAEiC461K0DGQX1QIInMXYGbB-UZIkIafrU",
+    "bot_token":         "8285265972:AAHyDSdAT0Uz2KrO6aH-zOdexK7pHpm4fz4",
         "api_id":            37407868,
         "api_hash":          "d7d3bff9f7cf9f3b111129bdbd13a065",
         "original_owner_id": 6728678197,
-        "mongo_uri":         "mongodb+srv://kenshinxu1:iammohitgurjar.1@kenshinfileshere.fyvrwjd.mongodb.net/?appName=Kenshinfileshere",
+        "mongo_uri":         "mongodb+srv://kenshinxu4:iammohitgurjar.1@kenshinfileshere.bhlhhjn.mongodb.net/?appName=Kenshinfileshere",
         "session_name":      "kenshin_primary",
         "db_name":           "Kenshinfileshere",
 }
