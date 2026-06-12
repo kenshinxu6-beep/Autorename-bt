@@ -3,3 +3,4 @@ TgCrypto
 motor
 pymongo
 aiohttp
+python-dotenv
