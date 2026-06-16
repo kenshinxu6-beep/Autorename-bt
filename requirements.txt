@@ -1,6 +1,0 @@
-pyrofork
-TgCrypto
-motor
-pymongo
-aiohttp
-python-dotenv
