@@ -19,12 +19,12 @@
 import os, asyncio, logging, base64
 from datetime import datetime
 
-from pyrofork import Client, filters, enums
-from pyrofork.types import (
+from pyrogram import Client, filters, enums
+from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, ForceReply
 )
-from pyrofork.errors import (
+from pyrogram.errors import (
     FloodWait, UserIsBlocked, InputUserDeactivated, MessageNotModified
 )
 from motor.motor_asyncio import AsyncIOMotorClient
