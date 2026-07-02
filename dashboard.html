@@ -5,34 +5,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Instagram Comment Bot</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             padding: 20px;
         }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
+        .container { max-width: 1400px; margin: 0 auto; }
         .header {
             text-align: center;
             color: white;
             margin-bottom: 30px;
         }
-        .header h1 {
-            font-size: 2.5rem;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
-        }
-        .header p {
-            opacity: 0.9;
-            font-size: 1.1rem;
-        }
+        .header h1 { font-size: 2.5rem; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }
+        .header p { opacity: 0.9; }
         .card {
             background: white;
             border-radius: 20px;
@@ -42,18 +29,11 @@
         }
         .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
             gap: 20px;
         }
-        .input-group {
-            margin-bottom: 15px;
-        }
-        label {
-            display: block;
-            font-weight: 600;
-            margin-bottom: 5px;
-            color: #333;
-        }
+        .input-group { margin-bottom: 15px; }
+        label { display: block; font-weight: 600; margin-bottom: 5px; color: #333; }
         input, textarea, select {
             width: 100%;
             padding: 12px;
@@ -62,14 +42,8 @@
             font-size: 14px;
             transition: border 0.3s;
         }
-        input:focus, textarea:focus {
-            border-color: #667eea;
-            outline: none;
-        }
-        textarea {
-            resize: vertical;
-            min-height: 80px;
-        }
+        input:focus, textarea:focus { border-color: #667eea; outline: none; }
+        textarea { resize: vertical; min-height: 80px; }
         .btn {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
@@ -81,20 +55,10 @@
             cursor: pointer;
             transition: transform 0.2s, box-shadow 0.2s;
         }
-        .btn:hover {
-            transform: scale(1.05);
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
-        }
-        .btn-danger {
-            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-        }
-        .btn-success {
-            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-        }
-        .btn-sm {
-            padding: 8px 15px;
-            font-size: 14px;
-        }
+        .btn:hover { transform: scale(1.05); box-shadow: 0 5px 15px rgba(102,126,234,0.4); }
+        .btn-danger { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }
+        .btn-success { background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); }
+        .btn-sm { padding: 8px 15px; font-size: 14px; }
         .account-item {
             background: #f8f9fa;
             padding: 12px;
@@ -104,24 +68,16 @@
             justify-content: space-between;
             align-items: center;
         }
-        .account-item .username {
-            font-weight: 600;
-            color: #333;
-        }
+        .account-item .username { font-weight: 600; color: #333; }
         .status-badge {
             padding: 4px 12px;
             border-radius: 20px;
             font-size: 12px;
             font-weight: 600;
         }
-        .status-active {
-            background: #d4edda;
-            color: #155724;
-        }
-        .status-inactive {
-            background: #f8d7da;
-            color: #721c24;
-        }
+        .status-active { background: #d4edda; color: #155724; }
+        .status-inactive { background: #f8d7da; color: #721c24; }
+        .status-validating { background: #fff3cd; color: #856404; }
         .hashtag-chip {
             background: #667eea;
             color: white;
@@ -133,13 +89,7 @@
             cursor: pointer;
             transition: all 0.3s;
         }
-        .hashtag-chip:hover {
-            background: #764ba2;
-            transform: scale(1.05);
-        }
-        .hashtag-list {
-            margin-top: 10px;
-        }
+        .hashtag-chip:hover { background: #764ba2; transform: scale(1.05); }
         .log-area {
             background: #1e1e1e;
             color: #00ff00;
@@ -150,13 +100,8 @@
             font-family: 'Courier New', monospace;
             font-size: 13px;
         }
-        .log-entry {
-            padding: 4px 0;
-            border-bottom: 1px solid #2a2a2a;
-        }
-        .log-time {
-            color: #ffaa00;
-        }
+        .log-entry { padding: 4px 0; border-bottom: 1px solid #2a2a2a; }
+        .log-time { color: #ffaa00; }
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -168,22 +113,52 @@
             border-radius: 10px;
             text-align: center;
         }
-        .stat-box .number {
-            font-size: 28px;
-            font-weight: 700;
-            color: #667eea;
-        }
-        .stat-box .label {
-            color: #666;
+        .stat-box .number { font-size: 28px; font-weight: 700; color: #667eea; }
+        .stat-box .label { color: #666; font-size: 14px; }
+        .flex { display: flex; gap: 15px; flex-wrap: wrap; }
+        .flex-grow { flex: 1; }
+        .history-table {
+            width: 100%;
+            border-collapse: collapse;
             font-size: 14px;
         }
-        .flex {
-            display: flex;
-            gap: 15px;
-            flex-wrap: wrap;
+        .history-table th {
+            background: #667eea;
+            color: white;
+            padding: 10px;
+            text-align: left;
         }
-        .flex-grow {
-            flex: 1;
+        .history-table td {
+            padding: 10px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        .history-table tr:hover { background: #f8f9fa; }
+        .history-table .post-link {
+            color: #667eea;
+            text-decoration: none;
+        }
+        .history-table .post-link:hover { text-decoration: underline; }
+        .scrollable {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .toast {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #333;
+            color: white;
+            padding: 15px 25px;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+            z-index: 1000;
+            animation: slideIn 0.5s;
+        }
+        .toast.success { background: #28a745; }
+        .toast.error { background: #dc3545; }
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
         }
         @media (max-width: 768px) {
             .header h1 { font-size: 1.8rem; }
@@ -196,29 +171,17 @@
 <div class="container">
     <div class="header">
         <h1>🤖 Instagram Comment Bot</h1>
-        <p>Automated commenting on health & wellness content</p>
+        <p>Real commenting on health & wellness content (⚠️ Use at your own risk)</p>
     </div>
 
     <!-- Stats -->
     <div class="card">
         <h3>📊 Live Stats</h3>
         <div class="stats-grid">
-            <div class="stat-box">
-                <div class="number" id="totalComments">0</div>
-                <div class="label">Total Comments</div>
-            </div>
-            <div class="stat-box">
-                <div class="number" id="activeAccounts">0</div>
-                <div class="label">Active Accounts</div>
-            </div>
-            <div class="stat-box">
-                <div class="number" id="postsProcessed">0</div>
-                <div class="label">Posts Processed</div>
-            </div>
-            <div class="stat-box">
-                <div class="number" id="botStatus">⏹</div>
-                <div class="label">Bot Status</div>
-            </div>
+            <div class="stat-box"><div class="number" id="totalComments">0</div><div class="label">Total Comments</div></div>
+            <div class="stat-box"><div class="number" id="activeAccounts">0</div><div class="label">Active Accounts</div></div>
+            <div class="stat-box"><div class="number" id="postsProcessed">0</div><div class="label">Posts Processed</div></div>
+            <div class="stat-box"><div class="number" id="botStatus">⏹</div><div class="label">Bot Status</div></div>
         </div>
     </div>
 
@@ -226,7 +189,7 @@
     <div class="grid">
         <!-- Add Account -->
         <div class="card">
-            <h3>➕ Add Account</h3>
+            <h3>➕ Add Account (Real Validation)</h3>
             <div class="input-group">
                 <label>Username</label>
                 <input type="text" id="accUsername" placeholder="your_username" />
@@ -235,7 +198,7 @@
                 <label>Password</label>
                 <input type="password" id="accPassword" placeholder="••••••••" />
             </div>
-            <button class="btn btn-success btn-sm" onclick="addAccount()">Add Account</button>
+            <button class="btn btn-success btn-sm" onclick="addAccount()">Validate & Add</button>
             <div id="accountList" style="margin-top:15px;"></div>
         </div>
 
@@ -247,9 +210,9 @@
                 <textarea id="customComment">This is so helpful! Thanks for sharing this amazing health tip! 💪🌟</textarea>
             </div>
             <div class="input-group">
-                <label>Delay (seconds)</label>
+                <label>Delay (seconds) between comments</label>
                 <input type="number" id="commentDelay" value="120" min="30" max="600" />
-                <small style="color:#666;">Recommended: 120-300 seconds</small>
+                <small>Recommended: 120-300s to avoid detection</small>
             </div>
             <div class="input-group">
                 <label>Max Comments Per Session</label>
@@ -280,11 +243,32 @@
         </div>
     </div>
 
+    <!-- History -->
+    <div class="card">
+        <h3>📜 Comment History</h3>
+        <div class="scrollable">
+            <table class="history-table" id="historyTable">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Account</th>
+                        <th>Hashtag</th>
+                        <th>Post</th>
+                        <th>Comment</th>
+                    </tr>
+                </thead>
+                <tbody id="historyBody">
+                    <tr><td colspan="5" style="text-align:center; color:#666;">No comments yet</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
     <!-- Logs -->
     <div class="card">
         <h3>📝 Activity Log</h3>
         <div class="log-area" id="logArea">
-            <div class="log-entry"><span class="log-time">[System]</span> Bot initialized. Ready to start.</div>
+            <div class="log-entry"><span class="log-time">[System]</span> Bot initialized. Ready.</div>
         </div>
     </div>
 </div>
@@ -296,6 +280,7 @@
     let commentHistory = 0;
     let postsProcessed = 0;
     let botRunning = false;
+    let historyData = [];
 
     // ==================== DASHBOARD FUNCTIONS ====================
 
@@ -304,16 +289,47 @@
         const password = document.getElementById('accPassword').value.trim();
         
         if (!username || !password) {
-            addLog('❌ Please enter both username and password');
+            showToast('Please enter both username and password', 'error');
             return;
         }
 
-        accounts.push({ username, password, status: 'active' });
-        document.getElementById('accUsername').value = '';
-        document.getElementById('accPassword').value = '';
-        renderAccounts();
-        updateStats();
-        addLog(`✅ Account ${username} added`);
+        // Show validating status
+        showToast('Validating account...', 'info');
+
+        fetch('/api/add_account', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+        })
+        .then(res => res.json())
+        .then(data => {
+            if (data.success) {
+                showToast(`✅ ${username} added successfully!`, 'success');
+                // Reload accounts list
+                loadAccounts();
+                document.getElementById('accUsername').value = '';
+                document.getElementById('accPassword').value = '';
+                addLog(`✅ Account ${username} added and validated`);
+            } else {
+                showToast(`❌ ${data.message}`, 'error');
+                addLog(`❌ Failed to add ${username}: ${data.message}`);
+            }
+        })
+        .catch(err => {
+            showToast(`Error: ${err.message}`, 'error');
+            addLog(`❌ Error adding account: ${err.message}`);
+        });
+    }
+
+    function loadAccounts() {
+        fetch('/api/accounts')
+            .then(res => res.json())
+            .then(data => {
+                accounts = data.accounts || [];
+                renderAccounts();
+                updateStats();
+            })
+            .catch(() => {});
     }
 
     function renderAccounts() {
@@ -335,6 +351,8 @@
 
     function removeAccount(index) {
         accounts.splice(index, 1);
+        // Also remove from backend (we'll just save settings)
+        saveSettings();
         renderAccounts();
         updateStats();
         addLog('🗑 Account removed');
@@ -372,12 +390,12 @@
 
     function startBot() {
         if (accounts.length === 0) {
-            addLog('❌ Please add at least one account first!');
+            showToast('❌ Please add at least one account first!', 'error');
             return;
         }
 
         if (hashtags.length === 0) {
-            addLog('❌ Please add at least one hashtag!');
+            showToast('❌ Please add at least one hashtag!', 'error');
             return;
         }
 
@@ -385,84 +403,55 @@
         const delay = parseInt(document.getElementById('commentDelay').value) || 120;
         const maxComments = parseInt(document.getElementById('maxComments').value) || 10;
 
-        fetch('/api/start', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                accounts: accounts,
-                hashtags: hashtags,
-                comment: comment,
-                delay: delay,
-                max_comments: maxComments
+        // First save settings
+        saveSettings(() => {
+            fetch('/api/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    accounts: accounts,
+                    hashtags: hashtags,
+                    comment: comment,
+                    delay: delay,
+                    max_comments: maxComments
+                })
             })
-        })
-        .then(res => res.json())
-        .then(data => {
-            if (data.success) {
-                botRunning = true;
-                document.getElementById('botStatus').textContent = '▶ RUNNING';
-                addLog(`🚀 Bot started! Targeting ${hashtags.length} hashtags with ${accounts.length} accounts`);
-                updateStats();
-            } else {
-                addLog(`❌ Failed to start: ${data.error || 'Unknown error'}`);
-            }
-        })
-        .catch(err => {
-            addLog(`❌ Error: ${err.message}`);
-            simulateBotLocally();
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    botRunning = true;
+                    document.getElementById('botStatus').textContent = '▶ RUNNING';
+                    showToast('🚀 Bot started!', 'success');
+                    addLog(`🚀 Bot started! Targeting ${hashtags.length} hashtags with ${accounts.length} accounts`);
+                    updateStats();
+                } else {
+                    showToast(`❌ Failed: ${data.error}`, 'error');
+                }
+            })
+            .catch(err => {
+                showToast(`Error: ${err.message}`, 'error');
+                addLog(`❌ Error starting bot: ${err.message}`);
+            });
         });
     }
 
     function stopBot() {
-        fetch('/api/stop', {
-            method: 'POST'
-        })
-        .then(res => res.json())
-        .then(data => {
-            botRunning = false;
-            document.getElementById('botStatus').textContent = '⏹ STOPPED';
-            addLog('⏹ Bot stopped');
-        })
-        .catch(() => {
-            botRunning = false;
-            document.getElementById('botStatus').textContent = '⏹ STOPPED';
-            addLog('⏹ Bot stopped (local)');
-        });
+        fetch('/api/stop', { method: 'POST' })
+            .then(res => res.json())
+            .then(data => {
+                botRunning = false;
+                document.getElementById('botStatus').textContent = '⏹ STOPPED';
+                showToast('⏹ Bot stopped', 'info');
+                addLog('⏹ Bot stopped');
+            })
+            .catch(() => {
+                botRunning = false;
+                document.getElementById('botStatus').textContent = '⏹ STOPPED';
+                addLog('⏹ Bot stopped (local)');
+            });
     }
 
-    function simulateBotLocally() {
-        addLog('⚠️ Running in local simulation mode');
-        let count = 0;
-        const maxComments = parseInt(document.getElementById('maxComments').value) || 10;
-        const delay = parseInt(document.getElementById('commentDelay').value) || 120;
-        
-        function doComment() {
-            if (!botRunning || count >= maxComments) {
-                if (count >= maxComments) {
-                    addLog('✅ Session complete!');
-                    document.getElementById('botStatus').textContent = '⏹ COMPLETED';
-                }
-                return;
-            }
-            
-            const randomAccount = accounts[Math.floor(Math.random() * accounts.length)];
-            const randomHashtag = hashtags[Math.floor(Math.random() * hashtags.length)];
-            const comment = document.getElementById('customComment').value || "Great content! 💪";
-            
-            count++;
-            commentHistory++;
-            postsProcessed++;
-            updateStats();
-            
-            addLog(`💬 [${randomAccount.username}] on #${randomHashtag}: "${comment.substring(0, 30)}..."`);
-            
-            setTimeout(doComment, delay * 1000 + Math.random() * 30000);
-        }
-        
-        doComment();
-    }
-
-    function saveSettings() {
+    function saveSettings(callback) {
         const settings = {
             accounts: accounts,
             hashtags: hashtags,
@@ -479,12 +468,14 @@
         .then(res => res.json())
         .then(data => {
             if (data.success) {
-                addLog('💾 Settings saved successfully!');
+                addLog('💾 Settings saved');
+                if (callback) callback();
             }
         })
         .catch(() => {
             localStorage.setItem('botSettings', JSON.stringify(settings));
             addLog('💾 Settings saved locally');
+            if (callback) callback();
         });
     }
 
@@ -501,11 +492,43 @@
                 renderAccounts();
                 renderHashtags();
                 updateStats();
-                addLog('📂 Settings loaded');
+                addLog('📂 Settings loaded locally');
             } catch (e) {
                 addLog('⚠️ Failed to load settings');
             }
         }
+        // Also load from server
+        loadAccounts();
+        loadHistory();
+    }
+
+    // ==================== HISTORY ====================
+
+    function loadHistory() {
+        fetch('/api/history')
+            .then(res => res.json())
+            .then(data => {
+                historyData = data.history || [];
+                renderHistory();
+            })
+            .catch(() => {});
+    }
+
+    function renderHistory() {
+        const tbody = document.getElementById('historyBody');
+        if (historyData.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#666;">No comments yet</td></tr>';
+            return;
+        }
+        tbody.innerHTML = historyData.map(entry => `
+            <tr>
+                <td>${entry.timestamp}</td>
+                <td>${entry.username}</td>
+                <td>#${entry.hashtag}</td>
+                <td><a href="${entry.post_url}" target="_blank" class="post-link">View Post</a></td>
+                <td>${entry.comment}</td>
+            </tr>
+        `).join('');
     }
 
     // ==================== UTILITIES ====================
@@ -531,27 +554,55 @@
         addLog('🗑 Logs cleared');
     }
 
-    // ==================== INIT ====================
+    function showToast(message, type = 'info') {
+        const toast = document.createElement('div');
+        toast.className = `toast ${type}`;
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        setTimeout(() => {
+            toast.remove();
+        }, 4000);
+    }
 
-    loadSettings();
-    renderHashtags();
-    addLog('🎯 Dashboard ready! Add accounts and start the bot.');
+    // ==================== POLLING ====================
 
-    setInterval(() => {
+    function pollStatus() {
         fetch('/api/status')
             .then(res => res.json())
             .then(data => {
                 if (data.running) {
                     document.getElementById('botStatus').textContent = '▶ RUNNING';
+                    botRunning = true;
+                } else {
+                    if (botRunning) {
+                        document.getElementById('botStatus').textContent = '⏹ STOPPED';
+                        botRunning = false;
+                    }
                 }
                 if (data.stats) {
-                    document.getElementById('totalComments').textContent = data.stats.total_comments || 0;
-                    document.getElementById('postsProcessed').textContent = data.stats.posts_processed || 0;
+                    commentHistory = data.stats.total_comments || 0;
+                    postsProcessed = data.stats.posts_processed || 0;
+                    document.getElementById('totalComments').textContent = commentHistory;
+                    document.getElementById('postsProcessed').textContent = postsProcessed;
+                }
+                if (data.history && data.history.length > 0) {
+                    historyData = data.history;
+                    renderHistory();
                 }
             })
             .catch(() => {});
-    }, 5000);
+    }
+
+    // ==================== INIT ====================
+
+    loadSettings();
+    renderHashtags();
+    addLog('🎯 Dashboard ready! Add validated accounts and start the bot.');
+    addLog('⚠️ WARNING: This bot actually comments on Instagram! Use at your own risk.');
+
+    setInterval(pollStatus, 3000);
+    setInterval(loadHistory, 10000);
 </script>
 
 </body>
-  </html>
+                                                                          </html>
