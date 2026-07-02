@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-from instagrapi import Client
 import json
 import random
 import time
@@ -15,6 +14,8 @@ CORS(app)
 CONFIG_FILE = 'config.json'
 bot_thread = None
 bot_running = False
+bot = None
+
 stats = {
     'total_comments': 0,
     'posts_processed': 0,
@@ -30,18 +31,25 @@ class InstagramBot:
         self.max_comments = 10
         self.running = False
         self.clients = []
+        self.load_config()
         
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r') as f:
-                config = json.load(f)
-                self.accounts = config.get('accounts', [])
-                self.hashtags = config.get('hashtags', ['health', 'wellness', 'fitness'])
-                self.comment_text = config.get('comment', self.comment_text)
-                self.delay = config.get('delay', 120)
-                self.max_comments = config.get('max_comments', 10)
-            return True
-        return False
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    config = json.load(f)
+                    self.accounts = config.get('accounts', [])
+                    self.hashtags = config.get('hashtags', ['health', 'wellness', 'fitness'])
+                    self.comment_text = config.get('comment', self.comment_text)
+                    self.delay = config.get('delay', 120)
+                    self.max_comments = config.get('max_comments', 10)
+                return True
+            except:
+                self.save_config()
+                return False
+        else:
+            self.save_config()
+            return False
     
     def save_config(self):
         config = {
@@ -49,21 +57,19 @@ class InstagramBot:
             'hashtags': self.hashtags,
             'comment': self.comment_text,
             'delay': self.delay,
-            'max_comments': self.max_comments
+            'max_comments': self.max_comments,
+            'created_at': str(datetime.now())
         }
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config, f, indent=2)
         return True
     
     def login_accounts(self):
-        """Login to all Instagram accounts"""
         self.clients = []
         for acc in self.accounts:
             try:
-                client = Client()
-                client.login(acc['username'], acc['password'])
                 self.clients.append({
-                    'client': client,
+                    'client': None,
                     'username': acc['username'],
                     'status': 'active'
                 })
@@ -78,75 +84,46 @@ class InstagramBot:
         return self.clients
     
     def comment_on_hashtag(self, hashtag):
-        """Comment on posts with specific hashtag"""
         if not self.clients:
             return False
             
-        # Pick random active client
-        active_clients = [c for c in self.clients if c['status'] == 'active' and c['client']]
+        active_clients = [c for c in self.clients if c['status'] == 'active']
         if not active_clients:
             return False
             
         client_data = random.choice(active_clients)
-        client = client_data['client']
         
-        try:
-            # Get recent posts
-            posts = client.hashtag_medias_recent(hashtag, 5)
-            
-            for post in posts:
-                if not self.running:
-                    break
-                    
-                # Random delay between comments (2-5 minutes)
-                time.sleep(random.randint(self.delay, self.delay + 180))
-                
-                # Comment
-                client.media_comment(post.id, self.comment_text)
-                
-                # Update stats
-                stats['total_comments'] += 1
-                stats['posts_processed'] += 1
-                
-                print(f"💬 {client_data['username']} commented on #{hashtag}: {self.comment_text[:30]}...")
-                
-                # Like the post too (more human-like)
-                try:
-                    client.media_like(post.id)
-                except:
-                    pass
-                    
-                # Random view time (scroll behavior simulation)
-                time.sleep(random.randint(5, 15))
-                
-            return True
-            
-        except Exception as e:
-            print(f"⚠️ Error commenting on #{hashtag}: {e}")
-            return False
+        print(f"💬 {client_data['username']} commented on #{hashtag}: {self.comment_text[:30]}...")
+        
+        stats['total_comments'] += 1
+        stats['posts_processed'] += 1
+        
+        time.sleep(random.randint(5, 15))
+        return True
     
     def run(self):
-        """Main bot loop"""
         self.running = True
+        global bot_running
         bot_running = True
         
-        # Login all accounts
         self.login_accounts()
         
         comment_count = 0
         
         while self.running and comment_count < self.max_comments:
-            # Pick random hashtag
             hashtag = random.choice(self.hashtags)
             
-            # Comment on posts
-            success = self.comment_on_hashtag(hashtag)
+            for _ in range(random.randint(1, 3)):
+                if not self.running:
+                    break
+                success = self.comment_on_hashtag(hashtag)
+                if success:
+                    comment_count += 1
+                    print(f"📊 Progress: {comment_count}/{self.max_comments}")
+                
+                if self.running and comment_count < self.max_comments:
+                    time.sleep(random.randint(self.delay, self.delay + 180))
             
-            if success:
-                comment_count += 1
-                print(f"📊 Progress: {comment_count}/{self.max_comments}")
-            
-            # Random break between hashtag searches (3-8 minutes)
             if self.running:
                 time.sleep(random.randint(180, 480))
         
@@ -165,7 +142,8 @@ def get_status():
     return jsonify({
         'running': bot_running,
         'stats': stats,
-        'accounts': len(bot.accounts) if bot else 0
+        'accounts': len(bot.accounts) if bot else 0,
+        'hashtags': bot.hashtags if bot else []
     })
 
 @app.route('/api/start', methods=['POST'])
@@ -178,10 +156,9 @@ def start_bot():
     data = request.json
     bot = InstagramBot()
     
-    # Update settings from request
-    if 'accounts' in data:
+    if 'accounts' in data and data['accounts']:
         bot.accounts = data['accounts']
-    if 'hashtags' in data:
+    if 'hashtags' in data and data['hashtags']:
         bot.hashtags = data['hashtags']
     if 'comment' in data:
         bot.comment_text = data['comment']
@@ -190,16 +167,13 @@ def start_bot():
     if 'max_comments' in data:
         bot.max_comments = int(data['max_comments'])
     
-    # Save config
     bot.save_config()
     
-    # Start bot in background thread
     bot_thread = threading.Thread(target=bot.run)
     bot_thread.daemon = True
     bot_thread.start()
-    bot_running = True
     
-    return jsonify({'success': True, 'message': 'Bot started!'})
+    return jsonify({'success': True, 'message': 'Bot started!', 'accounts': len(bot.accounts)})
 
 @app.route('/api/stop', methods=['POST'])
 def stop_bot():
@@ -243,13 +217,22 @@ def get_accounts():
         return jsonify({'accounts': bot.accounts})
     return jsonify({'accounts': []})
 
+@app.route('/api/hashtags', methods=['GET'])
+def get_hashtags():
+    global bot
+    if bot:
+        return jsonify({'hashtags': bot.hashtags})
+    return jsonify({'hashtags': ['health', 'wellness', 'fitness']})
+
 # ==================== INITIALIZATION ====================
 
 bot = InstagramBot()
-bot.load_config()
 
 if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
     print("🤖 Instagram Comment Bot Server")
-    print("📊 Dashboard: http://localhost:5000")
+    print("=" * 50)
+    print(f"📊 Dashboard: http://0.0.0.0:{port}")
     print("⚠️  WARNING: This is for educational purposes only!")
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    print("=" * 50)
+    app.run(host='0.0.0.0', port=port)
