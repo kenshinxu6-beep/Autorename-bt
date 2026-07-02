@@ -6,17 +6,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
+# Copy all files
 COPY main.py .
-COPY dashboard.html ./templates/
-COPY config.json .
+COPY dashboard.html .
 
-# Create templates directory
-RUN mkdir -p templates
-RUN mv dashboard.html templates/
+# Create templates directory and move dashboard
+RUN mkdir -p templates && mv dashboard.html templates/
 
-# Expose port
+# Expose port (Railway uses PORT env variable)
 EXPOSE 5000
 
-# Run the application
+# Run with proper host for Railway
 CMD ["python", "main.py"]
